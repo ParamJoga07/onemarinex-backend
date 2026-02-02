@@ -1,0 +1,6 @@
+pyproject.toml
+onemarinex_api.egg-info/PKG-INFO
+onemarinex_api.egg-info/SOURCES.txt
+onemarinex_api.egg-info/dependency_links.txt
+onemarinex_api.egg-info/requires.txt
+onemarinex_api.egg-info/top_level.txt
