@@ -1,4 +1,4 @@
-from typing import List, Optional, Literal
+from typing import List, Optional, Literal, Union
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Header, Query, status
@@ -48,11 +48,11 @@ class OrderOut(BaseModel):
     id: int
     order_number: str
     rfq_id: int
-    quote_id: int | None
-    buyer_user_id: int | None
-    vendor_user_id: int | None
-    vendor_company: str | None
-    port: str | None
+    quote_id: Optional[int]
+    buyer_user_id: Optional[int]
+    vendor_user_id: Optional[int]
+    vendor_company: Optional[str]
+    port: Optional[str]
     currency: str
     items: List[QuoteItemOut]
     shipping_cost: float
@@ -61,8 +61,8 @@ class OrderOut(BaseModel):
     subtotal: float
     tax_amount: float
     grand_total: float
-    delivery_time_days: int | None
-    notes: str | None
+    delivery_time_days: Optional[int]
+    notes: Optional[str]
     status: str
     created_at: datetime
 
@@ -106,15 +106,15 @@ class OrderEventIn(BaseModel):
 class OrderEventOut(BaseModel):
     id: int
     order_id: int
-    actor_user_id: int | None
-    actor_role: str | None
+    actor_user_id: Optional[int]
+    actor_role: Optional[str]
     status: TrackingStatus
-    location: str | None
-    hub_name: str | None
-    note: str | None
-    delay_reason: str | None
-    delay_hours: int | None
-    eta: datetime | None
+    location: Optional[str]
+    hub_name: Optional[str]
+    note: Optional[str]
+    delay_reason: Optional[str]
+    delay_hours: Optional[int]
+    eta: Optional[datetime]
     created_at: datetime
 
     model_config = ConfigDict(from_attributes=True)

@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
 from sqlalchemy.orm import Session
@@ -17,7 +17,7 @@ async def create_vendor_profile(
     phone_number: str = Form(""),
     ports_served: List[str] = Form([]),
     categories_supplied: List[str] = Form([]),
-    logo: UploadFile | None = File(None),
+    logo: Optional[UploadFile] = File(None),
     db: Session = Depends(get_db),
     user = Depends(get_current_user),
 ):
@@ -47,10 +47,10 @@ async def create_vendor_profile(
 
 @router.post("/vendor/documents")
 async def upload_vendor_documents(
-    trade_license: UploadFile | None = File(None),
-    gst_vat: UploadFile | None = File(None),
-    bank_details: UploadFile | None = File(None),
-    iso_certifications: UploadFile | None = File(None),
+    trade_license: Optional[UploadFile] = File(None),
+    gst_vat: Optional[UploadFile] = File(None),
+    bank_details: Optional[UploadFile] = File(None),
+    iso_certifications: Optional[UploadFile] = File(None),
     db: Session = Depends(get_db),
     user = Depends(get_current_user),
 ):

@@ -31,7 +31,7 @@ def verify_token(token: str) -> Optional[str]:
         return None
 
 
-def decode_subject(token: str) -> str | None:
+def decode_subject(token: str) -> Optional[str]:
     try:
         payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[ALGORITHM])
         return payload.get("sub")

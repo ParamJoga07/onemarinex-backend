@@ -1,7 +1,7 @@
 # app/api/v1/routes_quotes.py
 from datetime import datetime
 from decimal import Decimal, ROUND_HALF_UP
-from typing import List, Optional
+from typing import List, Optional, Union
 
 from fastapi import APIRouter, Depends, HTTPException, Header, status, Query
 from pydantic import BaseModel, Field, ConfigDict
@@ -81,11 +81,11 @@ class OrderOut(BaseModel):
     id: int
     order_number: str
     rfq_id: int
-    quote_id: int | None
-    buyer_user_id: int | None
-    vendor_user_id: int | None
-    vendor_company: str | None
-    port: str | None
+    quote_id: Optional[int]
+    buyer_user_id: Optional[int]
+    vendor_user_id: Optional[int]
+    vendor_company: Optional[str]
+    port: Optional[str]
     currency: str
     items: list[QuoteItemOut]
     shipping_cost: float
@@ -94,15 +94,15 @@ class OrderOut(BaseModel):
     subtotal: float
     tax_amount: float
     grand_total: float
-    delivery_time_days: int | None
-    notes: str | None
+    delivery_time_days: Optional[int]
+    notes: Optional[str]
     status: str
     created_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
 
 # -------- utils --------
-def _money(x: float | Decimal) -> Decimal:
+def _money(x: Union[float, Decimal]) -> Decimal:
     """Quantize to 2 decimals with HALF_UP."""
     d = Decimal(str(x))
     return d.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)

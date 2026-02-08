@@ -1,4 +1,6 @@
-#!/Users/param/onemarinex-backend/.venv/bin/python3.11
+#!/bin/sh
+'''exec' "/Users/param/heyports dev/onemarinex-backend/.venv/bin/python3" "$0" "$@"
+' '''
 # -*- coding: utf-8 -*-
 import re
 import sys

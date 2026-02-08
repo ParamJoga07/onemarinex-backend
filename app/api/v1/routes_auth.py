@@ -1,14 +1,11 @@
 from datetime import timedelta
-from typing import List, Optional
+from typing import Optional
 
 from fastapi import (
     APIRouter,
     Depends,
     HTTPException,
     status,
-    UploadFile,
-    File,
-    Form,
     Header,
 )
 from pydantic import BaseModel, EmailStr, Field
@@ -17,7 +14,6 @@ from sqlalchemy.orm import Session
 from app.db.session import get_db
     # ensure these models are imported so relationships are configured
 from app.db.models.user import User
-from app.db.models.vendor_profile import VendorProfile
 from app.services.auth import (
     get_password_hash,
     verify_password,
@@ -65,7 +61,7 @@ def get_current_user(
 # Schemas
 # ----------------------------
 class SignupIn(BaseModel):
-    name: str | None = Field(default=None, max_length=120)
+    name: Optional[str] = Field(default=None, max_length=120)
     email: EmailStr
     password: str = Field(min_length=6)
     role: str = Field(pattern="^(shipping_company|vendor|agent)$")
@@ -124,87 +120,3 @@ def login(body: LoginIn, db: Session = Depends(get_db)):
         expires_delta=timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES),
     )
     return AuthOut(access_token=token, role=user.role)
-
-
-# ----------------------------
-# Vendor profile routes
-# ----------------------------
-@router.post("/vendor/profile", status_code=status.HTTP_201_CREATED)
-async def create_vendor_profile(
-    company_name: str = Form(...),
-    contact_person: str = Form(...),
-    phone_number: str = Form(...),
-    ports_served: List[str] = Form([]),
-    categories_supplied: List[str] = Form([]),
-    logo: UploadFile | None = File(None),
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    if current_user.role != "vendor":
-        raise HTTPException(status_code=403, detail="Only vendors can create profiles")
-
-    # Ensure one profile per vendor (user_id is unique in the table)
-    existing = db.query(VendorProfile).filter(VendorProfile.user_id == current_user.id).first()
-    if existing:
-        raise HTTPException(status_code=409, detail="Vendor profile already exists")
-
-    profile = VendorProfile(
-        user_id=current_user.id,
-        company_name=company_name,
-        contact_person=contact_person,
-        phone_number=phone_number,
-        ports_served=ports_served,
-        categories_supplied=categories_supplied,
-        logo_url=f"/uploads/{logo.filename}" if logo else None,
-    )
-    db.add(profile)
-    db.commit()
-    db.refresh(profile)
-    return {"id": profile.id, "status": "created"}
-
-
-@router.post("/vendor/documents")
-async def upload_vendor_documents(
-    trade_license: UploadFile | None = File(None),
-    gst_vat: UploadFile | None = File(None),
-    bank_details: UploadFile | None = File(None),
-    iso_certifications: UploadFile | None = File(None),
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    if current_user.role != "vendor":
-        raise HTTPException(status_code=403, detail="Only vendors can upload vendor documents")
-
-    profile = db.query(VendorProfile).filter(VendorProfile.user_id == current_user.id).first()
-    if not profile:
-        raise HTTPException(status_code=404, detail="Vendor profile not found")
-
-    if trade_license:
-        profile.trade_license_url = f"/uploads/{trade_license.filename}"
-    if gst_vat:
-        profile.gst_vat_url = f"/uploads/{gst_vat.filename}"
-    if bank_details:
-        profile.bank_details_url = f"/uploads/{bank_details.filename}"
-    if iso_certifications:
-        profile.iso_certifications_url = f"/uploads/{iso_certifications.filename}"
-
-    db.commit()
-    return {"status": "documents_uploaded"}
-
-
-@router.get("/vendor/verification")
-async def get_vendor_verification_status(
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    if current_user.role != "vendor":
-        raise HTTPException(status_code=403, detail="Only vendors can query verification status")
-
-    profile = db.query(VendorProfile).filter(VendorProfile.user_id == current_user.id).first()
-    if not profile:
-        raise HTTPException(status_code=404, detail="Vendor profile not found")
-
-    return {
-        "status": profile.verification_status,
-        "notes": profile.verification_notes,
-    }

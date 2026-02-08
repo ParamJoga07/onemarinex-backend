@@ -1,10 +1,14 @@
-from fastapi import Depends, Header, HTTPException, status
+from typing import Optional
 from sqlalchemy.orm import Session
 from app.db.session import get_db
 from app.db.models.user import User
 from app.services.auth import decode_subject 
 
-def get_current_user(authorization: str | None = Header(None), db: Session = Depends(get_db)) -> User:
+
+from fastapi import Depends, Header, HTTPException, status
+# ... existing imports ...
+
+def get_current_user(authorization: Optional[str] = Header(None), db: Session = Depends(get_db)) -> User:
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
     token = authorization.split()[1]
