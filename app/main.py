@@ -8,7 +8,8 @@ from app.core.config import settings
 from app.db.session import engine
 from app.db.base import Base
 
-from app.api.v1 import routes_auth, routes_contact, routes_files, routes_users
+from app.api.v1 import routes_auth, routes_contact, routes_files, routes_users, registration, routes_crew, routes_pubs
+
 from app.api.v1.routes_vendor import router as vendor_router
 from app.api.v1.routes_rfqs import router as rfq_router
 from app.api.v1 import routes_quotes 
@@ -20,6 +21,8 @@ app = FastAPI(title=settings.APP_NAME)
 origins = [
     "http://localhost:5173",
     "http://127.0.0.1:5173",
+    "http://localhost:5174",
+    "http://127.0.0.1:5174",
 ]
 app.add_middleware(
     CORSMiddleware,
@@ -44,6 +47,9 @@ app.include_router(vendor_router,         prefix="/api/v1",         tags=["vendo
 app.include_router(rfq_router, prefix="/api/v1", tags=["rfqs"])
 app.include_router(routes_quotes.router, prefix="/api/v1", tags=["quotes"])
 app.include_router(routes_orders.router,  prefix="/api/v1",         tags=["orders"])
+app.include_router(registration.router,   prefix="/api/v1/registration", tags=["registration"])
+app.include_router(routes_crew.router,     prefix="/api/v1/crew",         tags=["crew"])
+app.include_router(routes_pubs.router,     prefix="/api/v1/pubs",         tags=["pubs"])
 
 
 

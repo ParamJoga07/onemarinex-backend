@@ -9,7 +9,7 @@ class Settings:
     )
     SECRET_KEY = os.getenv("SECRET_KEY", "onemarinexsecret")
     ALGORITHM = "HS256"
-    ACCESS_TOKEN_EXPIRE_MINUTES = 30
+    ACCESS_TOKEN_EXPIRE_MINUTES = 20160  # 2 weeks (14 days * 24 hours * 60 minutes)
     APP_NAME = "OneMarinex API"
 
 settings = Settings()
