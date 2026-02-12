@@ -1,11 +1,13 @@
-from app.db.base import engine, Base
+from app.db.base import Base
+from app.db.session import engine
 
 def create_tables():
     """Create all tables in the database"""
     try:
         # Import models to register them with Base
         from app.db.models.user import User
-        print("User model imported successfully")
+        from app.db.models.hotels import Hotel
+        print("User and Hotel models imported successfully")
         
         # Create all tables
         Base.metadata.create_all(bind=engine)

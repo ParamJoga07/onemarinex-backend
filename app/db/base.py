@@ -17,5 +17,7 @@ from app.db.models import cab_booking     # noqa: F401
 from app.db.models import cab_pricing     # noqa: F401
 from app.db.models import file_asset      # noqa: F401
 from app.db.models import pub             # noqa: F401
+from app.db.models import restaurant      # noqa: F401
+from app.db.models import hotels          # noqa: F401
 from app.db.models.order import Order
 from app.db.models.order_event import OrderEvent 

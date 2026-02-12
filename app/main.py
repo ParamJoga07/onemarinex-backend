@@ -8,7 +8,7 @@ from app.core.config import settings
 from app.db.session import engine
 from app.db.base import Base
 
-from app.api.v1 import routes_auth, routes_contact, routes_files, routes_users, registration, routes_crew, routes_pubs
+from app.api.v1 import routes_auth, routes_contact, routes_files, routes_users, registration, routes_crew, routes_pubs, routes_hotels, routes_restaurants
 
 from app.api.v1.routes_vendor import router as vendor_router
 from app.api.v1.routes_rfqs import router as rfq_router
@@ -50,6 +50,8 @@ app.include_router(routes_orders.router,  prefix="/api/v1",         tags=["order
 app.include_router(registration.router,   prefix="/api/v1/registration", tags=["registration"])
 app.include_router(routes_crew.router,     prefix="/api/v1/crew",         tags=["crew"])
 app.include_router(routes_pubs.router,     prefix="/api/v1/pubs",         tags=["pubs"])
+app.include_router(routes_hotels.router,   prefix="/api/v1/hotels",       tags=["hotels"])
+app.include_router(routes_restaurants.router, prefix="/api/v1/restaurants",   tags=["restaurants"])
 
 
 
