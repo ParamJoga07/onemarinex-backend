@@ -1,6 +1,6 @@
 # Database
 psycopg2-binary==2.9.7
-sqlalchemy==2.0.23
+sqlalchemy==2.0.36
 alembic==1.12.1
 
 # Authentication & Security
