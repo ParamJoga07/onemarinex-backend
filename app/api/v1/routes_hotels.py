@@ -25,6 +25,28 @@ def get_hotels(
     hotels = query.all()
     return hotels
 
+# Get hotels based on filters
+@router.get("/filters")
+def get_hotels_by_filters(
+    max_dist: Optional[float] = None,
+    min_price: Optional[float] = None,
+    max_price: Optional[float] = None,
+    min_rating: Optional[float] = None,
+    db: Session = Depends(get_db)
+):
+    query = db.query(Hotel)
+    if max_dist is not None:
+        query = query.filter(Hotel.distance_from_port <= max_dist)
+    if min_price is not None:
+        query = query.filter(Hotel.price_per_night >= min_price)
+    if max_price is not None:
+        query = query.filter(Hotel.price_per_night <= max_price)
+    if min_rating is not None:
+        query = query.filter(Hotel.rating >= min_rating)
+    
+    hotels = query.all()
+    return hotels
+
 # Get hotel by id
 @router.get("/{id}")
 def get_hotel(id: int, db: Session = Depends(get_db)):

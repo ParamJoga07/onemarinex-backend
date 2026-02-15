@@ -16,11 +16,11 @@ from pydantic import BaseModel
 router = APIRouter()
 
 class ProfileUpdateIn(BaseModel):
-    full_name: str
-    rank: str
-    nationality: str
-    passport_number: str
-    date_of_birth: date
+    full_name: Optional[str] = None
+    rank: Optional[str] = None
+    nationality: Optional[str] = None
+    passport_number: Optional[str] = None
+    date_of_birth: Optional[date] = None
     current_port: Optional[str] = None
     vessel: Optional[str] = None
 
@@ -127,16 +127,10 @@ def update_crew_profile(
     if not profile:
         raise HTTPException(status_code=404, detail="Crew profile not found")
     
-    profile.full_name = body.full_name
-    profile.rank = body.rank
-    profile.nationality = body.nationality
-    profile.passport_number = body.passport_number
-    profile.date_of_birth = body.date_of_birth
-    
-    if body.current_port:
-        profile.current_port = body.current_port
-    if body.vessel:
-        profile.vessel = body.vessel
+    # Partial update: only update if field is present in request
+    update_data = body.model_dump(exclude_unset=True)
+    for field, value in update_data.items():
+        setattr(profile, field, value)
     
     try:
         db.commit()
@@ -221,10 +215,13 @@ def book_cab(
     # Generate booking ID: CAB-XXXXXXXX
     booking_id = f"CAB-{uuid.uuid4().hex[:8].upper()}"
     
+    print(f"DEBUG: Receiving booking with price: {body.estimated_price}")
+    
     # Generate 4-digit OTP
     import random
     otp = f"{random.randint(0, 9999):04d}"
     
+    from app.db.models.cab_booking import VehicleType, BookingStatus
     new_booking = CabBooking(
         booking_id=booking_id,
         crew_id=profile.id,
@@ -234,7 +231,7 @@ def book_cab(
         drop_address=body.drop_address,
         drop_lat=body.drop_lat,
         drop_lng=body.drop_lng,
-        vehicle_type=body.vehicle_type,
+        vehicle_type=VehicleType(body.vehicle_type),
         vehicle_name=body.vehicle_name,
         estimated_price=body.estimated_price,
         distance_km=body.distance_km,
@@ -242,10 +239,10 @@ def book_cab(
         crew_member_ids=body.crew_member_ids,
         scheduled_time=body.scheduled_time,
         otp=otp,
-        driver_name="Not Yet Assigned",
-        driver_phone="Not Yet Assigned",
+        driver_name=None,
+        driver_phone=None,
         agent_number="+91 9876543251",
-        status="pending"
+        status=BookingStatus.PENDING
     )
     
     db.add(new_booking)
@@ -259,21 +256,22 @@ def book_cab(
     return CabBookingCreateOut(
         booking_id=new_booking.booking_id,
         otp=new_booking.otp,
-        status=new_booking.status,
+        status=new_booking.status.value,
         agent_number=new_booking.agent_number
     )
 
-@router.get("/cab/history", response_model=List[CabBookingOut])
-def get_cab_history(
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    profile = db.query(CrewProfile).filter(CrewProfile.user_id == current_user.id).first()
-    if not profile:
-        return []
-    
-    history = db.query(CabBooking).filter(CabBooking.crew_id == profile.id).order_by(CabBooking.created_at.desc()).all()
-    return history
+# Duplicate route removed/commented out
+# @router.get("/cab/history", response_model=List[CabBookingOut])
+# def get_cab_history(
+#     db: Session = Depends(get_db),
+#     current_user: User = Depends(get_current_user)
+# ):
+#     profile = db.query(CrewProfile).filter(CrewProfile.user_id == current_user.id).first()
+#     if not profile:
+#         return []
+#     
+#     history = db.query(CabBooking).filter(CabBooking.crew_id == profile.id).order_by(CabBooking.created_at.desc()).all()
+#     return history
 
 @router.get("/cab/estimate", response_model=List[CabEstimate])
 def get_cab_estimates(
@@ -325,68 +323,7 @@ def get_cab_estimates(
         ))
     return estimates
 
-# New Cab Booking Endpoints
-
-@router.post("/cab/book", response_model=CabBookingCreateOut)
-def create_cab_booking(
-    body: CabBookingCreateIn,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    """Create a new cab booking with OTP generation"""
-    if current_user.role != "crew":
-        raise HTTPException(status_code=403, detail="Only crew can book cabs")
-    
-    profile = db.query(CrewProfile).filter(CrewProfile.user_id == current_user.id).first()
-    if not profile:
-        raise HTTPException(status_code=404, detail="Crew profile not found")
-    
-    # Generate unique booking ID
-    booking_id = f"CAB-{uuid.uuid4().hex[:8].upper()}"
-    
-    # Generate 4-digit OTP
-    import random
-    otp = f"{random.randint(0, 9999):04d}"
-    
-    # Create booking
-    from app.db.models.cab_booking import VehicleType, BookingStatus
-    booking = CabBooking(
-        booking_id=booking_id,
-        crew_id=profile.id,
-        pickup_address=body.pickup_address,
-        pickup_lat=body.pickup_lat,
-        pickup_lng=body.pickup_lng,
-        drop_address=body.drop_address,
-        drop_lat=body.drop_lat,
-        drop_lng=body.drop_lng,
-        vehicle_type=VehicleType(body.vehicle_type),
-        vehicle_name=body.vehicle_name,
-        estimated_price=body.estimated_price,
-        distance_km=body.distance_km,
-        num_passengers=body.num_passengers,
-        crew_member_ids=body.crew_member_ids,
-        scheduled_time=body.scheduled_time,
-        otp=otp,
-        driver_name=None,
-        driver_phone=None,
-        agent_number="+91 9876543251",
-        status=BookingStatus.PENDING
-    )
-    
-    try:
-        db.add(booking)
-        db.commit()
-        db.refresh(booking)
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=f"Failed to create booking: {str(e)}")
-    
-    return CabBookingCreateOut(
-        booking_id=booking.booking_id,
-        otp=booking.otp,
-        status=booking.status.value,
-        agent_number=booking.agent_number
-    )
+    return {"message": "Booking cancelled successfully", "booking_id": booking_id}
 
 @router.get("/cab/bookings/{booking_id}", response_model=CabBookingDetailsOut)
 def get_booking_details(
