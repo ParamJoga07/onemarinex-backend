@@ -10,6 +10,8 @@ class ShorePass(Base):
 
     agent_name = Column(String(120), nullable=True)
     shore_pass_id = Column(String(64), nullable=False, unique=True)
+    port_name = Column(String(128), nullable=True)
+    vessel_name = Column(String(128), nullable=True)
     
     out_time = Column(DateTime(timezone=True), nullable=True)
     in_time = Column(DateTime(timezone=True), nullable=True)

@@ -42,6 +42,8 @@ class ShorePassOut(BaseModel):
     id: int
     agent_name: Optional[str]
     shore_pass_id: str
+    port_name: Optional[str]
+    vessel_name: Optional[str]
     out_time: Optional[datetime]
     in_time: Optional[datetime]
     expires_at: Optional[datetime]
@@ -150,8 +152,13 @@ def get_crew_profile(
         raise HTTPException(status_code=404, detail="Crew profile not found")
     return profile
 
+class GenerateShorePassIn(BaseModel):
+    port_name: Optional[str] = None
+    vessel_name: Optional[str] = None
+
 @router.post("/generate-shorepass", response_model=ShorePassOut)
 def generate_shorepass(
+    body: GenerateShorePassIn = GenerateShorePassIn(),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
@@ -165,14 +172,30 @@ def generate_shorepass(
     if not profile:
         raise HTTPException(status_code=404, detail="Crew profile not found")
     
-    if not profile.current_port or not profile.vessel:
+    # Use explicitly passed port/vessel, fallback to profile values
+    port = body.port_name or profile.current_port
+    vessel = body.vessel_name or profile.vessel
+
+    if not port or not vessel:
         raise HTTPException(status_code=400, detail="Port and Vessel must be selected first")
 
-    # Mock data for shore pass generation
+    # Derive agent name from port (e.g. "port_singapore" -> "Singapore Port Authority")
+    port_display = port.replace("port_", "").replace("_", " ").title()
+    agent_name = f"{port_display} Port Authority"
+
+    # Build unique shore pass ID: port code + vessel code + random
+    port_code = port.replace("port_", "")[:3].upper()          # e.g. "SIN"
+    vessel_code = vessel.replace("vessel_", "V")[:3].upper()   # e.g. "V1"
+    random_suffix = uuid.uuid4().hex[:4].upper()
+    shore_pass_id = f"SP-{port_code}-{vessel_code}-{random_suffix}"
+
+    # Generate shore pass
     new_pass = ShorePass(
         crew_profile_id=profile.id,
-        agent_name="Vizag Port Authority",
-        shore_pass_id=f"SP-{uuid.uuid4().hex[:8].upper()}",
+        agent_name=agent_name,
+        shore_pass_id=shore_pass_id,
+        port_name=port,
+        vessel_name=vessel,
         out_time=datetime.utcnow(),
         in_time=datetime.utcnow() + timedelta(days=7),
         expires_at=datetime.utcnow() + timedelta(days=7),
@@ -201,6 +224,21 @@ def get_current_shorepass(
     # Get the latest shore pass
     last_pass = db.query(ShorePass).filter(ShorePass.crew_profile_id == profile.id).order_by(ShorePass.created_at.desc()).first()
     return last_pass
+
+@router.get("/shorepass/history", response_model=List[ShorePassOut])
+def get_shorepass_history(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """Get all shore passes for the current user (newest first)"""
+    profile = db.query(CrewProfile).filter(CrewProfile.user_id == current_user.id).first()
+    if not profile:
+        return []
+    
+    passes = db.query(ShorePass).filter(
+        ShorePass.crew_profile_id == profile.id
+    ).order_by(ShorePass.created_at.desc()).all()
+    return passes
 
 @router.post("/cab/book", response_model=CabBookingCreateOut)
 def book_cab(
