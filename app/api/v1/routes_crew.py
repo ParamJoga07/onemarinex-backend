@@ -41,6 +41,13 @@ router = APIRouter()
 DEFAULT_TRIP_SPEED_KMPH = 28.0
 
 
+def is_partnered_agency(agency_name: Optional[str]) -> bool:
+    if not agency_name:
+        return False
+    clean = agency_name.strip().lower()
+    return clean not in ["other", "others", "none", "n/a", "", "other agency"]
+
+
 def _fallback_straight_line_distance_km(
     pickup_lat: float,
     pickup_lng: float,
@@ -472,7 +479,7 @@ def sync_crew_manifest_helper(profile: CrewProfile, db: Session):
             if not agency_name and vessel.agent and hasattr(vessel.agent, "agent_profile") and vessel.agent.agent_profile:
                 agency_name = vessel.agent.agent_profile.agency_name
 
-            if agency_name and agency_name.strip().lower() != "other":
+            if is_partnered_agency(agency_name):
                 port_to_use = vessel_port or profile.current_port or "GEN"
                 existing_pass = db.query(ShorePass).filter(
                     ShorePass.crew_profile_id == profile.id,
@@ -611,7 +618,7 @@ def get_crew_profile(
         agency_name = "Other"
 
     profile.agency_name = agency_name
-    profile.has_partnered_agency = bool(agency_name and agency_name.strip().lower() != "other")
+    profile.has_partnered_agency = is_partnered_agency(agency_name)
     profile.vessel_exists = v_target is not None
     
     return profile
@@ -889,7 +896,7 @@ def generate_shorepass(
     if not agency_name and v_target and v_target.agent and hasattr(v_target.agent, "agent_profile") and v_target.agent.agent_profile:
         agency_name = v_target.agent.agent_profile.agency_name
 
-    if not agency_name or agency_name.strip().lower() == "other":
+    if not is_partnered_agency(agency_name):
         return None
 
     # Derive agent name from port (e.g. "port_singapore" -> "Singapore Port Authority")
@@ -944,7 +951,7 @@ def get_current_shorepass(
     if not agency_name and v_target and v_target.agent and hasattr(v_target.agent, "agent_profile") and v_target.agent.agent_profile:
         agency_name = v_target.agent.agent_profile.agency_name
 
-    if not agency_name or agency_name.strip().lower() == "other":
+    if not is_partnered_agency(agency_name):
         return None
 
     # Get the latest shore pass for the CURRENT port
@@ -992,7 +999,7 @@ def check_shorepass_eligibility(
     if not agency_name and matching_vessel.agent and hasattr(matching_vessel.agent, "agent_profile") and matching_vessel.agent.agent_profile:
         agency_name = matching_vessel.agent.agent_profile.agency_name
 
-    if not agency_name or agency_name.strip().lower() == "other":
+    if not is_partnered_agency(agency_name):
         return {"under_agent": False, "agent_name": None}
 
     # Get the agent's name

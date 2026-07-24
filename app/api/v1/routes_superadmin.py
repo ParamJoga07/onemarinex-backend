@@ -1262,7 +1262,7 @@ class SuperAdminVesselCreate(BaseModel):
     etd: Optional[datetime] = None
     status: Optional[str] = "Active"
 
-from app.api.v1.routes_vessels import VesselOut
+from app.api.v1.routes_vessels import VesselOut, is_partnered_agency
 
 @router.get("/vessels", response_model=List[VesselOut])
 def list_all_vessels_superadmin(
@@ -1290,7 +1290,7 @@ def create_vessel_superadmin(
         c_count = body.total_crew
 
     assigned_agent_id = body.agent_id or current_user.id
-    if body.agency_name and body.agency_name != "Other":
+    if body.agency_name and is_partnered_agency(body.agency_name):
         # Find agent with matching agency_name if possible
         from app.db.models.agent_profile import AgentProfile
         prof = db.query(AgentProfile).filter(AgentProfile.agency_name == body.agency_name).first()
@@ -1342,7 +1342,7 @@ def update_vessel_superadmin(
     vessel.flag = body.flag
     if body.agency_name is not None:
         vessel.agency_name = body.agency_name
-        if body.agency_name != "Other":
+        if is_partnered_agency(body.agency_name):
             from app.db.models.agent_profile import AgentProfile
             prof = db.query(AgentProfile).filter(AgentProfile.agency_name == body.agency_name).first()
             if prof:

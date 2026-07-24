@@ -16,6 +16,13 @@ import uuid
 
 router = APIRouter()
 
+
+def is_partnered_agency(agency_name: Optional[str]) -> bool:
+    if not agency_name:
+        return False
+    clean = agency_name.strip().lower()
+    return clean not in ["other", "others", "none", "n/a", "", "other agency"]
+
 # --- Pydantic Schemas ---
 
 class CrewMemberIn(BaseModel):
@@ -197,7 +204,7 @@ def upload_crew_manifest(vessel_id: int, file: UploadFile = File(...), current_u
             agency_name = vessel.agency_name
             if not agency_name and vessel.agent and hasattr(vessel.agent, "agent_profile") and vessel.agent.agent_profile:
                 agency_name = vessel.agent.agent_profile.agency_name
-            if agency_name and agency_name.strip().lower() != "other":
+            if is_partnered_agency(agency_name):
                 existing_pass = db.query(ShorePass).filter(
                     ShorePass.crew_profile_id == profile.id,
                     ShorePass.port_name == port,
@@ -388,7 +395,7 @@ def get_public_vessels(
         if not agency:
             agency = "Other"
         
-        has_partnered = bool(agency and agency.strip().lower() != "other")
+        has_partnered = is_partnered_agency(agency)
         out.append(VesselPublicOut(
             id=v.id,
             name=v.name,
@@ -442,7 +449,7 @@ def add_crew_member(vessel_id: int, body: CrewMemberIn, current_user: User = Dep
     agency_name = vessel.agency_name
     if not agency_name and vessel.agent and hasattr(vessel.agent, "agent_profile") and vessel.agent.agent_profile:
         agency_name = vessel.agent.agent_profile.agency_name
-    if profile and agency_name and agency_name.strip().lower() != "other":
+    if profile and is_partnered_agency(agency_name):
         # Create ShorePass automatically
         port_code = (port or "GEN").replace("port_", "")[:3].upper()
         vessel_code = vessel.name.replace(" ", "")[:3].upper()
