@@ -439,16 +439,27 @@ def sync_crew_manifest_helper(profile: CrewProfile, db: Session):
     from app.db.models.vessel_crew import VesselCrew
     from app.db.models.vessel import Vessel
     
-    # 1. Try to find VesselCrew matching by generated HPID or passport search
+    # 1. Try to find VesselCrew matching current vessel and generated HPID or passport search
     hpid = profile.hpid or generate_hpid(profile.passport_number, profile.nationality, profile.current_port)
     
-    v_crew = db.query(VesselCrew).filter(VesselCrew.hp_id == hpid).first()
-    if not v_crew and profile.passport_number:
-        # Match by passport_number column directly
-        v_crew = db.query(VesselCrew).filter(VesselCrew.passport_number == profile.passport_number).first()
-    if not v_crew and profile.passport_number:
-        # Fallback: search for VesselCrew by passport code in hp_id
-        v_crew = db.query(VesselCrew).filter(VesselCrew.hp_id.like(f"HP-{profile.passport_number}-%")).first()
+    v_crew = None
+    if profile.vessel and profile.vessel.strip():
+        target_vessel_name = profile.vessel.strip()
+        v_crew = (
+            db.query(VesselCrew)
+            .join(Vessel, VesselCrew.vessel_id == Vessel.id)
+            .filter(
+                func.lower(Vessel.name) == target_vessel_name.lower(),
+                (VesselCrew.hp_id == hpid) | (VesselCrew.passport_number == profile.passport_number)
+            )
+            .first()
+        )
+    else:
+        v_crew = db.query(VesselCrew).filter(VesselCrew.hp_id == hpid).first()
+        if not v_crew and profile.passport_number:
+            v_crew = db.query(VesselCrew).filter(VesselCrew.passport_number == profile.passport_number).first()
+        if not v_crew and profile.passport_number:
+            v_crew = db.query(VesselCrew).filter(VesselCrew.hp_id.like(f"HP-{profile.passport_number}-%")).first()
         
     if v_crew:
         # 2. Sync fields
@@ -587,9 +598,22 @@ def get_crew_profile(
     from app.db.models.vessel_crew import VesselCrew
     from app.db.models.vessel import Vessel
     
-    v_crew = db.query(VesselCrew).filter(VesselCrew.hp_id == profile.hpid).first()
-    if not v_crew and profile.passport_number:
-        v_crew = db.query(VesselCrew).filter(VesselCrew.passport_number == profile.passport_number).first()
+    v_crew = None
+    if profile.vessel and profile.vessel.strip():
+        target_vessel_name = profile.vessel.strip()
+        v_crew = (
+            db.query(VesselCrew)
+            .join(Vessel, VesselCrew.vessel_id == Vessel.id)
+            .filter(
+                func.lower(Vessel.name) == target_vessel_name.lower(),
+                (VesselCrew.hp_id == profile.hpid) | (VesselCrew.passport_number == profile.passport_number)
+            )
+            .first()
+        )
+    else:
+        v_crew = db.query(VesselCrew).filter(VesselCrew.hp_id == profile.hpid).first()
+        if not v_crew and profile.passport_number:
+            v_crew = db.query(VesselCrew).filter(VesselCrew.passport_number == profile.passport_number).first()
     vessel = None
     if v_crew:
         vessel = db.query(Vessel).filter(Vessel.id == v_crew.vessel_id).first()
@@ -954,10 +978,11 @@ def get_current_shorepass(
     if not is_partnered_agency(agency_name):
         return None
 
-    # Get the latest shore pass for the CURRENT port
+    # Get the latest shore pass for the CURRENT port and CURRENT vessel
     last_pass = db.query(ShorePass).filter(
         ShorePass.crew_profile_id == profile.id,
-        ShorePass.port_name == profile.current_port
+        ShorePass.port_name == profile.current_port,
+        func.lower(ShorePass.vessel_name) == profile.vessel.strip().lower()
     ).order_by(ShorePass.created_at.desc()).first()
     return last_pass
 
