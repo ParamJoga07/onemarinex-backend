@@ -16,3 +16,5 @@ email-validator==2.1.0
 python-dotenv==1.0.0
 httpx==0.28.1
 qrcode[pil]>=7.4.2
+# Scheduled jobs (shore-pass return reminders)
+apscheduler==3.10.4

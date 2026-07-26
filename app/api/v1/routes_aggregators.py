@@ -3,6 +3,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import func, cast, String, or_, and_
 from typing import List, Optional, Dict, Any
 from datetime import datetime, date
+import logging
 
 from app.db.session import get_db
 from app.db.models.aggregator_profile import AggregatorProfile
@@ -19,6 +20,7 @@ from app.services.timeline_service import create_timeline_event
 from app.services.booking_service import get_eligible_providers_for_ride
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 PRICING_PROVIDER_TYPE_BY_PROFILE_TYPE = {
     "partnered_driver": "partner_drivers",
@@ -552,6 +554,15 @@ def decline_ride(
         )
 
     db.commit()
+
+    if not remaining:
+        try:
+            from app.services.whatsapp import notify_trip_rejection
+            crew_user = full_booking.crew.user if full_booking.crew else None
+            notify_trip_rejection(crew_user.mobile_number if crew_user else None)
+        except Exception:
+            logger.exception("WhatsApp trip_rejection notify failed for booking %s", full_booking.booking_id)
+
     return {
         "message": "Ride declined for this provider; still available to others" if remaining else "Booking cancelled — no eligible providers remaining",
         "booking_id": booking_id,

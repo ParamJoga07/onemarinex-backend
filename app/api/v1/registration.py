@@ -10,7 +10,7 @@ from app.db.models.crew_profile import CrewProfile
 from app.db.models.agent_profile import AgentProfile
 from app.db.models.aggregator_profile import AggregatorProfile
 from app.services.auth import get_password_hash, create_access_token, create_refresh_token
-from app.services.crew_service import generate_hpid
+from app.services.crew_service import generate_unique_hpid
 from app.api.v1.routes_auth import AuthOut
 from app.core.config import settings
 import random
@@ -72,6 +72,9 @@ class FleetItem(BaseModel):
     cost_per_km: float
     
 class AggregatorUpdate(BaseModel):
+    email: Optional[EmailStr] = None
+    mobile_number: Optional[str] = None
+    password: Optional[str] = Field(default=None, min_length=6)
     company_name: Optional[str]
     provider_type: Optional[str] = Field(default=None, pattern="^(partnered_driver|aggregator)$")
     contact_person: Optional[str]
@@ -80,7 +83,7 @@ class AggregatorUpdate(BaseModel):
     status: Optional[str] = Field(default=None, pattern="^(Active|Suspended|Inactive)$")
 
     fleet: Optional[List[FleetItem]]
-    documents: Optional[List[str]]    
+    documents: Optional[List[str]]
 
 @router.post("/crew", response_model=AuthOut, status_code=status.HTTP_201_CREATED)
 def register_crew(body: CrewRegistrationIn, db: Session = Depends(get_db)):
@@ -117,7 +120,10 @@ def register_crew(body: CrewRegistrationIn, db: Session = Depends(get_db)):
     db.flush() # Get crew_profile.id
 
     # 3. Generate HPID using Passport Number
-    crew_profile.hpid = generate_hpid(body.passport_number, body.nationality, "port_general")
+    crew_profile.hpid = generate_unique_hpid(
+        db, body.passport_number, body.nationality, "port_general",
+        unique_fallback=user.id, exclude_profile_id=crew_profile.id,
+    )
     
     try:
         db.commit()
@@ -293,6 +299,19 @@ def update_aggregator(
         raise HTTPException(status_code=404, detail="Aggregator not found")
 
     update_data = payload.dict(exclude_unset=True)
+
+    # email/mobile_number/password live on the linked User row, not AggregatorProfile
+    user_fields = {"email", "mobile_number", "password"}
+    user_updates = {k: update_data.pop(k) for k in list(update_data.keys()) if k in user_fields}
+    if user_updates:
+        user = db.query(User).filter(User.id == aggregator.user_id).first()
+        if user:
+            if user_updates.get("email"):
+                user.email = user_updates["email"].lower().strip()
+            if user_updates.get("mobile_number"):
+                user.mobile_number = user_updates["mobile_number"]
+            if user_updates.get("password"):
+                user.hashed_password = get_password_hash(user_updates["password"])
 
     for key, value in update_data.items():
         setattr(aggregator, key, value)
