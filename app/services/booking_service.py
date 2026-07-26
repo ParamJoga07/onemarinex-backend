@@ -1,3 +1,4 @@
+import logging
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -14,6 +15,8 @@ from app.db.models.port import Port
 from app.db.models.pricing_controls import PricingVehicleCategory
 from app.db.models.user import User
 from app.services.timeline_service import create_timeline_event
+
+logger = logging.getLogger(__name__)
 
 
 RIDE_TYPE_TO_PROVIDER_TYPE = {
@@ -633,6 +636,18 @@ def assign_driver_to_booking(
     )
     db.commit()
     db.refresh(booking)
+
+    try:
+        from app.services.whatsapp import notify_driver_alloted
+        crew_user = booking.crew.user if booking.crew else None
+        notify_driver_alloted(
+            crew_user.mobile_number if crew_user else None,
+            booking.booking_id, booking.driver_name, booking.driver_plate,
+            booking.pickup_address, booking.driver_phone,
+        )
+    except Exception:
+        logger.exception("WhatsApp driver_alloted notify failed for booking %s", booking.booking_id)
+
     return booking
 
 
@@ -661,7 +676,7 @@ def driver_accept_booking(db: Session, booking: CabBooking, driver: Driver) -> C
 
 def start_trip(db: Session, booking: CabBooking, driver: Driver) -> CabBooking:
     ensure_driver_access(booking, driver)
-    if booking.status not in {BookingStatus.DRIVER_ACCEPTED, BookingStatus.DRIVER_ASSIGNED}:
+    if booking.status not in {BookingStatus.DRIVER_ACCEPTED, BookingStatus.DRIVER_ASSIGNED, BookingStatus.ARRIVED}:
         raise HTTPException(status_code=400, detail="Trip cannot be started in current status")
 
     now = datetime.utcnow()
@@ -704,6 +719,16 @@ def complete_trip(db: Session, booking: CabBooking, driver: Driver) -> CabBookin
     )
     db.commit()
     db.refresh(booking)
+
+    try:
+        from app.core.config import settings
+        from app.services.whatsapp import notify_submit_review
+        crew_user = booking.crew.user if booking.crew else None
+        review_url = f"{settings.APP_PUBLIC_BASE_URL}/bookings"
+        notify_submit_review(crew_user.mobile_number if crew_user else None, review_url)
+    except Exception:
+        logger.exception("WhatsApp submit_review notify failed for booking %s", booking.booking_id)
+
     return booking
 
 

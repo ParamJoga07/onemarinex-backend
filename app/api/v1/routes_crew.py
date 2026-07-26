@@ -3,6 +3,8 @@ from sqlalchemy.orm import Session
 from sqlalchemy import cast, String, func
 from typing import List, Optional
 from datetime import date, datetime, timedelta
+import logging
+import re
 import uuid
 import json
 import urllib.request
@@ -18,7 +20,9 @@ from app.db.models.incident import Incident, IncidentStatus, IncidentType
 from app.db.models.notification import Notification
 from app.db.models.crew_sos import CrewSos
 from app.db.models.port import Port
+from app.db.models.port_rule import PortRule
 from app.db.models.aggregator_profile import AggregatorProfile
+from app.db.models.agent_profile import AgentProfile
 from app.db.models.booking_invitation import BookingInvitation
 from app.db.models.pricing_controls import (
     PricingDuration,
@@ -30,15 +34,57 @@ from app.db.models.pricing_controls import (
     PricingVehicleVisibility,
 )
 from app.api.v1.routes_auth import get_current_user
-from app.services.crew_service import generate_hpid
+from app.services.crew_service import generate_hpid, generate_unique_hpid
 from app.services.booking_service import (
     get_eligible_providers_for_ride,
     vehicle_category_matches,
+    STATUS_LABELS,
 )
 from pydantic import BaseModel, Field
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 DEFAULT_TRIP_SPEED_KMPH = 28.0
+
+
+def _extract_package_duration_label(vehicle_name: str) -> str:
+    """Package bookings encode duration into the free-text vehicle_name
+    (e.g. "Sedan 3h Package (Partner)") since there's no dedicated duration
+    column on CabBooking today. Best-effort extraction for WhatsApp copy."""
+    match = re.search(r"(\d+)\s*h\s*Package", vehicle_name or "")
+    return f"{match.group(1)} hours" if match else "N/A"
+
+
+def _compute_shore_pass_expiry(db: Session, port_name: Optional[str], out_time: datetime) -> datetime:
+    """Resolve a shore pass's real expiry from the port's configured
+    closing_time, anchored to out_time's date, rolling to the next day if
+    that closing time already passed today (same midnight-crossing heuristic
+    as heyports-frontend's isShoreLeaveValid() in CoordinatedTransfer.tsx).
+    Falls back to the prior +2 day placeholder if no PortRule/closing_time
+    is configured for this port."""
+    fallback = out_time + timedelta(days=2)
+    if not port_name:
+        return fallback
+
+    port = (
+        db.query(Port)
+        .filter((Port.code == port_name) | (Port.name == port_name))
+        .first()
+    )
+    candidates = [c for c in ([port.code, port.name, port_name] if port else [port_name]) if c]
+    rule = db.query(PortRule).filter(PortRule.port_name.in_(candidates)).first()
+    if not rule or not rule.closing_time:
+        return fallback
+
+    try:
+        hour, minute = (int(x) for x in rule.closing_time.split(":")[:2])
+    except (ValueError, AttributeError):
+        return fallback
+
+    expiry = out_time.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if expiry < out_time and hour < 12 and out_time.hour >= 12:
+        expiry = expiry + timedelta(days=1)
+    return expiry
 
 
 def is_partnered_agency(agency_name: Optional[str]) -> bool:
@@ -195,6 +241,7 @@ class CabBookingCreateIn(BaseModel):
     scheduled_time: Optional[datetime] = None
     otp: Optional[str] = None
     ride_type: str  # flexible_ride | guaranteed_coordinated_ride
+    trip_type: Optional[str] = None  # package_trip | coordinated_transfer
 
 class CabBookingCreateOut(BaseModel):
     booking_id: str
@@ -481,7 +528,10 @@ def sync_crew_manifest_helper(profile: CrewProfile, db: Session):
                 profile.current_port = vessel_port
                 
             # Keep HPID aligned
-            new_hpid = generate_hpid(profile.passport_number, profile.nationality, profile.current_port)
+            new_hpid = generate_unique_hpid(
+                db, profile.passport_number, profile.nationality, profile.current_port,
+                unique_fallback=profile.user_id, exclude_profile_id=profile.id,
+            )
             profile.hpid = new_hpid
             v_crew.hp_id = new_hpid
             
@@ -547,32 +597,12 @@ def update_crew_profile(
     for field, value in update_data.items():
         setattr(profile, field, value)
         
-    # Regenerate hpid if port or nationality changed
+    # Regenerate hpid if port, nationality, or passport number changed
     if "current_port" in update_data or "nationality" in update_data or "passport_number" in update_data:
-        profile.hpid = generate_hpid(profile.passport_number, profile.nationality, profile.current_port)
-
-    # Always generate a unique HPID if passport_number or current_port or nationality is updated
-    if (
-        'passport_number' in update_data or
-        'current_port' in update_data or
-        'nationality' in update_data
-    ):
-        # Use generate_hpid utility
-        hpid_candidate = generate_hpid(
-            profile.passport_number,
-            profile.nationality,
-            profile.current_port
+        profile.hpid = generate_unique_hpid(
+            db, profile.passport_number, profile.nationality, profile.current_port,
+            unique_fallback=profile.user_id, exclude_profile_id=profile.id,
         )
-        # If passport_number is missing, append user_id to ensure uniqueness
-        if not profile.passport_number or profile.passport_number.strip() == "":
-            hpid_candidate = f"{hpid_candidate}-{profile.user_id}"
-        # Check for uniqueness in DB
-        existing = db.query(CrewProfile).filter(CrewProfile.hpid == hpid_candidate, CrewProfile.id != profile.id).first()
-        if existing:
-            # Append random suffix if still not unique
-            import uuid
-            hpid_candidate = f"{hpid_candidate}-{uuid.uuid4().hex[:4]}"
-        profile.hpid = hpid_candidate
 
     try:
         db.commit()
@@ -842,7 +872,94 @@ def trigger_sos(
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Failed to record SOS: {str(e)}")
-        
+
+    try:
+        from app.db.models.cab_booking import BookingStatus
+        from app.services.whatsapp import (
+            notify_sos_crew_in_danger,
+            notify_sos_crew_and_admin,
+            notify_sos_aggregator,
+        )
+
+        def _fmt_location(lat, lng):
+            return f"{lat:.5f}, {lng:.5f}" if lat is not None and lng is not None else "Location unavailable"
+
+        location_str = _fmt_location(body.lat, body.lng)
+
+        active_booking = (
+            db.query(CabBooking)
+            .filter(
+                CabBooking.crew_id == profile.id,
+                CabBooking.status.in_([
+                    BookingStatus.DRIVER_ASSIGNED,
+                    BookingStatus.DRIVER_ACCEPTED,
+                    BookingStatus.ON_TRIP,
+                ]),
+            )
+            .order_by(CabBooking.created_at.desc())
+            .first()
+        )
+
+        # 1. Crew member themselves — always fires
+        notify_sos_crew_in_danger(current_user.mobile_number)
+
+        # 2. Port-assigned agent + all superadmins with a phone on file (additive)
+        trip_id_for_admin = active_booking.booking_id if active_booking else "N/A"
+        agent_profile = (
+            db.query(AgentProfile)
+            .filter(AgentProfile.assigned_port == port_name)
+            .first()
+        )
+        if agent_profile and agent_profile.user:
+            notify_sos_crew_and_admin(
+                agent_profile.user.mobile_number, trip_id_for_admin,
+                profile.full_name, profile.vessel or "N/A", location_str,
+            )
+        superadmins = db.query(User).filter(
+            User.role == "superadmin",
+            User.mobile_number.isnot(None),
+            User.mobile_number != "",
+        ).all()
+        for admin in superadmins:
+            notify_sos_crew_and_admin(
+                admin.mobile_number, trip_id_for_admin,
+                profile.full_name, profile.vessel or "N/A", location_str,
+            )
+
+        # 2b. Fellow crew members at the same port (excluding the crew member who
+        # triggered the SOS) — broadcasts the alert so nearby crew can help.
+        fellow_crew = (
+            db.query(CrewProfile)
+            .join(User, User.id == CrewProfile.user_id)
+            .filter(
+                CrewProfile.current_port == port_name,
+                CrewProfile.user_id != current_user.id,
+                User.mobile_number.isnot(None),
+                User.mobile_number != "",
+            )
+            .all()
+        )
+        for fellow in fellow_crew:
+            notify_sos_crew_and_admin(
+                fellow.user.mobile_number, trip_id_for_admin,
+                profile.full_name, profile.vessel or "N/A", location_str,
+            )
+
+        # 3. Aggregator on the active booking, if any — no active booking, no send
+        if active_booking:
+            provider_profile = active_booking.provider or active_booking.aggregator
+            if provider_profile and provider_profile.user:
+                notify_sos_aggregator(
+                    provider_profile.user.mobile_number,
+                    active_booking.booking_id, location_str,
+                    datetime.now().strftime("%I:%M:%S %p"),
+                    lat=body.lat, lng=body.lng,
+                )
+        else:
+            logger.info("SOS aggregator notify skipped — no active booking for crew_profile_id=%s", profile.id)
+    except Exception:
+        logger.exception("WhatsApp SOS notify failed for user %s", current_user.id)
+
     return {
         "status": "success",
         "message": "SOS Alert sent to all recipients",
@@ -934,7 +1051,10 @@ def generate_shorepass(
     shore_pass_id = f"SP-{port_code}-{vessel_code}-{random_suffix}"
 
     # Update HPID in profile based on current port and Passport Number
-    profile.hpid = generate_hpid(profile.passport_number, profile.nationality, port)
+    profile.hpid = generate_unique_hpid(
+        db, profile.passport_number, profile.nationality, port,
+        unique_fallback=profile.user_id, exclude_profile_id=profile.id,
+    )
 
     # Generate shore pass
     new_pass = ShorePass(
@@ -1061,11 +1181,11 @@ def verify_shorepass(
     if not shore_pass.approved_by_name:
         shore_pass.approved_by_name = "Vikram Patel" # Default as per screenshot
     
-    # Set default times if agent didn't set them (2 days duration as a placeholder)
+    # Set default times if agent didn't set them
     if not shore_pass.out_time:
         shore_pass.out_time = datetime.now()
     if not shore_pass.expires_at:
-        shore_pass.expires_at = datetime.now() + timedelta(days=2)
+        shore_pass.expires_at = _compute_shore_pass_expiry(db, shore_pass.port_name, shore_pass.out_time)
     if not shore_pass.in_time:
         shore_pass.in_time = shore_pass.expires_at
 
@@ -1630,6 +1750,15 @@ def book_cab(
     otp = body.otp or (profile.ride_otp if profile else None) or "1234"
     now = datetime.utcnow()
 
+    # Prefer the explicit trip_type sent by the frontend; fall back to the
+    # scheduled_time heuristic (package bookings never send scheduled_time,
+    # transfer bookings always do) only for older/cached frontend builds that
+    # don't send trip_type yet. This is purely a notification-selection
+    # detail — never let it block booking creation.
+    resolved_trip_type = body.trip_type or (
+        "package_trip" if body.scheduled_time is None else "coordinated_transfer"
+    )
+
     new_booking = CabBooking(
         booking_id=booking_id,
         crew_id=profile.id,
@@ -1650,6 +1779,7 @@ def book_cab(
         scheduled_time=body.scheduled_time,
         otp=otp,
         ride_type=ride_type,
+        trip_type=resolved_trip_type,
         provider_id=None,
         aggregator_id=None,
         aggregator_name=None,
@@ -1689,6 +1819,43 @@ def book_cab(
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
+
+    try:
+        from app.services.whatsapp import (
+            notify_crew_package_trip_state,
+            notify_crew_coordinated_transfer_trip_state,
+            notify_aggregator_trip_request,
+            notify_aggregator_coordinated_transfer_trip_request,
+        )
+
+        trip_type_label = "Package trip" if resolved_trip_type == "package_trip" else "Coordinated Transfer"
+        status_label = STATUS_LABELS.get(new_booking.status, new_booking.status.value)
+
+        if resolved_trip_type == "package_trip":
+            duration_label = _extract_package_duration_label(new_booking.vehicle_name)
+            notify_crew_package_trip_state(
+                current_user.mobile_number, status_label, new_booking.booking_id,
+                trip_type_label, new_booking.pickup_address, new_booking.num_passengers, duration_label,
+            )
+            for eligible_provider in broadcast_providers:
+                notify_aggregator_trip_request(
+                    eligible_provider.user.mobile_number if eligible_provider.user else None,
+                    new_booking.booking_id, trip_type_label, new_booking.pickup_address,
+                    new_booking.num_passengers, duration_label,
+                )
+        else:
+            notify_crew_coordinated_transfer_trip_state(
+                current_user.mobile_number, status_label, new_booking.booking_id,
+                trip_type_label, new_booking.pickup_address, new_booking.drop_address, new_booking.num_passengers,
+            )
+            for eligible_provider in broadcast_providers:
+                notify_aggregator_coordinated_transfer_trip_request(
+                    eligible_provider.user.mobile_number if eligible_provider.user else None,
+                    new_booking.booking_id, trip_type_label, new_booking.pickup_address,
+                    new_booking.drop_address, new_booking.num_passengers,
+                )
+    except Exception:
+        logger.exception("WhatsApp notify failed for booking %s", new_booking.booking_id)
 
     return CabBookingCreateOut(
         booking_id=new_booking.booking_id,

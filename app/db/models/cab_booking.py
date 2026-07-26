@@ -58,6 +58,10 @@ class CabBooking(Base):
     distance_km = Column(Float, nullable=False)
 
     ride_type = Column(SQLEnum(RideType), nullable=True)
+    # "package_trip" or "coordinated_transfer" — distinguishes the two booking
+    # flows for WhatsApp template selection (independent of ride_type, which
+    # is about the fulfilling provider, not the trip shape).
+    trip_type = Column(String(32), nullable=True)
 
     num_passengers = Column(Integer, nullable=False, default=1)
     crew_member_ids = Column(JSON, nullable=True)
