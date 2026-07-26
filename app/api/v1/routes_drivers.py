@@ -3,6 +3,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import or_
 from typing import List, Optional
 from datetime import datetime
+import logging
 import uuid
 from app.db.session import get_db
 from app.db.models.driver import Driver
@@ -15,6 +16,7 @@ from pydantic import BaseModel
 import uuid
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 class DriverBase(BaseModel):
     name: str
@@ -251,6 +253,7 @@ async def get_assigned_rides(
         CabBooking.status.in_([
             BookingStatus.DRIVER_ASSIGNED,
             BookingStatus.DRIVER_ACCEPTED,
+            BookingStatus.ARRIVED,
             BookingStatus.ON_TRIP,
             BookingStatus.CONFIRMED,
             BookingStatus.IN_PROGRESS,
@@ -330,6 +333,14 @@ async def driver_arrived(
     ride.arrived_at = datetime.utcnow()
     ride.status = BookingStatus.ARRIVED
     db.commit()
+
+    try:
+        from app.services.whatsapp import notify_driver_arrival
+        crew_user = ride.crew.user if ride.crew else None
+        notify_driver_arrival(crew_user.mobile_number if crew_user else None, ride.booking_id)
+    except Exception:
+        logger.exception("WhatsApp driver_arrival notify failed for ride %s", ride.booking_id)
+
     return {"message": "Arrival recorded"}
 
 class StartRideIn(BaseModel):

@@ -1,3 +1,5 @@
+import logging
+import re
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 from types import SimpleNamespace
@@ -18,6 +20,8 @@ from app.db.session import get_db
 from app.db.models.vessel import Vessel
 from app.db.models.vessel_crew import VesselCrew
 from app.db.models.crew_profile import CrewProfile
+from app.db.models.port import Port
+from app.db.models.vendors import Vendors
 from app.services.booking_service import (
     accept_booking,
     assign_driver_to_booking,
@@ -43,6 +47,71 @@ from app.services.timeline_service import create_timeline_event
 from app.services.timeline_service import get_booking_timeline
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
+
+
+# Stop labels that are structural, not real venue names — a "drop" stop is
+# stored as name="Drop" with the actual venue sitting in `address`.
+_GENERIC_STOP_LABELS = {"pickup", "drop", "stop", "trip end", "trip end (port)"}
+
+
+def _first_usable_phone(raw: Optional[str]) -> Optional[str]:
+    """Vendor phone fields in this DB hold anything from a single number to a
+    comma-separated list of five, or the placeholder text 'NA'. Return the
+    first entry containing digits, so a multi-number field doesn't get
+    mangled into one impossible number by the digit-stripping normalizer."""
+    if not raw:
+        return None
+    for part in re.split(r"[,;/]", raw):
+        if any(ch.isdigit() for ch in part):
+            return part.strip()
+    return None
+
+
+def _lookup_facility_phone(db: Session, stop: Dict[str, Any], port_value: Optional[str]) -> Optional[str]:
+    """Find the real phone number for the venue an itinerary stop refers to,
+    from the Vendors table the superadmin dashboard manages.
+
+    Checks both `name` and `address`: package-trip facility stops carry the
+    venue in `name`, but a coordinated-transfer drop stop is stored as
+    name="Drop" with the venue in `address`. Exact (case-insensitive) match
+    only — never fuzzy, so we can't notify the wrong business. Active
+    vendors win over inactive duplicates (this table has several same-named
+    rows across categories, e.g. the same pub listed under 'pub' and
+    'restaurant')."""
+    candidates = []
+    for key in ("name", "address"):
+        value = str(stop.get(key) or "").strip()
+        if value and value.lower() not in _GENERIC_STOP_LABELS and value not in candidates:
+            candidates.append(value)
+    if not candidates:
+        return None
+
+    port = None
+    if port_value:
+        port = db.query(Port).filter((Port.code == port_value) | (Port.name == port_value)).first()
+
+    for candidate in candidates:
+        query = db.query(Vendors).filter(func.lower(Vendors.name) == candidate.lower())
+        if port:
+            query = query.filter(Vendors.port_id == port.id)
+        matches = query.all()
+        if not matches:
+            continue
+
+        # Prefer an active listing; fall back to any match if none are active.
+        active = [v for v in matches if (v.status or "").strip().lower() == "active"]
+        preferred = active or matches
+        if len(preferred) > 1:
+            logger.info(
+                "facility phone lookup: %d vendors named %r at port %r — using the first",
+                len(preferred), candidate, port_value,
+            )
+        for vendor in preferred:
+            phone = _first_usable_phone(vendor.phone)
+            if phone:
+                return phone
+    return None
 
 
 def _resolve_booking_db_id(db: Session, booking_identifier: str) -> int:
@@ -134,6 +203,22 @@ def mark_magic_link_stop_reached(
     db: Session = Depends(get_db),
 ):
     magic_link = get_magic_link_by_token(db, token)
+
+    matched_stop: Dict[str, Any] = {}
+    stop_type = "facility"
+    stop_name = stop_id
+    for stop in magic_link.itinerary_stops or []:
+        if str(stop.get("id")) == stop_id:
+            matched_stop = stop
+            stop_type = str(stop.get("type") or "facility").strip().lower()
+            # A "drop" stop's name is the literal label "Drop"; the venue the
+            # crew actually arrived at is in `address`.
+            stop_name = str(
+                stop.get("address") if str(stop.get("name") or "").strip().lower() in _GENERIC_STOP_LABELS
+                else stop.get("name") or stop_id
+            )
+            break
+
     mark_stop_reached(
         db,
         magic_link=magic_link,
@@ -142,6 +227,27 @@ def mark_magic_link_stop_reached(
         longitude=body.longitude,
         notes=body.notes,
     )
+
+    try:
+        booking = magic_link.booking
+        if booking:
+            if stop_type == "pickup":
+                from app.services.whatsapp import notify_driver_arrival
+                crew_user = booking.crew.user if booking.crew else None
+                notify_driver_arrival(crew_user.mobile_number if crew_user else None, booking.booking_id)
+            elif stop_type != "trip_end":
+                facility_phone = _lookup_facility_phone(db, matched_stop, booking.port)
+                if facility_phone:
+                    from app.services.whatsapp import notify_facility_reached
+                    notify_facility_reached(facility_phone, booking.booking_id, booking.num_passengers, stop_name)
+                else:
+                    logger.info(
+                        "facility_reached skipped — no vendor with a usable phone matched stop=%r port=%r",
+                        matched_stop, booking.port,
+                    )
+    except Exception:
+        logger.exception("WhatsApp stop-reached notify failed for magic link %s stop %s", token, stop_id)
+
     refreshed = get_magic_link_by_token(db, token)
     return serialize_magic_link_public_payload(refreshed)
 
@@ -260,6 +366,13 @@ def complete_magic_link_ride(
         event_time=now,
     )
     db.commit()
+
+    try:
+        from app.services.whatsapp import notify_submit_review
+        crew_user = booking.crew.user if booking.crew else None
+        notify_submit_review(crew_user.mobile_number if crew_user else None)
+    except Exception:
+        logger.exception("WhatsApp submit_review notify failed for booking %s", booking.booking_id)
 
     refreshed = get_magic_link_by_token(db, token)
     return serialize_magic_link_public_payload(refreshed)
@@ -530,6 +643,15 @@ def reject_booking_endpoint(
         )
 
     db.commit()
+
+    if not remaining:
+        try:
+            from app.services.whatsapp import notify_trip_rejection
+            crew_user = full_booking.crew.user if full_booking.crew else None
+            notify_trip_rejection(crew_user.mobile_number if crew_user else None)
+        except Exception:
+            logger.exception("WhatsApp trip_rejection notify failed for booking %s", full_booking.booking_id)
+
     return {
         "message": "Booking declined for this provider; still available to others" if remaining else "Booking cancelled — no eligible providers remaining",
         "booking_id": booking_id,
@@ -644,6 +766,19 @@ def assign_driver_endpoint(
         event_time=now,
     )
     db.commit()
+
+    try:
+        from app.services.whatsapp import notify_driver_alloted
+        full_booking = db.query(CabBooking).filter(CabBooking.id == booking.id).first()
+        crew_user = full_booking.crew.user if full_booking and full_booking.crew else None
+        pickup_address = full_booking.pickup_address if full_booking else booking.pickup_address
+        notify_driver_alloted(
+            crew_user.mobile_number if crew_user else None,
+            full_booking.booking_id if full_booking else booking_id,
+            driver.name, driver.vehicle_number, pickup_address, driver.phone,
+        )
+    except Exception:
+        logger.exception("WhatsApp driver_alloted notify failed for booking %s", booking_id)
 
     updated = SimpleNamespace(
         id=booking.id,

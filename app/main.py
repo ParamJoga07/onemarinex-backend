@@ -5,10 +5,12 @@ from fastapi.openapi.models import OAuthFlows as OAuthFlowsModel
 from fastapi.openapi.utils import get_openapi
 import os
 from sqlalchemy import inspect, text
+from apscheduler.schedulers.background import BackgroundScheduler
 
 from app.core.config import settings
 from app.db.session import engine
 from app.db.base import Base
+from app.services.shore_pass_reminders import run_shore_pass_reminders
 
 from app.api.v1 import routes_auth, routes_contact, routes_files, routes_users, registration, routes_crew, routes_pubs, routes_hotels, routes_restaurants, routes_incidents, routes_ports, routes_drivers, routes_early_access, routes_chat, routes_superadmin, routes_reviews, routes_sightseeing, routes_notifications, routes_sos, routes_pricing_controls, routes_facilities
 
@@ -85,12 +87,21 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+scheduler = BackgroundScheduler()
+
 # --- Startup event: ensure tables exist ---
 @app.on_event("startup")
 def on_startup():
     # Base is already linked to all models via app/db/base.py imports
     Base.metadata.create_all(bind=engine)
     ensure_legacy_schema_columns()
+    scheduler.add_job(run_shore_pass_reminders, "interval", minutes=5, id="shore_pass_reminders", replace_existing=True)
+    scheduler.start()
+
+
+@app.on_event("shutdown")
+def on_shutdown():
+    scheduler.shutdown(wait=False)
 
 
 def ensure_legacy_schema_columns():
