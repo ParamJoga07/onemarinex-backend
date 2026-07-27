@@ -633,11 +633,11 @@ def reject_booking_endpoint(
     remaining = [p for p in eligible_providers if p.id not in rejected_provider_ids]
 
     if not remaining:
-        full_booking.status = BookingStatus.CANCELLED
+        full_booking.status = BookingStatus.PROVIDER_REJECTED
         create_timeline_event(
             db,
             booking_db_id=full_booking.id,
-            event_type=TimelineEventType.TRIP_CANCELLED,
+            event_type=TimelineEventType.PROVIDER_REJECTED,
             actor_id=provider.id,
             actor_type="provider",
             metadata={"reason": "all_providers_rejected"},
