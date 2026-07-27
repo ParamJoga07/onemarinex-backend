@@ -721,11 +721,9 @@ def complete_trip(db: Session, booking: CabBooking, driver: Driver) -> CabBookin
     db.refresh(booking)
 
     try:
-        from app.core.config import settings
         from app.services.whatsapp import notify_submit_review
         crew_user = booking.crew.user if booking.crew else None
-        review_url = f"{settings.APP_PUBLIC_BASE_URL}/bookings"
-        notify_submit_review(crew_user.mobile_number if crew_user else None, review_url)
+        notify_submit_review(crew_user.mobile_number if crew_user else None)
     except Exception:
         logger.exception("WhatsApp submit_review notify failed for booking %s", booking.booking_id)
 
