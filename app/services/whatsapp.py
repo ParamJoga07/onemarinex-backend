@@ -38,10 +38,30 @@ def normalize_whatsapp_number(raw: Optional[str]) -> Optional[str]:
 
 
 
+# Layer 1 — shape detection. Matches any KEY=VALUE assignment whose key
+# contains a sensitive word anywhere in it, so SECRET_KEY=, WHATSAPP_ACCESS_TOKEN=
+# and DB_PASSWORD= are all caught, not just bare SECRET=.
 _CREDENTIAL_PATTERN = re.compile(
-    r"(?:ACCESS_TOKEN|SECRET|PASSWORD|API_KEY|PRIVATE_KEY|DATABASE_URL)\s*=",
+    r"[A-Z0-9_]*"
+    r"(?:SECRET|TOKEN|PASSWORD|PASSWD|API_?KEY|PRIVATE_?KEY|CREDENTIAL|DATABASE_URL|AUTH)"
+    r"[A-Z0-9_]*\s*=",
     re.IGNORECASE,
 )
+
+# Layer 2 — value detection. Shape matching can always be evaded by a
+# differently-formatted leak, so also refuse to transmit anything containing
+# the literal value of a real secret. Short values are ignored to avoid
+# matching ordinary text.
+_MIN_SECRET_LEN = 8
+
+
+def _known_secret_values() -> List[str]:
+    values = [
+        getattr(settings, "WHATSAPP_ACCESS_TOKEN", "") or "",
+        getattr(settings, "SECRET_KEY", "") or "",
+        getattr(settings, "DATABASE_URL", "") or "",
+    ]
+    return [v for v in values if isinstance(v, str) and len(v) >= _MIN_SECRET_LEN]
 
 
 class UnsafeTemplateParamError(Exception):
@@ -49,12 +69,21 @@ class UnsafeTemplateParamError(Exception):
 
 
 def _sanitize_param(value) -> str:
-    """Meta rejects template params with newlines or 4+ consecutive spaces."""
+    """Meta rejects template params with newlines or 4+ consecutive spaces.
+
+    Also refuses outright to pass through anything that looks like — or
+    literally contains — a credential, so a bug or mistaken call upstream
+    can never put a secret on the wire to an external phone number."""
     text = str(value if value is not None else "")
     if _CREDENTIAL_PATTERN.search(text):
         raise UnsafeTemplateParamError(
             "Refusing to send a template parameter that looks like a credential assignment"
         )
+    for secret in _known_secret_values():
+        if secret in text:
+            raise UnsafeTemplateParamError(
+                "Refusing to send a template parameter containing a known secret value"
+            )
     return re.sub(r"\s+", " ", text).strip()
 
 
