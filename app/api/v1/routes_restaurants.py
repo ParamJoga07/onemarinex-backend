@@ -67,6 +67,7 @@ def get_restaurants(
             "description": other.get("about") or other.get("description") or "",
             "about": other.get("about") or other.get("description") or "",
             "facilities": other.get("facilities", []),
+            "menu_items": v.menu_items or [],
             "address": v.location_name,
             "open_time": other.get("open_time"),
             "close_time": other.get("close_time"),
@@ -99,6 +100,7 @@ def get_restaurant(id: int, db: Session = Depends(get_db)):
         "description": other.get("about") or other.get("description") or "",
         "about": other.get("about") or other.get("description") or "",
         "facilities": other.get("facilities", []),
+        "menu_items": v.menu_items or [],
         "address": v.location_name,
     }
 

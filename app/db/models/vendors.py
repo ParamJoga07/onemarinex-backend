@@ -22,6 +22,7 @@ class Vendors(Base):
     status = Column(String(32), server_default="Active") # Active, Inactive
     documents = Column(JSON, nullable=True)
     images = Column(JSON, nullable=True)
+    menu_items = Column(JSON, nullable=True)  # list of menu PDF/image URLs (e.g. S3/Spaces)
     other_information = Column(JSON, nullable=True)    # service type,price,timings
     category = Column(String(64), nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)

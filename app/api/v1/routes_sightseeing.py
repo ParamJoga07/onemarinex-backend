@@ -70,6 +70,7 @@ def get_sightseeing(
             "description": other.get("about") or other.get("description") or "",
             "about": other.get("about") or other.get("description") or "",
             "facilities": other.get("facilities", []),
+            "menu_items": v.menu_items or [],
             "best_time_to_visit": other.get("best_time_to_visit", "Evening"),
             "open_time": other.get("open_time"),
             "close_time": other.get("close_time"),
@@ -123,6 +124,7 @@ def get_sightseeing_by_filters(
             "description": other.get("about") or other.get("description") or "",
             "about": other.get("about") or other.get("description") or "",
             "facilities": other.get("facilities", []),
+            "menu_items": v.menu_items or [],
             "best_time_to_visit": other.get("best_time_to_visit", "Evening"),
         })
     return results
@@ -152,6 +154,7 @@ def get_single_sightseeing(id: int, db: Session = Depends(get_db)):
         "description": other.get("about") or other.get("description") or "",
         "about": other.get("about") or other.get("description") or "",
         "facilities": other.get("facilities", []),
+        "menu_items": v.menu_items or [],
         "best_time_to_visit": other.get("best_time_to_visit", "Evening"),
     }
 

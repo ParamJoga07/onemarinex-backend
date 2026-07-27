@@ -115,8 +115,9 @@ class VendorCreate(VendorCreationBase):
     email: Optional[str] = None
     documents: Optional[List[str]] = None
     images: Optional[List[str]] = None
+    menu_items: Optional[List[str]] = None
     other_information: Optional[Dict[str, Any]] = None
-    
+
 
 class VendorUpdate(BaseModel):
     name: Optional[str] = None
@@ -130,6 +131,7 @@ class VendorUpdate(BaseModel):
     email: Optional[str] = None
     documents: Optional[List[str]] = None
     images: Optional[List[str]] = None
+    menu_items: Optional[List[str]] = None
     other_information: Optional[Dict[str, Any]] = None
     port_id: Optional[int] = None
     status: Optional[str] = None
@@ -150,9 +152,10 @@ class VendorOut(BaseModel):
     status: str
     documents: Optional[List[str]]
     images: Optional[List[str]]
+    menu_items: Optional[List[str]] = None
     other_information: Optional[Dict[str, Any]]
     created_at: datetime
-    updated_at: datetime    
+    updated_at: datetime
 
 
 class VendorTagIn(BaseModel):

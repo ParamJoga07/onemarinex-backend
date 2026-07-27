@@ -28,6 +28,7 @@ class FacilityOut(BaseModel):
     close_time: Optional[str] = None
     working_days: Optional[str] = None
     facilities: Optional[List[str]] = None
+    menu_items: Optional[List[str]] = None
     best_for: Optional[str] = None
     category: Optional[str] = None
 
@@ -62,6 +63,7 @@ def _vendor_to_facility(v: Vendors) -> FacilityOut:
         close_time=other.get("close_time"),
         working_days=other.get("working_days"),
         facilities=other.get("facilities", []),
+        menu_items=v.menu_items or [],
         best_for=other.get("best_for", ""),
         category=other.get("category", v.category),
     )

@@ -68,6 +68,7 @@ class PubOut(BaseModel):
     category: Optional[str] = None
     best_for: Optional[str] = None
     facilities: Optional[List[str]] = None
+    menu_items: Optional[List[str]] = None
     about: Optional[str] = None
     open_time: Optional[str] = None
     close_time: Optional[str] = None
@@ -108,6 +109,7 @@ def get_pubs(
             category=other.get("category", ""),
             best_for=other.get("best_for", ""),
             facilities=other.get("facilities", []),
+            menu_items=v.menu_items or [],
             about=other.get("about") or other.get("description") or "",
             open_time=other.get("open_time"),
             close_time=other.get("close_time"),
@@ -144,6 +146,7 @@ def get_pub_details(
         category=other.get("category", ""),
         best_for=other.get("best_for", ""),
         facilities=other.get("facilities", []),
+        menu_items=v.menu_items or [],
         about=other.get("about") or other.get("description") or ""
     )
 
