@@ -3,9 +3,34 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.openapi.models import OAuthFlows as OAuthFlowsModel
 from fastapi.openapi.utils import get_openapi
+import logging
+import logging.handlers
 import os
 from sqlalchemy import inspect, text
 from apscheduler.schedulers.background import BackgroundScheduler
+
+# --- Logging ---
+# Without this, every logger.warning/exception in the app (notably the
+# WhatsApp send failures) goes only to the console of whoever started the
+# server, which makes production issues effectively invisible. Mirror all
+# logs to a rotating file as well.
+os.makedirs("logs", exist_ok=True)
+_log_formatter = logging.Formatter(
+    "%(asctime)s %(levelname)-8s %(name)s: %(message)s"
+)
+_file_handler = logging.handlers.RotatingFileHandler(
+    "logs/app.log", maxBytes=5 * 1024 * 1024, backupCount=3
+)
+_file_handler.setFormatter(_log_formatter)
+
+_root_logger = logging.getLogger()
+if not any(
+    isinstance(h, logging.handlers.RotatingFileHandler)
+    for h in _root_logger.handlers
+):
+    _root_logger.addHandler(_file_handler)
+if _root_logger.level == logging.NOTSET or _root_logger.level > logging.INFO:
+    _root_logger.setLevel(logging.INFO)
 
 from app.core.config import settings
 from app.db.session import engine
