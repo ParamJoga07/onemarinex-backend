@@ -8,6 +8,7 @@ from app.db.session import get_db
 from app.db.models.user import User
 from app.db.models.chat import ChatMessage
 from app.db.models.port import Port
+from app.utils.bad_words import contains_bad_words
 from app.api.v1.routes_auth import get_current_user
 # If get_current_user requires Bearer we'll need to parse token for WS manually or use query params.
 
@@ -169,6 +170,12 @@ async def websocket_endpoint(websocket: WebSocket, port_id: int, token: str = Qu
                 text = msg_data.get("message", "").strip()
                 
                 if text:
+                    if contains_bad_words(text):
+                        await websocket.send_json({
+                            "type": "error",
+                            "data": {"message": "Message contains inappropriate language"},
+                        })
+                        continue
                     # Save to DB
                     new_msg = ChatMessage(port_id=port_id, user_id=user.id, message=text)
                     db.add(new_msg)
