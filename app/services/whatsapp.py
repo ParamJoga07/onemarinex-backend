@@ -64,6 +64,23 @@ def _known_secret_values() -> List[str]:
     return [v for v in values if isinstance(v, str) and len(v) >= _MIN_SECRET_LEN]
 
 
+# Layer 3 — shape whitelist for parameters that are meant to be a URL.
+# The credential leak arrived in a slot whose only legitimate value is a link,
+# so for those slots we accept nothing that isn't plainly an http(s) URL,
+# rather than trying to enumerate everything that's forbidden.
+_MAX_URL_LEN = 500
+
+
+def _is_safe_public_url(value: str) -> bool:
+    if not value or len(value) > _MAX_URL_LEN:
+        return False
+    if not value.lower().startswith(("http://", "https://")):
+        return False
+    if any(ch in value for ch in "\n\r\t "):
+        return False
+    return True
+
+
 class UnsafeTemplateParamError(Exception):
     pass
 
@@ -121,10 +138,13 @@ def _post_template_message(
         if components:
             payload["template"]["components"] = components
     except UnsafeTemplateParamError:
+        # Never log the offending values — they are, by definition, the thing
+        # we're stopping from escaping the process, and this logger now writes
+        # to a file on disk. Log only enough to locate the bad call site.
         logger.error(
-            "WhatsApp send BLOCKED — a parameter for template=%s looked like a credential assignment. "
-            "Not sending. body_params=%s button_params=%s",
-            template_name, body_params, button_params,
+            "WhatsApp send BLOCKED — a parameter for template=%s looked like a credential. "
+            "Not sending. body_param_count=%d button_param_count=%d",
+            template_name, len(body_params or []), len(button_params or []),
         )
         return False
     try:
@@ -143,6 +163,11 @@ def _post_template_message(
                 template_name, response.status_code, response.text,
             )
             return False
+        # Log successes too — otherwise a delivered send leaves no trace and
+        # "did it even fire?" becomes unanswerable after the fact.
+        logger.info(
+            "WhatsApp send OK template=%s to=***%s", template_name, to[-4:]
+        )
         return True
     except Exception:
         logger.exception("WhatsApp send raised template=%s", template_name)
@@ -241,13 +266,32 @@ def notify_trip_rejection(phone) -> bool:
     return send_whatsapp_template(phone, "trip_rejection", [])
 
 
-def notify_submit_review(phone) -> bool:
-    # Built here, not accepted from the caller — this template's only
-    # parameter is a URL, and there's no legitimate reason for any caller to
-    # supply that string themselves rather than us deriving it from the one
-    # trusted setting that's meant to be public anyway.
-    review_url = f"{settings.APP_PUBLIC_BASE_URL}/bookings"
-    return send_whatsapp_template(phone, "submit_review", [review_url])
+def notify_submit_review(phone, review_url: Optional[str] = None) -> bool:
+    """Send the post-trip review prompt.
+
+    `review_url` is accepted from the caller, but this template's only
+    parameter is a link — so anything that isn't plainly an http(s) URL is
+    rejected and replaced with the default, rather than being forwarded to
+    an external phone number. Callers may omit it to get the default.
+    """
+    default_url = f"{settings.APP_PUBLIC_BASE_URL}/bookings"
+    candidate = (review_url or "").strip()
+
+    if not candidate:
+        url = default_url
+    elif _is_safe_public_url(candidate):
+        url = candidate
+    else:
+        # Deliberately does not log the rejected value — it may be the very
+        # secret we're preventing from leaving the process.
+        logger.warning(
+            "submit_review: review_url was not a valid http(s) URL (len=%d); "
+            "falling back to the default link",
+            len(candidate),
+        )
+        url = default_url
+
+    return send_whatsapp_template(phone, "submit_review", [url])
 
 
 def notify_sos_crew_in_danger(phone) -> bool:
