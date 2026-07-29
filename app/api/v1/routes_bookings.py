@@ -32,6 +32,7 @@ from app.services.booking_service import (
     get_eligible_drivers,
     list_bookings_for_user,
     reject_booking,
+    request_trip_review,
     serialize_booking,
     start_trip,
     vehicle_category_matches,
@@ -53,6 +54,17 @@ logger = logging.getLogger(__name__)
 # Stop labels that are structural, not real venue names — a "drop" stop is
 # stored as name="Drop" with the actual venue sitting in `address`.
 _GENERIC_STOP_LABELS = {"pickup", "drop", "stop", "trip end", "trip end (port)"}
+
+
+def _booking_status_label(booking: CabBooking) -> str:
+    """Lower-cased status, tolerant of how the row was written.
+
+    `cab_bookings.status` holds a mix of enum names ("COMPLETED") and values
+    ("completed") from earlier code, so comparing against either one alone
+    misses half the rows.
+    """
+    status = booking.status
+    return str(getattr(status, "value", status)).lower()
 
 
 def _first_usable_phone(raw: Optional[str]) -> Optional[str]:
@@ -315,6 +327,16 @@ def complete_magic_link_ride(
     if not booking:
         raise HTTPException(status_code=404, detail="Linked booking not found")
 
+    # A second tap on "Complete Ride" (or a retry over a flaky connection) used
+    # to re-run the whole thing: it overwrote trip_completed_at, appended
+    # duplicate reach and timeline events, and sent the crew a second review
+    # request. Completing an already-completed ride is a no-op.
+    if _booking_status_label(booking) == "completed":
+        logger.info(
+            "complete-ride ignored for booking %s — already completed", booking.booking_id
+        )
+        return serialize_magic_link_public_payload(get_magic_link_by_token(db, token))
+
     trip_end_stop = None
     for stop in magic_link.itinerary_stops or []:
         stop_type = str(stop.get("type") or "").strip().lower()
@@ -367,14 +389,7 @@ def complete_magic_link_ride(
     )
     db.commit()
 
-    try:
-        from app.core.config import settings
-        from app.services.whatsapp import notify_submit_review
-        crew_user = booking.crew.user if booking.crew else None
-        review_url = f"{settings.APP_PUBLIC_BASE_URL}/bookings"
-        notify_submit_review(crew_user.mobile_number if crew_user else None, review_url)
-    except Exception:
-        logger.exception("WhatsApp submit_review notify failed for booking %s", booking.booking_id)
+    request_trip_review(booking)
 
     refreshed = get_magic_link_by_token(db, token)
     return serialize_magic_link_public_payload(refreshed)

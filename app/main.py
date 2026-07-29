@@ -120,8 +120,36 @@ def on_startup():
     # Base is already linked to all models via app/db/base.py imports
     Base.metadata.create_all(bind=engine)
     ensure_legacy_schema_columns()
+    _log_whatsapp_config()
     scheduler.add_job(run_shore_pass_reminders, "interval", minutes=5, id="shore_pass_reminders", replace_existing=True)
     scheduler.start()
+
+
+def _log_whatsapp_config() -> None:
+    """State the WhatsApp config at boot, without printing any secret.
+
+    A deploy whose env vars never made it across is otherwise indistinguishable
+    from a working one until someone notices, days later, that no customer got
+    a message. This one line makes it obvious in the logs on every boot.
+    """
+    logging.getLogger("app.startup").info(
+        "WhatsApp config: enabled=%s access_token_set=%s phone_number_id_set=%s "
+        "api_version=%s default_country_code=%s public_base_url=%s",
+        settings.WHATSAPP_ENABLED,
+        bool(settings.WHATSAPP_ACCESS_TOKEN),
+        bool(settings.WHATSAPP_PHONE_NUMBER_ID),
+        settings.WHATSAPP_API_VERSION,
+        settings.WHATSAPP_DEFAULT_COUNTRY_CODE,
+        settings.APP_PUBLIC_BASE_URL,
+    )
+    if not settings.WHATSAPP_ENABLED:
+        logging.getLogger("app.startup").warning(
+            "WhatsApp is DISABLED — no template messages will be sent from this instance."
+        )
+    elif not (settings.WHATSAPP_ACCESS_TOKEN and settings.WHATSAPP_PHONE_NUMBER_ID):
+        logging.getLogger("app.startup").warning(
+            "WhatsApp is enabled but credentials are missing — every send will be skipped."
+        )
 
 
 @app.on_event("shutdown")

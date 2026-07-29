@@ -698,6 +698,43 @@ def start_trip(db: Session, booking: CabBooking, driver: Driver) -> CabBooking:
     return booking
 
 
+def request_trip_review(booking: CabBooking) -> bool:
+    """Ask the crew member who owns this booking to rate the completed trip.
+
+    Every path that completes a trip goes through here, so the recipient and
+    the link can't drift apart between the driver-app route and the magic-link
+    route the way two hand-copied blocks did. Never raises — a WhatsApp
+    problem must not fail the completion that already committed.
+    """
+    try:
+        from app.core.config import settings
+        from app.services.whatsapp import notify_submit_review
+
+        crew_user = booking.crew.user if booking.crew else None
+        phone = crew_user.mobile_number if crew_user else None
+        if not phone:
+            logger.warning(
+                "submit_review not sent for booking %s — crew has no mobile number "
+                "(crew_id=%s)", booking.booking_id, booking.crew_id,
+            )
+            return False
+
+        # The crew reviews a trip from the bookings list, which is where the
+        # review dialog lives — so that page is the correct destination.
+        review_url = f"{settings.APP_PUBLIC_BASE_URL.rstrip('/')}/bookings"
+        sent = notify_submit_review(phone, review_url)
+        if not sent:
+            logger.warning(
+                "submit_review send returned False for booking %s", booking.booking_id
+            )
+        return sent
+    except Exception:
+        logger.exception(
+            "WhatsApp submit_review notify failed for booking %s", booking.booking_id
+        )
+        return False
+
+
 def complete_trip(db: Session, booking: CabBooking, driver: Driver) -> CabBooking:
     ensure_driver_access(booking, driver)
     if booking.status != BookingStatus.ON_TRIP:
@@ -720,14 +757,7 @@ def complete_trip(db: Session, booking: CabBooking, driver: Driver) -> CabBookin
     db.commit()
     db.refresh(booking)
 
-    try:
-        from app.core.config import settings
-        from app.services.whatsapp import notify_submit_review
-        crew_user = booking.crew.user if booking.crew else None
-        review_url = f"{settings.APP_PUBLIC_BASE_URL}/bookings"
-        notify_submit_review(crew_user.mobile_number if crew_user else None, review_url)
-    except Exception:
-        logger.exception("WhatsApp submit_review notify failed for booking %s", booking.booking_id)
+    request_trip_review(booking)
 
     return booking
 

@@ -23,16 +23,27 @@ def normalize_whatsapp_number(raw: Optional[str]) -> Optional[str]:
     for bare 10-digit numbers, since this app is India-only today."""
     if not raw:
         return None
-    had_plus = raw.strip().startswith("+")
     digits = re.sub(r"\D", "", raw)
     if not digits:
         return None
-    if not had_plus:
-        if digits.startswith("0"):
-            digits = settings.WHATSAPP_DEFAULT_COUNTRY_CODE + digits.lstrip("0")
-        elif len(digits) == 10:
-            digits = settings.WHATSAPP_DEFAULT_COUNTRY_CODE + digits
-    if not (10 <= len(digits) <= 15):
+
+    # "00" is the international access prefix — what follows is already
+    # country-coded. Strip it before anything else, otherwise the old code
+    # read the leading zero as a trunk prefix and prepended the country code
+    # a second time, producing a valid-looking but completely wrong number.
+    if digits.startswith("00"):
+        digits = digits[2:]
+    elif digits.startswith("0"):
+        # National trunk prefix.
+        digits = digits.lstrip("0")
+
+    # A bare 10-digit number is a national one and needs the country code —
+    # whether or not the stored string happened to carry a leading "+".
+    # (Trusting the "+" left numbers like "+9398653761" unroutable.)
+    if len(digits) == 10:
+        digits = settings.WHATSAPP_DEFAULT_COUNTRY_CODE + digits
+
+    if not (11 <= len(digits) <= 15):
         return None
     return digits
 
@@ -165,8 +176,19 @@ def _post_template_message(
             return False
         # Log successes too — otherwise a delivered send leaves no trace and
         # "did it even fire?" becomes unanswerable after the fact.
+        #
+        # Record Meta's message id: a 200 here means *accepted*, not delivered.
+        # Meta can still drop a message afterwards (notably marketing-category
+        # templates), and the id is the only way to match this send against the
+        # delivery status in Meta's reporting.
+        message_id = ""
+        try:
+            message_id = (response.json().get("messages") or [{}])[0].get("id", "")
+        except Exception:
+            pass
         logger.info(
-            "WhatsApp send OK template=%s to=***%s", template_name, to[-4:]
+            "WhatsApp send accepted template=%s to=***%s message_id=%s",
+            template_name, to[-4:], message_id or "<none>",
         )
         return True
     except Exception:
@@ -181,13 +203,28 @@ def send_whatsapp_template(
     button_params: Optional[List[str]] = None,
 ) -> bool:
     if not settings.WHATSAPP_ENABLED:
+        # Used to return silently. A disabled flag and a broken integration
+        # looked identical in the logs, which is exactly the situation you
+        # need to tell apart when "no one got the message" in production.
+        logger.warning(
+            "WhatsApp DISABLED by config (WHATSAPP_ENABLED) — not sending template=%s",
+            template_name,
+        )
         return False
     if not settings.WHATSAPP_ACCESS_TOKEN or not settings.WHATSAPP_PHONE_NUMBER_ID:
-        logger.warning("WhatsApp not configured — skipping template=%s", template_name)
+        logger.warning(
+            "WhatsApp not configured — skipping template=%s (token_set=%s phone_id_set=%s)",
+            template_name,
+            bool(settings.WHATSAPP_ACCESS_TOKEN),
+            bool(settings.WHATSAPP_PHONE_NUMBER_ID),
+        )
         return False
     to = normalize_whatsapp_number(raw_phone)
     if not to:
-        logger.info("WhatsApp skipped, no usable phone number for template=%s", template_name)
+        logger.warning(
+            "WhatsApp skipped, no usable phone number for template=%s (raw_len=%d)",
+            template_name, len(raw_phone or ""),
+        )
         return False
     return _post_template_message(to, template_name, body_params, button_params)
 
