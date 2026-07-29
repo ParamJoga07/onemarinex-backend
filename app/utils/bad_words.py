@@ -17,6 +17,7 @@ BAD_WORDS = {
     "bollocks",
     "twat",
     "wanker",
+    "idiot", "drugs", "sexual", "terrorism", "prostitute", "prostitution","human", "trafficking"
 }
 
 
