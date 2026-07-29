@@ -813,11 +813,21 @@ def trigger_sos(
 
     # 2. HeyPorts Support
     recipients.append("support@heyports.com")
-    
-    # In a real app, send emails here
-    print(f"[SOS TRIGGERED] From: {current_user.email}, Port: {body.port_name}, Lat: {body.lat}, Lng: {body.lng}")
-    print(f"[SOS RECIPIENTS] {', '.join(set(recipients))}")
-    
+
+    # Alert the ship's configured SOS email + HeyPorts support. send_sos_alert
+    # never raises — an SMTP outage must not block recording the SOS. Delivers
+    # for real once SMTP_* is configured; logs otherwise.
+    from app.services.email import send_sos_alert
+    send_sos_alert(
+        ship_email=profile.sos_email,
+        crew_name=profile.full_name or current_user.email,
+        crew_email=current_user.email,
+        vessel=profile.vessel,
+        port_name=port_name,
+        lat=body.lat,
+        lng=body.lng,
+    )
+
     # Record SOS request
     new_sos = CrewSos(
         user_id=current_user.id,

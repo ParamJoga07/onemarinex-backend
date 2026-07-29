@@ -1,4 +1,4 @@
-from datetime import timedelta, date
+from datetime import timedelta, date, datetime
 from typing import Optional, List, Dict, Any
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, EmailStr, Field
@@ -9,27 +9,65 @@ from app.db.models.user import User
 from app.db.models.crew_profile import CrewProfile
 from app.db.models.agent_profile import AgentProfile
 from app.db.models.aggregator_profile import AggregatorProfile
-from app.services.auth import get_password_hash, create_access_token, create_refresh_token
+from app.db.models.email_verification import EmailVerification
+from app.services.auth import get_password_hash, verify_password, create_access_token, create_refresh_token
 from app.services.crew_service import generate_unique_hpid
+from app.services.email import send_email_verification_code
 from app.api.v1.routes_auth import AuthOut
 from app.core.config import settings
 import random
 import string
+import secrets
 
 router = APIRouter()
+
+# --- Email OTP (verify-at-registration / "block") ---
+OTP_TTL_MINUTES = 10
+OTP_MAX_ATTEMPTS = 5
+
+
+def _consume_valid_otp(db: Session, email: str, code: str) -> bool:
+    """Authoritative OTP check used at account creation. Verifies the latest
+    unexpired code for `email`, and on success deletes all codes for that email
+    (single-use). Returns False on missing/expired/wrong/over-attempts."""
+    rec = (
+        db.query(EmailVerification)
+        .filter(EmailVerification.email == email)
+        .order_by(EmailVerification.id.desc())
+        .first()
+    )
+    if not rec or rec.expires_at < datetime.utcnow() or rec.attempts >= OTP_MAX_ATTEMPTS:
+        return False
+    if not verify_password(code, rec.code_hash):
+        rec.attempts += 1
+        db.commit()
+        return False
+    db.query(EmailVerification).filter(EmailVerification.email == email).delete()
+    db.commit()
+    return True
 
 class CrewRegistrationIn(BaseModel):
     # User fields
     email: EmailStr
     password: str = Field(min_length=6)
     mobile_number: str
-    
+    otp: str = Field(min_length=6, max_length=6)  # emailed verification code
+
     # Profile fields
     full_name: str
     rank: str
     nationality: str
     passport_number: Optional[str] = None
     date_of_birth: Optional[date] = None
+
+
+class SendOtpIn(BaseModel):
+    email: EmailStr
+
+
+class VerifyOtpIn(BaseModel):
+    email: EmailStr
+    code: str = Field(min_length=6, max_length=6)
 
 class RegistrationCheckIn(BaseModel):
     email: EmailStr
@@ -85,9 +123,59 @@ class AggregatorUpdate(BaseModel):
     fleet: Optional[List[FleetItem]]
     documents: Optional[List[str]]
 
+@router.post("/send-otp", status_code=status.HTTP_200_OK)
+def send_registration_otp(body: SendOtpIn, db: Session = Depends(get_db)):
+    """Email a 6-digit verification code for a new-account signup. Rejects
+    emails that are already registered (registration already reveals this via
+    /registration/check, so this is not an enumeration regression)."""
+    email = body.email.lower().strip()
+    if db.query(User).filter(User.email == email).first():
+        raise HTTPException(status_code=409, detail="Email already registered")
+
+    # Invalidate any previous codes for this email.
+    db.query(EmailVerification).filter(EmailVerification.email == email).delete()
+    code = f"{secrets.randbelow(1_000_000):06d}"
+    db.add(EmailVerification(
+        email=email,
+        code_hash=get_password_hash(code),
+        expires_at=datetime.utcnow() + timedelta(minutes=OTP_TTL_MINUTES),
+    ))
+    db.commit()
+    send_email_verification_code(to=email, code=code)
+    return {"message": "Verification code sent."}
+
+
+@router.post("/verify-otp", status_code=status.HTTP_200_OK)
+def verify_registration_otp(body: VerifyOtpIn, db: Session = Depends(get_db)):
+    """Non-consuming pre-check so the UI can confirm the code before the final
+    submit. The authoritative single-use check runs in /registration/crew."""
+    email = body.email.lower().strip()
+    rec = (
+        db.query(EmailVerification)
+        .filter(EmailVerification.email == email)
+        .order_by(EmailVerification.id.desc())
+        .first()
+    )
+    if not rec or rec.expires_at < datetime.utcnow():
+        raise HTTPException(status_code=400, detail="Code expired — request a new one.")
+    if rec.attempts >= OTP_MAX_ATTEMPTS:
+        raise HTTPException(status_code=429, detail="Too many attempts — request a new code.")
+    if not verify_password(body.code, rec.code_hash):
+        rec.attempts += 1
+        db.commit()
+        raise HTTPException(status_code=400, detail="Invalid code.")
+    rec.verified = True
+    db.commit()
+    return {"verified": True}
+
+
 @router.post("/crew", response_model=AuthOut, status_code=status.HTTP_201_CREATED)
 def register_crew(body: CrewRegistrationIn, db: Session = Depends(get_db)):
     email = body.email.lower().strip()
+
+    # Block account creation until the emailed OTP is verified (single-use).
+    if not _consume_valid_otp(db, email, body.otp):
+        raise HTTPException(status_code=400, detail="Invalid or expired verification code")
 
     # Check if user already exists
     if db.query(User).filter(User.email == email).first():
@@ -136,6 +224,10 @@ def register_crew(body: CrewRegistrationIn, db: Session = Depends(get_db)):
         from app.api.v1.routes_crew import sync_crew_manifest_helper
         sync_crew_manifest_helper(crew_profile, db)
     except Exception as e:
+        # The account is already committed above; a manifest-sync failure must
+        # not fail the signup. Roll back the (now-aborted) transaction so the
+        # session is usable for the refresh/token issuance below.
+        db.rollback()
         print(f"Error during registration crew manifest sync: {e}")
 
     db.refresh(user)

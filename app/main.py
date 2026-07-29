@@ -24,6 +24,8 @@ from app.api.v1 import routes_agents
 from app.api.v1 import routes_aggregators
 from app.api.v1 import routes_bookings
 from app.api.v1 import routes_itinerary
+from app.api.v1 import routes_expenses
+from app.api.v1 import routes_payments
 
 def custom_openapi():
     if app.openapi_schema:
@@ -148,6 +150,8 @@ app.include_router(routes_notifications.router, prefix="/api/v1/notifications", 
 app.include_router(routes_sos.router, prefix="/api/v1/sos", tags=["sos"])
 app.include_router(routes_itinerary.router, prefix="/api/v1/itinerary", tags=["itinerary"])
 app.include_router(routes_facilities.router, prefix="/api/v1/facilities", tags=["facilities"])
+app.include_router(routes_expenses.router, prefix="/api/v1/crew/expense-bills", tags=["expenses"])
+app.include_router(routes_payments.router, prefix="/api/v1/crew/payments", tags=["payments"])
 
 
 # --- Health checks & root ---
