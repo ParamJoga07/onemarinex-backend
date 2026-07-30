@@ -228,3 +228,67 @@ def change_password(
     current_user.must_change_password = False
     db.commit()
     return {"message": "Password updated successfully"}
+
+
+# ---------- forgot password (email a 6-digit reset code) ----------
+
+from datetime import datetime, timedelta
+import secrets
+
+from app.db.models.password_reset import PasswordReset
+from app.services.email import send_password_reset_code
+
+RESET_CODE_TTL_MINUTES = 15
+
+
+class ForgotPasswordIn(BaseModel):
+    email: EmailStr
+
+
+class ResetPasswordIn(BaseModel):
+    email: EmailStr
+    code: str
+    new_password: str = Field(..., min_length=8)
+
+
+@router.post("/forgot-password")
+def forgot_password(body: ForgotPasswordIn, db: Session = Depends(get_db)):
+    """Email a short-lived reset code. Always returns 200 so the endpoint
+    can't be used to probe which emails are registered."""
+    user = db.query(User).filter(User.email == body.email.lower()).first()
+    if user:
+        # Invalidate any previous codes for this user.
+        db.query(PasswordReset).filter(PasswordReset.user_id == user.id).delete()
+        code = f"{secrets.randbelow(1_000_000):06d}"
+        db.add(PasswordReset(
+            user_id=user.id,
+            token=get_password_hash(code),
+            expires_at=datetime.utcnow() + timedelta(minutes=RESET_CODE_TTL_MINUTES),
+        ))
+        db.commit()
+        send_password_reset_code(to=user.email, name=user.name, code=code)
+    return {"message": "If that email is registered, a reset code has been sent."}
+
+
+@router.post("/reset-password")
+def reset_password(body: ResetPasswordIn, db: Session = Depends(get_db)):
+    generic_error = HTTPException(status_code=400, detail="Invalid or expired reset code")
+    user = db.query(User).filter(User.email == body.email.lower()).first()
+    if not user:
+        raise generic_error
+    reset = (
+        db.query(PasswordReset)
+        .filter(PasswordReset.user_id == user.id)
+        .order_by(PasswordReset.id.desc())
+        .first()
+    )
+    if not reset or reset.expires_at < datetime.utcnow():
+        raise generic_error
+    if not verify_password(body.code, reset.token):
+        raise generic_error
+
+    user.hashed_password = get_password_hash(body.new_password)
+    user.must_change_password = False
+    db.query(PasswordReset).filter(PasswordReset.user_id == user.id).delete()
+    db.commit()
+    return {"message": "Password reset successfully. You can now log in."}

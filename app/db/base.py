@@ -48,4 +48,7 @@ from app.db.models import vendor_tag # noqa: F401
 from app.db.models import booking_provider_rejection # noqa: F401
 from app.db.models import booking_review # noqa: F401
 from app.db.models import booking_invitation # noqa: F401
+from app.db.models import expense_bill  # noqa: F401
+from app.db.models import payment  # noqa: F401
+from app.db.models import email_verification  # noqa: F401
 from app.db.models.shore_pass_reminder import ShorePassReminder # noqa: F401

@@ -18,3 +18,8 @@ httpx==0.28.1
 qrcode[pil]>=7.4.2
 # Scheduled jobs (shore-pass return reminders)
 apscheduler==3.10.4
+# Object storage (DigitalOcean Spaces / S3)
+boto3==1.35.21
+# Payments
+razorpay==1.4.2
+anthropic==0.120.2

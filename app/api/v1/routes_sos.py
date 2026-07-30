@@ -73,6 +73,86 @@ def list_sos_requests(
     ]
 
 
+class SosTimelineEvent(BaseModel):
+    event: str
+    label: str
+    time: Optional[datetime] = None
+    done: bool
+
+
+class SosTimelineOut(BaseModel):
+    id: int
+    status: str
+    crew_name: Optional[str] = None
+    crew_email: Optional[str] = None
+    port_name: Optional[str] = None
+    vessel: Optional[str] = None
+    lat: Optional[float] = None
+    lng: Optional[float] = None
+    events: List[SosTimelineEvent]
+
+
+@router.get("/{sos_id}/timeline", response_model=SosTimelineOut)
+def get_sos_timeline(
+    sos_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Ordered timeline of an SOS request's lifecycle for the admin view."""
+    if current_user.role not in {"superadmin", "agent"}:
+        raise HTTPException(status_code=403, detail="Only superadmins or agents can view SOS")
+
+    sos = db.query(CrewSos).filter(CrewSos.id == sos_id).first()
+    if not sos:
+        raise HTTPException(status_code=404, detail="SOS request not found")
+
+    if current_user.role == "agent":
+        port = current_user.agent_profile.assigned_port if current_user.agent_profile else None
+        if not port or sos.port_name != port:
+            raise HTTPException(status_code=403, detail="Not authorized to view SOS for this port")
+
+    events: List[SosTimelineEvent] = [
+        SosTimelineEvent(
+            event="TRIGGERED",
+            label="SOS triggered by crew",
+            time=sos.created_at,
+            done=True,
+        ),
+        SosTimelineEvent(
+            event="ACKNOWLEDGED",
+            label="Acknowledged by admin",
+            time=sos.acknowledged_at,
+            done=sos.acknowledged_at is not None,
+        ),
+    ]
+    if sos.cancelled_at is not None:
+        events.append(SosTimelineEvent(
+            event="CANCELLED",
+            label="Cancelled by crew",
+            time=sos.cancelled_at,
+            done=True,
+        ))
+    else:
+        events.append(SosTimelineEvent(
+            event="CLOSED",
+            label="Resolved & closed",
+            time=sos.closed_at,
+            done=sos.closed_at is not None,
+        ))
+
+    return SosTimelineOut(
+        id=sos.id,
+        status=sos.status,
+        crew_name=sos.crew_profile.full_name if sos.crew_profile else None,
+        crew_email=sos.user.email if sos.user else None,
+        port_name=sos.port_name,
+        vessel=sos.vessel,
+        lat=sos.lat,
+        lng=sos.lng,
+        events=events,
+    )
+
+
 @router.patch("/{sos_id}/status", response_model=SosStatusOut)
 def update_sos_status(
     sos_id: int,
