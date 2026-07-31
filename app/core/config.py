@@ -33,5 +33,16 @@ class Settings:
     WHATSAPP_DEFAULT_COUNTRY_CODE = os.getenv("WHATSAPP_DEFAULT_COUNTRY_CODE", "91")
     WHATSAPP_ENABLED = _env_flag("WHATSAPP_ENABLED", "true")
     APP_PUBLIC_BASE_URL = os.getenv("APP_PUBLIC_BASE_URL", "https://heyports-56we8.ondigitalocean.app")
+    # --- Anthropic AI Moderation & Chat Safety ---
+    ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+    ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-haiku-4-5")
+    CHAT_RATE_LIMIT_MAX = int(os.getenv("CHAT_RATE_LIMIT_MAX", "5"))
+    CHAT_RATE_LIMIT_SECONDS = int(os.getenv("CHAT_RATE_LIMIT_SECONDS", "10"))
+    CHAT_MAX_MESSAGE_LENGTH = int(os.getenv("CHAT_MAX_MESSAGE_LENGTH", "1000"))
+    CHAT_BLOCK_PII = _env_flag("CHAT_BLOCK_PII", "true")
+    CHAT_BLOCK_URLS = _env_flag("CHAT_BLOCK_URLS", "true")
+    CHAT_EXTRA_BLOCKED_WORDS = [
+        w.strip().lower() for w in os.getenv("CHAT_EXTRA_BLOCKED_WORDS", "").split(",") if w.strip()
+    ]
 
 settings = Settings()

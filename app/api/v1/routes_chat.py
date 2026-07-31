@@ -8,7 +8,7 @@ from app.db.session import get_db
 from app.db.models.user import User
 from app.db.models.chat import ChatMessage
 from app.db.models.port import Port
-from app.utils.bad_words import contains_bad_words
+from app.services.ai_moderation import moderate_message
 from app.api.v1.routes_auth import get_current_user
 # If get_current_user requires Bearer we'll need to parse token for WS manually or use query params.
 
@@ -170,10 +170,15 @@ async def websocket_endpoint(websocket: WebSocket, port_id: int, token: str = Qu
                 text = msg_data.get("message", "").strip()
                 
                 if text:
-                    if contains_bad_words(text):
+                    is_blocked, tier_used = await moderate_message(text, user_id=user.id)
+                    if is_blocked:
+                        print(f"[WS] Message blocked ({tier_used}) from user {user.id}")
                         await websocket.send_json({
                             "type": "error",
-                            "data": {"message": "Message contains inappropriate language"},
+                            "data": {
+                                "message": "Your message couldn't be sent because it violates our community guidelines.",
+                                "tier": tier_used
+                            },
                         })
                         continue
                     # Save to DB
