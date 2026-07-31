@@ -122,6 +122,7 @@ def on_startup():
     # Base is already linked to all models via app/db/base.py imports
     Base.metadata.create_all(bind=engine)
     ensure_legacy_schema_columns()
+    ensure_expense_bill_columns()
     _log_whatsapp_config()
     scheduler.add_job(run_shore_pass_reminders, "interval", minutes=5, id="shore_pass_reminders", replace_existing=True)
     scheduler.start()
@@ -170,6 +171,30 @@ def ensure_legacy_schema_columns():
         connection.execute(
             text("ALTER TABLE aggregator_profiles ADD COLUMN provider_type VARCHAR(32) DEFAULT 'aggregator' NOT NULL")
         )
+
+
+def ensure_expense_bill_columns():
+    """`expense_bills` shipped before trip-linking / tax-split / bill-number.
+    create_all never ALTERs an existing table, so add the new columns here
+    (idempotent). Plain columns (no FK constraint) — ownership is validated in
+    the API layer."""
+    inspector = inspect(engine)
+    if "expense_bills" not in inspector.get_table_names():
+        return  # brand-new deploy: create_all already built it with all columns
+    existing = {c["name"] for c in inspector.get_columns("expense_bills")}
+    additions = {
+        "amount_pre_tax": "NUMERIC(10,2)",
+        "amount_post_tax": "NUMERIC(10,2)",
+        "bill_number": "VARCHAR(128)",
+        "shore_pass_id": "INTEGER",
+        "cab_booking_id": "INTEGER",
+    }
+    missing = {name: ddl for name, ddl in additions.items() if name not in existing}
+    if not missing:
+        return
+    with engine.begin() as connection:
+        for name, ddl in missing.items():
+            connection.execute(text(f"ALTER TABLE expense_bills ADD COLUMN IF NOT EXISTS {name} {ddl}"))
 
 # --- Routes ---
 app.include_router(routes_auth.router,    prefix="/api/v1/auth",    tags=["authentication"])
