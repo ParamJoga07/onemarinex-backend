@@ -1542,3 +1542,89 @@ def review_stats(
         "facility_avg_rating": round(float(facility_avg), 2) if facility_avg else None,
         "facility_review_count": facility_count,
     }
+
+
+# =====================================================
+# EXPENSE BILLS (crew-uploaded receipts) — admin view
+# =====================================================
+from app.db.models.expense_bill import ExpenseBill
+from app.db.models.shore_pass import ShorePass
+from app.services import storage as bill_storage
+
+
+class AdminBillOut(BaseModel):
+    id: int
+    crew_id: int
+    crew_name: Optional[str] = None
+    merchant: str
+    # Admin-facing amount is the PRE-TAX figure; falls back to the paid total
+    # for bills uploaded before the tax split existed.
+    amount_pre_tax: Optional[float] = None
+    amount_post_tax: Optional[float] = None
+    bill_number: Optional[str] = None
+    bill_date: Optional[datetime] = None
+    trip_kind: Optional[str] = None       # "shore_pass" | "cab_booking" | None
+    trip_label: Optional[str] = None
+    receipt_url: str
+    receipt_filename: str
+    created_at: datetime
+
+
+@router.get("/expense-bills", response_model=List[AdminBillOut])
+def admin_list_expense_bills(
+    crew_id: Optional[int] = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """All crew bills for the super admin, showing pre-tax amounts."""
+    verify_superadmin(current_user)
+
+    q = db.query(ExpenseBill).order_by(ExpenseBill.created_at.desc())
+    if crew_id is not None:
+        q = q.filter(ExpenseBill.crew_id == crew_id)
+    bills = q.limit(500).all()
+
+    crew_names = {
+        cp.id: cp.full_name
+        for cp in db.query(CrewProfile).filter(
+            CrewProfile.id.in_({b.crew_id for b in bills} or {0})
+        ).all()
+    }
+    sp_labels = {
+        sp.id: f"Shore leave {sp.shore_pass_id}"
+        for sp in db.query(ShorePass).filter(
+            ShorePass.id.in_({b.shore_pass_id for b in bills if b.shore_pass_id} or {0})
+        ).all()
+    }
+    cab_labels = {
+        cb.id: f"Cab {cb.booking_id}"
+        for cb in db.query(CabBooking).filter(
+            CabBooking.id.in_({b.cab_booking_id for b in bills if b.cab_booking_id} or {0})
+        ).all()
+    }
+
+    out: List[AdminBillOut] = []
+    for b in bills:
+        pre = b.amount_pre_tax if b.amount_pre_tax is not None else (b.amount_post_tax or b.amount)
+        post = b.amount_post_tax if b.amount_post_tax is not None else b.amount
+        trip_kind = trip_label = None
+        if b.shore_pass_id:
+            trip_kind, trip_label = "shore_pass", sp_labels.get(b.shore_pass_id)
+        elif b.cab_booking_id:
+            trip_kind, trip_label = "cab_booking", cab_labels.get(b.cab_booking_id)
+        out.append(AdminBillOut(
+            id=b.id,
+            crew_id=b.crew_id,
+            crew_name=crew_names.get(b.crew_id),
+            merchant=b.merchant,
+            amount_pre_tax=float(pre) if pre is not None else None,
+            amount_post_tax=float(post) if post is not None else None,
+            bill_number=b.bill_number,
+            bill_date=b.bill_date,
+            trip_kind=trip_kind,
+            trip_label=trip_label,
+            receipt_url=bill_storage.resolve(b.receipt_url),
+            receipt_filename=b.receipt_filename,
+            created_at=b.created_at,
+        ))
+    return out

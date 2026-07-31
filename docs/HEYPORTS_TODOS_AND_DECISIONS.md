@@ -25,6 +25,8 @@ See **§6 Next steps** for what remains before/after production.
 | 7 | Payments | Bill upload & pay-online flow | BE `routes_expenses.py`, `models/expense_bill.py`, `services/storage.py` (Spaces), `routes_payments.py`, `models/payment.py`, `services/payments.py` (Razorpay); FE `Expenses/`, `services/payments.ts` |
 | 8 | Registration | Email OTP verification at signup ("block") | BE `models/email_verification.py`, `registration.py` (`/send-otp`, `/verify-otp`, `otp` on `/crew`), `services/email.send_email_verification_code`; FE `CrewRegistrationStep2.tsx` |
 | 9 | Payments | Bill auto-extract (Claude Haiku 4.5 vision) | BE `services/bill_extraction.py`, `routes_expenses.py` (`POST /crew/expense-bills/extract`); FE `Expenses/expenses.ts` (`extractBill`) + "Extract details" in `ExpensesFlow.tsx` |
+| 10 | Payments | Bill ↔ trip link, tax split, bill no., admin view | BE `models/expense_bill.py` (+5 cols), `routes_expenses.py` (`/linkable-trips`, trip validation), `routes_superadmin.py` (`GET /expense-bills`); FE trip picker + Bill No. in `ExpensesFlow.tsx`, `SuperAdmin/ExpenseBills.tsx` |
+| 11 | Login | Forgot-password in landing-page login drawer | FE `LandingPage.tsx` (link + reset modal, mirrors `UnifiedLogin`) |
 
 All verified end-to-end (see §5).
 
@@ -151,6 +153,27 @@ details" pre-fills the form → crew edits/confirms → normal `uploadBill`.
 Model `claude-haiku-4-5` (override via `BILL_EXTRACTION_MODEL`). **Verified**
 2026-07-28: real receipt → merchant/amount(total)/currency/date, confidence 0.95.
 
+### 3.7b Bill ↔ trip linking, tax split, bill number, admin view
+- **Trip link:** a bill may link to a **shore pass** or a **cab booking** (not
+  both) via nullable `shore_pass_id` / `cab_booking_id`. Linkable = trip is
+  active, or ended within **24 h** (shore pass end = `in_time` or `expires_at`
+  passed; cab end = `trip_completed_at`/`completed_at`; cancelled/rejected
+  never linkable). `GET /crew/expense-bills/linkable-trips` feeds the picker;
+  ownership + recency validated server-side on upload.
+- **Tax split:** `amount_pre_tax` (subtotal) + `amount_post_tax` (paid).
+  **Crew sees post-tax** (their `amount` = paid); **super admin sees pre-tax**
+  (falls back to paid total for pre-split rows). Legacy `amount` kept in sync
+  with post-tax for back-compat.
+- **Bill number:** `bill_number` column; extraction now also returns
+  `bill_number`, `amount_pre_tax`, `amount_post_tax` (same-total rule when no
+  separate tax line). Verified live: INV no. + 29.50/31.86 split, conf 0.95.
+- **Admin view:** `GET /superadmin/expense-bills` (superadmin-gated, crew name
+  + trip label + pre-tax) rendered by `SuperAdmin/ExpenseBills.tsx` ("Expense
+  Bills" sidebar item).
+- **Schema:** these are **new columns on an existing table** → handled by
+  idempotent `ensure_expense_bill_columns()` in `main.py` startup (create_all
+  won't ALTER; §4). Plain columns, no FK constraint — ownership checked in API.
+
 ### 3.8 Email OTP verification at registration ("block") — new
 New-account signup now requires a verified emailed code before the user row is
 created (crew registration).
@@ -251,9 +274,7 @@ code-single-use all PASS; registration survives an induced manifest-sync failure
    routes for a browser/UI click-through of the OTP flow.
 
 ### 6.3 Build next (feature work)
-9. **Bill extraction — Claude Haiku 4.5 vision** (§3.7, task open). Add
-   `services/bill_extraction.py` + `POST /crew/expense-bills/extract` +
-   "Extract details" on the upload screen. `ANTHROPIC_API_KEY` unset → mock.
+9. ~~Bill extraction — Claude Haiku 4.5 vision~~ **✅ Shipped** (§3.7).
 10. **Payments finish-up (Razorpay, parked)** — go-live needs real
     `RAZORPAY_*` creds and a "Payment Successful" confirmation screen; verify
     the admin SOS timeline against a prod-shaped DB.
@@ -261,3 +282,76 @@ code-single-use all PASS; registration survives an induced manifest-sync failure
 ### 6.4 Test-account state (local dev)
 - `swetan369@gmail.com` / `NewPass@2026` (role `crew`) — created + password
   reset during the 2026-07-28 E2E.
+
+---
+
+## 7. Setting environment variables on DigitalOcean App Platform
+
+Production reads these from App Platform, **not** from `.env` (which is
+git-ignored and never deployed). Set them on the **backend service component**,
+except `VITE_API_BASE_URL` which belongs to the **frontend** component.
+
+### Dashboard steps
+1. **Apps** → open the app → **Settings** tab.
+2. Under **Components**, click the **backend service** (the FastAPI
+   `onemarinex-backend` component — not the frontend static site).
+3. **Environment Variables** → **Edit** → **Add Variable** for each key below.
+4. For every secret, tick **Encrypt** (stored as `SECRET`, hidden after save).
+5. **Save** → App Platform automatically **redeploys** the component (~1–2 min).
+
+### Backend component variables
+
+| Key | Required? | Encrypt | Value / notes |
+|-----|-----------|---------|---------------|
+| `DATABASE_URL` | ✅ | — | Managed-DB DSN (often injected as `${db.DATABASE_URL}`) |
+| `SECRET_KEY` | ✅ | 🔒 | JWT signing secret |
+| `SMTP_HOST` | ✅¹ | — | `smtp.gmail.com` |
+| `SMTP_PORT` | ✅¹ | — | `587` (STARTTLS; 465/SSL not supported) |
+| `SMTP_USER` | ✅¹ | — | sending mailbox, e.g. `hello@heyports.com` |
+| `SMTP_PASSWORD` | ✅¹ | 🔒 | 16-char Google App Password for `SMTP_USER` |
+| `SMTP_FROM` | ✅¹ | — | must equal `SMTP_USER` or a verified alias |
+| `SMTP_USE_TLS` | — | — | `true` (default) |
+| `SUPPORT_EMAIL` | ✅¹ | — | inbox for contact-us + SOS, e.g. `support@heyports.com` |
+| `SPACES_KEY` | ✅² | 🔒 | DO Spaces access key |
+| `SPACES_SECRET` | ✅² | 🔒 | DO Spaces secret |
+| `SPACES_BUCKET` | ✅² | — | `heyports-assets` |
+| `SPACES_REGION` | ✅² | — | `sgp1` |
+| `SPACES_ENDPOINT` | — | — | `https://sgp1.digitaloceanspaces.com` (**region host only, no bucket**) |
+| `ANTHROPIC_API_KEY` | ✅³ | 🔒 | `sk-ant-…` — enables bill auto-extract |
+| `BILL_EXTRACTION_MODEL` | ❌ optional | — | **only to override** the default `claude-haiku-4-5` |
+| `RAZORPAY_KEY_ID` | ✅⁴ | — | `rzp_live_…` |
+| `RAZORPAY_KEY_SECRET` | ✅⁴ | 🔒 | Razorpay secret |
+| `RAZORPAY_WEBHOOK_SECRET` | — | 🔒 | optional webhook verification |
+
+¹ Required for OTP/reset/SOS/contact email to actually send. Unset → logged
+only, so **crew signup can't complete** (OTP is mandatory).
+² Required for bill receipts to persist; unset → ephemeral disk (lost on redeploy).
+³ Required for real bill extraction; unset → mock/empty fields (no crash).
+⁴ Required only when going live with real payments; unset → mock mode.
+
+> **`BILL_EXTRACTION_MODEL` is optional** — the model ID is hard-coded default
+> `claude-haiku-4-5` in `services/bill_extraction.py`. You do **not** need to add
+> it to App Platform. Only `ANTHROPIC_API_KEY` is required for extraction.
+
+### Frontend component
+| Key | Notes |
+|-----|-------|
+| `VITE_API_BASE_URL` | build-time — a change requires a **rebuild**, not just restart |
+
+### App-spec alternative (`app.yaml` / `doctl apps update`)
+```yaml
+services:
+  - name: onemarinex-backend
+    envs:
+      - key: SMTP_PASSWORD
+        value: <app-password>
+        type: SECRET          # = the "Encrypt" checkbox
+      - key: ANTHROPIC_API_KEY
+        value: sk-ant-...
+        type: SECRET
+      # …plaintext ones omit `type: SECRET`
+```
+
+Reminders: saving env vars triggers a redeploy; deploy **frontend + backend
+together** (backend now requires `otp` on crew registration); add SPF/DKIM/DMARC
+DNS for the sending domain so OTP/reset/SOS mail isn't spam-filtered.
