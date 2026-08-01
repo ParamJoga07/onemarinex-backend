@@ -1,17 +1,27 @@
 """Text normalization for chat moderation matching.
 
-All 11 rules applied in order. Normalized text is for matching only; the original
-raw text is what gets stored and broadcast.
+Normalization pipeline:
+1. Lowercase
+2. Strip whitespace
+3. Collapse multiple spaces
+4. Remove zero-width/control chars
+5. Collapse character runs (aaa→aa)
+6. Collapse multiple punctuation (!!! → !)
+7. Remove intra-word punctuation (s.e.x → sex)
+8. Remove spaced-out single letters (p o r n → porn)
+9. Apply ONLY numeric/symbolic leet substitutions (0→o, 1→i, not !→i or @→a)
+10. Strip non-word characters except apostrophes
+11. Final space collapse
 """
 import re
 import unicodedata
 
 _LEET_TABLE = {
-    '@': 'a', '4': 'a',
+    '4': 'a',
     '3': 'e',
-    '1': 'i', '!': 'i',
+    '1': 'i',
     '0': 'o',
-    '5': 's', '$': 's',
+    '5': 's',
     '7': 't',
     'z': 's',
 }
@@ -44,9 +54,18 @@ def normalize(text: str) -> str:
     while re.search(r'[a-z][._\-/\\*!]+[a-z]', result):
         result = re.sub(r'([a-z])[._\-/\\*!]+([a-z])', r'\1\2', result)
 
+    def remove_excessive_spaces(match):
+        token = match.group(0)
+        letters = sum(1 for c in token if c.isalpha())
+        spaces = sum(1 for c in token if c == ' ')
+        if letters > 2 and spaces >= letters - 1:
+            return token.replace(' ', '')
+        return token
+    result = re.sub(r'[a-z](?:\s[a-z])+', remove_excessive_spaces, result)
+
     result = ''.join(_LEET_TABLE.get(c, c) for c in result)
 
-    result = re.sub(r'[^a-z0-9\s.!?\'\"-]', '', result)
+    result = re.sub(r'[^a-z0-9\s\']', '', result)
 
     result = re.sub(r'\s+', ' ', result).strip()
 

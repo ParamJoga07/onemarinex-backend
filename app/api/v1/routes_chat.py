@@ -8,7 +8,8 @@ from app.db.session import get_db
 from app.db.models.user import User
 from app.db.models.chat import ChatMessage
 from app.db.models.port import Port
-from app.utils.bad_words import contains_bad_words
+from app.db.models.chat_moderation_event import ChatModerationEvent
+from app.services.chat_moderation import moderate_message
 from app.api.v1.routes_auth import get_current_user
 # If get_current_user requires Bearer we'll need to parse token for WS manually or use query params.
 
@@ -129,6 +130,30 @@ def get_chat_history(port_id: int, limit: int = 50, db: Session = Depends(get_db
     return result
 
 
+@router.get("/moderation-config")
+def get_moderation_config(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Get moderation config for frontend (authenticated crew only).
+
+    Only crew members can access community chat moderation config.
+    """
+    if current_user.role != "crew":
+        raise HTTPException(status_code=403, detail="Crew access required for community chat")
+
+    from app.db.models.chat_moderation_setting import ChatModerationSetting
+    settings = db.query(ChatModerationSetting).filter(ChatModerationSetting.id == 1).first()
+    if not settings:
+        settings = ChatModerationSetting(id=1)
+        db.add(settings)
+        db.commit()
+        db.refresh(settings)
+    return {
+        "max_message_length": settings.max_message_length,
+    }
+
+
 # --- WebSocket Endpoint ---
 from jose import jwt
 from app.core.config import settings
@@ -168,20 +193,75 @@ async def websocket_endpoint(websocket: WebSocket, port_id: int, token: str = Qu
             try:
                 msg_data = json.loads(data)
                 text = msg_data.get("message", "").strip()
-                
+
                 if text:
-                    if contains_bad_words(text):
+                    result = await moderate_message(db, user.id, port_id, text)
+
+                    if result.rejected:
+                        error_messages = {
+                            "empty": "Message cannot be empty.",
+                            "too_long": "Message exceeds maximum length.",
+                            "rate_limited": "You are sending messages too quickly. Please slow down.",
+                            "duplicate": "This message was just sent. Please send something different.",
+                            "contact_info": "Messages cannot contain contact information.",
+                            "payment_info": "Messages cannot contain payment information.",
+                            "external_link": "Messages cannot contain external links.",
+                            "spam": "Message looks like spam.",
+                            "restricted_word": "Message contains restricted words.",
+                            "charset": "Message looks like keyboard-smash.",
+                            "language_violation": "Messages must be in English.",
+                            "guidelines_violation": "Message violates community guidelines.",
+                            "ai_unavailable": "Message couldn't be checked right now — please try again.",
+                        }
+                        error_msg = error_messages.get(result.code, "Message was rejected.")
+
                         await websocket.send_json({
                             "type": "error",
-                            "data": {"message": "Message contains inappropriate language"},
+                            "data": {
+                                "code": result.code,
+                                "message": error_msg,
+                            },
                         })
+
+                        event = ChatModerationEvent(
+                            port_id=port_id,
+                            user_id=user.id,
+                            raw_message=text,
+                            normalized_message=text.lower(),
+                            decision="rejected",
+                            rejected_by=result.rejected_by,
+                            reason_code=result.reason_code,
+                            matched_term=result.matched_term,
+                            ai_route=result.ai_route,
+                            ai_model=result.ai_model,
+                            ai_latency_ms=result.ai_latency_ms,
+                        )
+                        db.add(event)
+                        try:
+                            db.commit()
+                        except Exception:
+                            db.rollback()
                         continue
-                    # Save to DB
+
                     new_msg = ChatMessage(port_id=port_id, user_id=user.id, message=text)
                     db.add(new_msg)
                     db.commit()
-                    
-                    # Broadcast
+
+                    event = ChatModerationEvent(
+                        port_id=port_id,
+                        user_id=user.id,
+                        chat_message_id=new_msg.id,
+                        raw_message=text,
+                        normalized_message=text.lower(),
+                        decision="allowed",
+                        rejected_by="backend",
+                    )
+                    db.add(event)
+                    try:
+                        db.commit()
+                    except Exception:
+                        db.rollback()
+
                     await manager.broadcast(port_id, text, user)
             except json.JSONDecodeError:
                 pass

@@ -186,13 +186,6 @@ async def moderate_message(
 
     single_words, phrase_regex = _get_cached_dictionary(db)
     matched_term = _check_dictionary(normalized, single_words, phrase_regex)
-    if matched_term:
-        result.rejected = True
-        result.code = "restricted_word"
-        result.reason_code = "restricted_word"
-        result.rejected_by = "level_1"
-        result.matched_term = matched_term
-        return result
 
     if _check_charset(normalized):
         result.rejected = True
@@ -202,11 +195,18 @@ async def moderate_message(
         return result
 
     if not settings.language_ai_enabled and not settings.moderation_ai_enabled:
-        result.rejected = False
-        result.rejected_by = "backend"
+        if matched_term:
+            result.rejected = True
+            result.code = "restricted_word"
+            result.reason_code = "restricted_word"
+            result.rejected_by = "level_1"
+            result.matched_term = matched_term
+        else:
+            result.rejected = False
+            result.rejected_by = "backend"
         return result
 
-    level2_decision = await _route_level2(normalized, settings)
+    level2_decision = await _route_level2(normalized, settings, matched_term=matched_term)
     if level2_decision:
         result.rejected = True
         result.rejected_by = level2_decision['rejected_by']
@@ -215,6 +215,15 @@ async def moderate_message(
         result.ai_route = level2_decision.get('ai_route')
         result.ai_model = level2_decision.get('ai_model')
         result.ai_latency_ms = level2_decision.get('ai_latency_ms')
+        result.matched_term = level2_decision.get('matched_term', matched_term)
+        return result
+
+    if matched_term:
+        result.rejected = True
+        result.code = "restricted_word"
+        result.reason_code = "restricted_word"
+        result.rejected_by = "level_1"
+        result.matched_term = matched_term
         return result
 
     result.rejected = False
@@ -222,11 +231,14 @@ async def moderate_message(
     return result
 
 
-async def _route_level2(normalized: str, settings) -> Optional[dict]:
-    """Level 2: Moderation routing. Invoke AI for contextual triggers and direct abuse signals.
+async def _route_level2(normalized: str, settings, matched_term: str = None) -> Optional[dict]:
+    """Level 2: Moderation routing. Invoke AI for contextual triggers, dictionary matches, and abuse signals.
 
     Routes to:
-    - Moderation AI: contextual red flags or direct abuse signals (caps, repeats, curse-like patterns)
+    - Moderation AI:
+        * Dictionary word match (verify context - "porn addiction is dangerous" should be allowed)
+        * Contextual red flags (escort services, illegal activity language)
+        * Direct abuse signals (high caps, curse patterns)
     - Language AI: non-English content
     """
     has_contextual_trigger = any(trigger in normalized for trigger in _CONTEXTUAL_TRIGGERS)
@@ -241,20 +253,26 @@ async def _route_level2(normalized: str, settings) -> Optional[dict]:
          re.search(r'[a-z]-[a-z]', normalized))  # hyphen between letters (f-u-c-k)
     )
 
-    if (has_contextual_trigger or has_abuse_signals) and settings.moderation_ai_enabled:
-        verdict = await check_moderation(normalized)
-        if verdict.result == "FLAGGED":
-            return {
-                'rejected_by': 'moderation_ai',
-                'reason_code': 'guidelines_violation',
-                'code': 'guidelines_violation',
-                'ai_route': 'moderation',
-                'ai_model': 'claude-haiku-4-5',
-            }
+    if settings.moderation_ai_enabled:
+        call_moderation_ai = (
+            matched_term or
+            has_contextual_trigger or
+            has_abuse_signals
+        )
+
+        if call_moderation_ai:
+            verdict = await check_moderation(normalized)
+            if verdict.result == "FLAGGED":
+                return {
+                    'rejected_by': 'moderation_ai',
+                    'reason_code': 'guidelines_violation',
+                    'code': 'guidelines_violation',
+                    'ai_route': 'moderation',
+                    'ai_model': 'claude-haiku-4-5',
+                    'matched_term': matched_term,
+                }
 
     if settings.language_ai_enabled:
-        # Always check language (not expensive, catches transliterated non-English)
-        # Examples: "dengutha" (Telugu), "bagunnara" (Telugu), "hola" (Spanish)
         verdict = await check_language(normalized)
         if verdict.result == "LANGUAGE":
             return {
@@ -344,30 +362,20 @@ def _check_spam(normalized: str) -> bool:
 
 
 def _check_raw_spam(raw_text: str) -> bool:
-    """Check raw text for spam patterns before normalization.
-    Detects: symbol density, keyboard smash entropy.
+    """Check raw text for obvious spam patterns before normalization.
+    Only detects high-confidence spam to avoid false positives.
+
+    Keyboard smash detection removed due to high false positive rate on legitimate text.
+    Keyboard smash will be caught by Level 2 AI moderation if needed.
     """
     if not raw_text or len(raw_text) < 3:
         return False
 
-    # Check for excessive symbols (less than 20% letters)
     letters = sum(1 for c in raw_text if c.isalpha())
     total = len(raw_text)
+
     if total > 0 and (letters / total) < 0.2:
         return True
-
-    # Check for keyboard smash: random sequence of keys
-    from collections import Counter
-    letter_list = [c.lower() for c in raw_text if c.isalpha()]
-    if len(letter_list) > 8:
-        letter_counts = Counter(letter_list)
-        unique_letters = len(letter_counts)
-        single_occurrence = sum(1 for count in letter_counts.values() if count == 1)
-        # Keyboard smash: lots of unique letters with many appearing only once
-        # "hgfkguilhio..." has 11 unique, 6 appearing once
-        # "hello" has 4 unique, 0 appearing once (all repeat)
-        if unique_letters > len(letter_list) * 0.25 and single_occurrence > unique_letters * 0.4:
-            return True
 
     return False
 
