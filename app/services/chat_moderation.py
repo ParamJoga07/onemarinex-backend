@@ -16,7 +16,7 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.utils.text_normalization import normalize
-from app.services.moderation_ai import check_language, check_moderation
+from app.services.moderation_ai import check_language, check_context
 
 logger = logging.getLogger("heyports.chat_moderation")
 
@@ -206,7 +206,7 @@ async def moderate_message(
             result.rejected_by = "backend"
         return result
 
-    level2_decision = await _route_level2(normalized, settings, matched_term=matched_term)
+    level2_decision = await _route_level2(normalized, settings, matched_term=matched_term, raw_text=raw_text)
     if level2_decision:
         result.rejected = True
         result.rejected_by = level2_decision['rejected_by']
@@ -216,6 +216,13 @@ async def moderate_message(
         result.ai_model = level2_decision.get('ai_model')
         result.ai_latency_ms = level2_decision.get('ai_latency_ms')
         result.matched_term = level2_decision.get('matched_term', matched_term)
+        return result
+
+    if matched_term and settings.moderation_ai_enabled:
+        # Context AI evaluated as EDUCATIONAL or CLEAN, allow message
+        result.rejected = False
+        result.rejected_by = "moderation_ai_approved"
+        result.matched_term = matched_term
         return result
 
     if matched_term:
@@ -231,50 +238,39 @@ async def moderate_message(
     return result
 
 
-async def _route_level2(normalized: str, settings, matched_term: str = None) -> Optional[dict]:
-    """Level 2: Moderation routing. Invoke AI for contextual triggers, dictionary matches, and abuse signals.
+async def _route_level2(normalized: str, settings, matched_term: str = None, raw_text: str = None) -> Optional[dict]:
+    """Level 2: Moderation routing. Invoke AI for context evaluation and language detection.
 
     Routes to:
-    - Moderation AI:
-        * Dictionary word match (verify context - "porn addiction is dangerous" should be allowed)
-        * Contextual red flags (escort services, illegal activity language)
-        * Direct abuse signals (high caps, curse patterns)
-    - Language AI: non-English content
+    - Context AI (if dictionary match found):
+        * Evaluates EDUCATIONAL, CLEAN, HARASSMENT, ABUSE
+        * HARASSMENT/ABUSE → REJECT
+        * EDUCATIONAL/CLEAN → ALLOW
+
+    - Language AI (for non-English content):
+        * Detects non-English abuse terms
+        * LANGUAGE result → Policy depends on deployment
     """
-    has_contextual_trigger = any(trigger in normalized for trigger in _CONTEXTUAL_TRIGGERS)
+    if settings.moderation_ai_enabled and matched_term:
+        verdict = await check_context(normalized, matched_term=matched_term)
+        logger.debug(f"Context verdict for '{matched_term}': {verdict.result}")
 
-    # Heuristics for likely abuse (high caps, excessive punctuation, obfuscation patterns)
-    has_abuse_signals = (
-        len(normalized) > 0 and
-        (sum(1 for c in normalized if c.isupper()) / len(normalized) > 0.5 or  # >50% caps
-         '!!!' in normalized or '???' in normalized or  # excessive punctuation
-         normalized.count('*') > 2 or  # asterisk obfuscation
-         re.search(r'[a-z]\.[a-z]', normalized) or  # dot between letters (s.e.x, f.u.c.k)
-         re.search(r'[a-z]-[a-z]', normalized))  # hyphen between letters (f-u-c-k)
-    )
+        if verdict.result in ("HARASSMENT", "ABUSE"):
+            return {
+                'rejected_by': 'moderation_ai',
+                'reason_code': 'guidelines_violation',
+                'code': 'guidelines_violation',
+                'ai_route': 'context',
+                'ai_model': 'claude-haiku-4-5',
+                'matched_term': matched_term,
+            }
+        # EDUCATIONAL and CLEAN context → Allow (will be handled by caller)
 
-    if settings.moderation_ai_enabled:
-        call_moderation_ai = (
-            matched_term or
-            has_contextual_trigger or
-            has_abuse_signals
-        )
-
-        if call_moderation_ai:
-            verdict = await check_moderation(normalized)
-            if verdict.result == "FLAGGED":
-                return {
-                    'rejected_by': 'moderation_ai',
-                    'reason_code': 'guidelines_violation',
-                    'code': 'guidelines_violation',
-                    'ai_route': 'moderation',
-                    'ai_model': 'claude-haiku-4-5',
-                    'matched_term': matched_term,
-                }
-
-    if settings.language_ai_enabled:
+    if settings.language_ai_enabled and not matched_term:
+        # Only check language if no dictionary match (performance optimization)
         verdict = await check_language(normalized)
         if verdict.result == "LANGUAGE":
+            logger.debug(f"Non-English content detected")
             return {
                 'rejected_by': 'language_ai',
                 'reason_code': 'language_violation',
