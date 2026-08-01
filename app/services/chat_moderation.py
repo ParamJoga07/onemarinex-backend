@@ -99,10 +99,20 @@ def _get_cached_dictionary(db: Session) -> tuple:
     """Return (single_words_set, phrase_regex) with TTL refresh."""
     global _dictionary_cache, _phrase_regex, _cache_loaded_at
 
-    if _dictionary_cache is None or (datetime.utcnow() - _cache_loaded_at).total_seconds() > _CACHE_TTL_SECONDS:
+    # Check if cache needs refresh
+    needs_refresh = (
+        _dictionary_cache is None or
+        _cache_loaded_at is None or
+        (datetime.utcnow() - _cache_loaded_at).total_seconds() > _CACHE_TTL_SECONDS
+    )
+
+    if needs_refresh:
+        logger.info("DEBUG: Reloading restricted words dictionary")
         reload_restricted_words(db)
 
-    return _dictionary_cache or set(), _phrase_regex
+    result_dict = _dictionary_cache or set()
+    logger.info(f"DEBUG: Returning dictionary with {len(result_dict)} words")
+    return result_dict, _phrase_regex
 
 
 async def moderate_message(
@@ -185,7 +195,10 @@ async def moderate_message(
         return result
 
     single_words, phrase_regex = _get_cached_dictionary(db)
+    logger.info(f"DEBUG: Dictionary loaded - single_words count: {len(single_words) if single_words else 0}")
+
     matched_term = _check_dictionary(normalized, single_words, phrase_regex)
+    logger.info(f"DEBUG: Dictionary check result - matched_term: {matched_term}, tokens: {normalized.split()}")
 
     if _check_charset(normalized):
         result.rejected = True
@@ -379,17 +392,23 @@ def _check_raw_spam(raw_text: str) -> bool:
 def _check_dictionary(normalized: str, single_words: Set[str], phrase_regex: Optional[re.Pattern]) -> Optional[str]:
     """Check against restricted words and phrases."""
     tokens = normalized.split()
+    logger.debug(f"DEBUG _check_dictionary: tokens={tokens}, dict_size={len(single_words)}")
 
     for token in tokens:
         clean_token = re.sub(r'[^a-z0-9]', '', token)
-        if clean_token and clean_token in single_words:
+        in_dict = clean_token in single_words if single_words else False
+        logger.debug(f"DEBUG _check_dictionary: token='{token}' -> clean='{clean_token}' -> in_dict={in_dict}")
+        if clean_token and in_dict:
+            logger.info(f"DEBUG _check_dictionary: MATCH FOUND: '{clean_token}'")
             return clean_token
 
     if phrase_regex:
         match = phrase_regex.search(normalized)
         if match:
+            logger.info(f"DEBUG _check_dictionary: PHRASE MATCH: '{match.group(1)}'")
             return match.group(1)
 
+    logger.debug(f"DEBUG _check_dictionary: NO MATCH FOUND")
     return None
 
 
