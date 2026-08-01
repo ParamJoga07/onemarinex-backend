@@ -1,0 +1,404 @@
+"""Chat message moderation pipeline orchestrator.
+
+Implements the three-level moderation pipeline:
+- Level 0: Text normalization
+- Level 1: Deterministic checks (no AI)
+- Level 2: Routing and AI-based checks
+
+Exports: ModerationResult, moderate_message()
+"""
+import logging
+import re
+from collections import deque
+from datetime import datetime, timedelta
+from typing import Optional, Dict, Set
+from pydantic import BaseModel
+from sqlalchemy.orm import Session
+
+from app.utils.text_normalization import normalize
+from app.services.moderation_ai import check_language, check_moderation
+
+logger = logging.getLogger("heyports.chat_moderation")
+
+_flood_deques: Dict[tuple, deque] = {}
+_duplicate_cache: Dict[tuple, tuple] = {}
+_dictionary_cache = None
+_phrase_regex = None
+_cache_loaded_at = None
+_CACHE_TTL_SECONDS = 60
+
+
+class ModerationResult(BaseModel):
+    rejected: bool
+    code: Optional[str] = None
+    message: Optional[str] = None
+    reason_code: Optional[str] = None
+    rejected_by: Optional[str] = None
+    matched_term: Optional[str] = None
+    ai_route: Optional[str] = None
+    ai_model: Optional[str] = None
+    ai_latency_ms: Optional[int] = None
+    ai_input_tokens: Optional[int] = None
+    ai_output_tokens: Optional[int] = None
+
+
+_PHONE_REGEX = re.compile(r'(\+\d{1,3}[-.\s]?)?\(?([0-9]{1,4})\)?[-.\s]?([0-9]{1,4})[-.\s]?([0-9]{1,9})')
+_EMAIL_REGEX = re.compile(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b')
+_URL_REGEX = re.compile(r'https?://[^\s]+|www\.[^\s]+')
+_UPI_REGEX = re.compile(r'\b[a-zA-Z0-9._-]+@[a-zA-Z]{3,}\b')
+_CARD_REGEX = re.compile(r'\b\d{4}[\s-]?\d{4}[\s-]?\d{4}[\s-]?\d{4}\b|\bcard\b')
+_IFSC_REGEX = re.compile(r'\b[A-Z]{4}0[A-Z0-9]{6}\b')
+_HANDLE_REGEX = re.compile(r'@[a-zA-Z0-9_]+')
+
+_CONTEXTUAL_TRIGGERS = {
+    'arrange', 'arrangement', 'something special', 'privately', 'private',
+    'green stuff', 'anything special', 'help me out', 'discrete',
+    'under table', 'cash only', 'no record', 'off books',
+}
+
+
+def _ensure_settings(db: Session):
+    """Ensure settings row exists, create if missing."""
+    from app.db.models.chat_moderation_setting import ChatModerationSetting
+    settings = db.query(ChatModerationSetting).filter(ChatModerationSetting.id == 1).first()
+    if not settings:
+        settings = ChatModerationSetting(id=1)
+        db.add(settings)
+        db.commit()
+    return settings
+
+
+def reload_restricted_words(db: Session) -> None:
+    """Reload the in-memory dictionary from the database. Call after add/delete/import."""
+    from app.db.models.chat_restricted_word import ChatRestrictedWord
+    global _dictionary_cache, _phrase_regex, _cache_loaded_at
+
+    words = db.query(ChatRestrictedWord).filter(ChatRestrictedWord.is_active).all()
+
+    single_words = set()
+    phrases = []
+
+    for w in words:
+        normalized = w.word.lower()
+        if ' ' in normalized:
+            phrases.append(re.escape(normalized))
+        else:
+            single_words.add(normalized)
+
+    _dictionary_cache = single_words
+    if phrases:
+        _phrase_regex = re.compile(r'\b(' + '|'.join(phrases) + r')\b')
+    else:
+        _phrase_regex = None
+
+    _cache_loaded_at = datetime.utcnow()
+    logger.info("Restricted words dictionary reloaded: %d single words, %d phrases", len(single_words), len(phrases))
+
+
+def _get_cached_dictionary(db: Session) -> tuple:
+    """Return (single_words_set, phrase_regex) with TTL refresh."""
+    global _dictionary_cache, _phrase_regex, _cache_loaded_at
+
+    if _dictionary_cache is None or (datetime.utcnow() - _cache_loaded_at).total_seconds() > _CACHE_TTL_SECONDS:
+        reload_restricted_words(db)
+
+    return _dictionary_cache or set(), _phrase_regex
+
+
+async def moderate_message(
+    db: Session,
+    user_id: int,
+    port_id: int,
+    raw_text: str,
+) -> ModerationResult:
+    """Execute the three-level moderation pipeline.
+
+    Returns a ModerationResult with rejection decision and audit fields.
+    Never raises; failures follow fail_closed policy.
+    """
+    settings = _ensure_settings(db)
+    normalized = normalize(raw_text)
+
+    result = ModerationResult(rejected=False)
+
+    if not normalized:
+        result.rejected = True
+        result.code = "empty"
+        result.reason_code = "empty"
+        result.rejected_by = "level_1"
+        return result
+
+    if len(normalized) > settings.max_message_length:
+        result.rejected = True
+        result.code = "too_long"
+        result.reason_code = "too_long"
+        result.rejected_by = "level_1"
+        return result
+
+    if _check_flood(user_id, port_id, settings):
+        result.rejected = True
+        result.code = "rate_limited"
+        result.reason_code = "rate_limited"
+        result.rejected_by = "level_1"
+        return result
+
+    if _check_duplicate(user_id, port_id, normalized, settings):
+        result.rejected = True
+        result.code = "duplicate"
+        result.reason_code = "duplicate"
+        result.rejected_by = "level_1"
+        return result
+
+    if _check_contact_info(normalized):
+        result.rejected = True
+        result.code = "contact_info"
+        result.reason_code = "contact_info"
+        result.rejected_by = "level_1"
+        return result
+
+    if settings.block_payment_info and _check_payment_info(normalized):
+        result.rejected = True
+        result.code = "payment_info"
+        result.reason_code = "payment_info"
+        result.rejected_by = "level_1"
+        return result
+
+    if settings.block_external_links and _check_external_links(normalized):
+        result.rejected = True
+        result.code = "external_link"
+        result.reason_code = "external_link"
+        result.rejected_by = "level_1"
+        return result
+
+    if _check_raw_spam(raw_text):
+        result.rejected = True
+        result.code = "spam"
+        result.reason_code = "spam"
+        result.rejected_by = "level_1"
+        return result
+
+    if _check_spam(normalized):
+        result.rejected = True
+        result.code = "spam"
+        result.reason_code = "spam"
+        result.rejected_by = "level_1"
+        return result
+
+    single_words, phrase_regex = _get_cached_dictionary(db)
+    matched_term = _check_dictionary(normalized, single_words, phrase_regex)
+    if matched_term:
+        result.rejected = True
+        result.code = "restricted_word"
+        result.reason_code = "restricted_word"
+        result.rejected_by = "level_1"
+        result.matched_term = matched_term
+        return result
+
+    if _check_charset(normalized):
+        result.rejected = True
+        result.code = "charset"
+        result.reason_code = "charset"
+        result.rejected_by = "level_1"
+        return result
+
+    if not settings.language_ai_enabled and not settings.moderation_ai_enabled:
+        result.rejected = False
+        result.rejected_by = "backend"
+        return result
+
+    level2_decision = await _route_level2(normalized, settings)
+    if level2_decision:
+        result.rejected = True
+        result.rejected_by = level2_decision['rejected_by']
+        result.reason_code = level2_decision['reason_code']
+        result.code = level2_decision['code']
+        result.ai_route = level2_decision.get('ai_route')
+        result.ai_model = level2_decision.get('ai_model')
+        result.ai_latency_ms = level2_decision.get('ai_latency_ms')
+        return result
+
+    result.rejected = False
+    result.rejected_by = "backend"
+    return result
+
+
+async def _route_level2(normalized: str, settings) -> Optional[dict]:
+    """Level 2: Moderation routing. Invoke AI for contextual triggers and direct abuse signals.
+
+    Routes to:
+    - Moderation AI: contextual red flags or direct abuse signals (caps, repeats, curse-like patterns)
+    - Language AI: non-English content
+    """
+    has_contextual_trigger = any(trigger in normalized for trigger in _CONTEXTUAL_TRIGGERS)
+
+    # Heuristics for likely abuse (high caps, excessive punctuation, obfuscation patterns)
+    has_abuse_signals = (
+        len(normalized) > 0 and
+        (sum(1 for c in normalized if c.isupper()) / len(normalized) > 0.5 or  # >50% caps
+         '!!!' in normalized or '???' in normalized or  # excessive punctuation
+         normalized.count('*') > 2 or  # asterisk obfuscation
+         re.search(r'[a-z]\.[a-z]', normalized) or  # dot between letters (s.e.x, f.u.c.k)
+         re.search(r'[a-z]-[a-z]', normalized))  # hyphen between letters (f-u-c-k)
+    )
+
+    if (has_contextual_trigger or has_abuse_signals) and settings.moderation_ai_enabled:
+        verdict = await check_moderation(normalized)
+        if verdict.result == "FLAGGED":
+            return {
+                'rejected_by': 'moderation_ai',
+                'reason_code': 'guidelines_violation',
+                'code': 'guidelines_violation',
+                'ai_route': 'moderation',
+                'ai_model': 'claude-haiku-4-5',
+            }
+
+    if settings.language_ai_enabled:
+        # Always check language (not expensive, catches transliterated non-English)
+        # Examples: "dengutha" (Telugu), "bagunnara" (Telugu), "hola" (Spanish)
+        verdict = await check_language(normalized)
+        if verdict.result == "LANGUAGE":
+            return {
+                'rejected_by': 'language_ai',
+                'reason_code': 'language_violation',
+                'code': 'language_violation',
+                'ai_route': 'language',
+                'ai_model': 'claude-haiku-4-5',
+            }
+
+    return None
+
+
+def _check_flood(user_id: int, port_id: int, settings) -> bool:
+    """Check if user exceeded rate limit (5 messages in 10 seconds per port)."""
+    now = datetime.utcnow().timestamp()
+    key = (user_id, port_id)
+
+    if key not in _flood_deques:
+        _flood_deques[key] = deque()
+
+    deq = _flood_deques[key]
+
+    while deq and deq[0] < now - settings.rate_limit_window_seconds:
+        deq.popleft()
+
+    if len(deq) >= settings.rate_limit_count:
+        return True
+
+    deq.append(now)
+    return False
+
+
+def _check_duplicate(user_id: int, port_id: int, normalized: str, settings) -> bool:
+    """Check if message is a duplicate within window per port."""
+    now = datetime.utcnow().timestamp()
+    key = (user_id, port_id)
+    msg_hash = hash(normalized)
+
+    if key in _duplicate_cache:
+        prev_hash, prev_ts = _duplicate_cache[key]
+        if now - prev_ts < settings.duplicate_window_seconds and prev_hash == msg_hash:
+            return True
+
+    _duplicate_cache[key] = (msg_hash, now)
+    return False
+
+
+def _check_contact_info(normalized: str) -> bool:
+    """Check for phone/email/handle patterns."""
+    return bool(_PHONE_REGEX.search(normalized) or
+                _EMAIL_REGEX.search(normalized) or
+                _HANDLE_REGEX.search(normalized))
+
+
+def _check_payment_info(normalized: str) -> bool:
+    """Check for payment-related patterns."""
+    return bool(_UPI_REGEX.search(normalized) or
+                _CARD_REGEX.search(normalized) or
+                _IFSC_REGEX.search(normalized))
+
+
+def _check_external_links(normalized: str) -> bool:
+    """Check for URLs."""
+    return bool(_URL_REGEX.search(normalized))
+
+
+def _check_spam(normalized: str) -> bool:
+    """Check spam heuristics: char-run ratio, repeated-token ratio."""
+    if not normalized:
+        return False
+
+    non_space_len = sum(1 for c in normalized if c != ' ')
+    if non_space_len < 3:
+        return False
+
+    char_runs = sum(1 for c in normalized if c.isalpha())
+    if non_space_len > 0 and (char_runs / non_space_len) < 0.3:
+        return True
+
+    repeated_word_count = len(normalized.split())
+    unique_words = len(set(normalized.split()))
+    if repeated_word_count > 1 and (unique_words / repeated_word_count) < 0.3:
+        return True
+
+    return False
+
+
+def _check_raw_spam(raw_text: str) -> bool:
+    """Check raw text for spam patterns before normalization.
+    Detects: symbol density, keyboard smash entropy.
+    """
+    if not raw_text or len(raw_text) < 3:
+        return False
+
+    # Check for excessive symbols (less than 20% letters)
+    letters = sum(1 for c in raw_text if c.isalpha())
+    total = len(raw_text)
+    if total > 0 and (letters / total) < 0.2:
+        return True
+
+    # Check for keyboard smash: random sequence of keys
+    from collections import Counter
+    letter_list = [c.lower() for c in raw_text if c.isalpha()]
+    if len(letter_list) > 8:
+        letter_counts = Counter(letter_list)
+        unique_letters = len(letter_counts)
+        single_occurrence = sum(1 for count in letter_counts.values() if count == 1)
+        # Keyboard smash: lots of unique letters with many appearing only once
+        # "hgfkguilhio..." has 11 unique, 6 appearing once
+        # "hello" has 4 unique, 0 appearing once (all repeat)
+        if unique_letters > len(letter_list) * 0.25 and single_occurrence > unique_letters * 0.4:
+            return True
+
+    return False
+
+
+def _check_dictionary(normalized: str, single_words: Set[str], phrase_regex: Optional[re.Pattern]) -> Optional[str]:
+    """Check against restricted words and phrases."""
+    tokens = normalized.split()
+
+    for token in tokens:
+        clean_token = re.sub(r'[^a-z0-9]', '', token)
+        if clean_token and clean_token in single_words:
+            return clean_token
+
+    if phrase_regex:
+        match = phrase_regex.search(normalized)
+        if match:
+            return match.group(1)
+
+    return None
+
+
+def _check_charset(normalized: str) -> bool:
+    """Check for keyboard-smash (low alpha-char ratio)."""
+    if not normalized:
+        return False
+
+    non_space = sum(1 for c in normalized if c != ' ')
+    alpha = sum(1 for c in normalized if c.isalpha())
+
+    if non_space > 0:
+        ratio = alpha / non_space
+        return ratio < 0.3
+
+    return False
