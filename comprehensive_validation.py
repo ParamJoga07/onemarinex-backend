@@ -39,14 +39,7 @@ def trace_moderation(raw_text):
     total = len(raw_text)
     symbol_spam = total > 0 and (letters / total) < 0.2
 
-    # Step 5: Check keyboard smash
-    letter_list = [c.lower() for c in raw_text if c.isalpha()]
     keyboard_smash = False
-    if len(letter_list) > 8:
-        letter_counts = Counter(letter_list)
-        unique_letters = len(letter_counts)
-        single_occurrence = sum(1 for count in letter_counts.values() if count == 1)
-        keyboard_smash = unique_letters > len(letter_list) * 0.25 and single_occurrence > unique_letters * 0.4
 
     # Step 6: Determine final decision based on pipeline
     reason = ""
