@@ -358,7 +358,9 @@ def find_provider_for_ride(
 
 def get_booking_by_identifier(db: Session, booking_identifier: str) -> CabBooking:
     query = db.query(CabBooking).options(
-        joinedload(CabBooking.crew),
+        # crew.user is loaded eagerly because serialize_booking reads the crew's
+        # mobile number from it — lazy-loading would be a query per booking.
+        joinedload(CabBooking.crew).joinedload(CrewProfile.user),
         joinedload(CabBooking.provider),
         joinedload(CabBooking.assigned_driver),
     )
@@ -406,6 +408,13 @@ def serialize_booking(booking: CabBooking) -> Dict[str, Any]:
             "name": booking.crew.full_name if booking.crew else None,
             "hp_id": booking.crew.hpid if booking.crew else None,
             "vessel": booking.crew.vessel if booking.crew else None,
+            # The contact number lives on the linked user, not the profile —
+            # admins/agents need it to reach the crew about a ride.
+            "mobile_number": (
+                booking.crew.user.mobile_number
+                if booking.crew and booking.crew.user
+                else None
+            ),
         },
         "pickup_address": booking.pickup_address,
         "drop_address": booking.drop_address,
@@ -774,7 +783,9 @@ def list_bookings_for_user(
     date_to: Optional[datetime] = None,
 ) -> List[CabBooking]:
     query = db.query(CabBooking).options(
-        joinedload(CabBooking.crew),
+        # crew.user is loaded eagerly because serialize_booking reads the crew's
+        # mobile number from it — lazy-loading would be a query per booking.
+        joinedload(CabBooking.crew).joinedload(CrewProfile.user),
         joinedload(CabBooking.provider),
         joinedload(CabBooking.assigned_driver),
     )

@@ -26,17 +26,23 @@ PDF_TYPE = "application/pdf"
 
 _PROMPT = (
     "You are extracting fields from a photographed or scanned receipt/bill. "
-    "Return the merchant/vendor name, the final total amount actually paid "
-    "(number only, no currency symbol), the ISO currency code if visible, and "
-    "the bill date as YYYY-MM-DD. If a field is not clearly present, leave it "
-    "null — do not guess. Set confidence to your overall confidence (0-1) that "
-    "the extracted values are correct."
+    "Return, as numbers only (no currency symbol): the merchant/vendor name; "
+    "the bill/invoice number if printed (bill_number); the amount BEFORE taxes "
+    "(subtotal, amount_pre_tax); the final total actually paid AFTER taxes "
+    "(amount_post_tax); the ISO currency code if visible; and the bill date as "
+    "YYYY-MM-DD. Also set amount to the final total paid (same as amount_post_tax). "
+    "If a field is not clearly present, leave it null — do not guess. If the "
+    "receipt shows no separate tax line, set amount_pre_tax and amount_post_tax "
+    "to the same total. Set confidence to your overall confidence (0-1)."
 )
 
 
 class ExtractedBill(BaseModel):
     merchant: Optional[str] = Field(default=None, description="Vendor/merchant name")
+    bill_number: Optional[str] = Field(default=None, description="Bill/invoice number if printed")
     amount: Optional[float] = Field(default=None, description="Final total paid, number only")
+    amount_pre_tax: Optional[float] = Field(default=None, description="Subtotal before taxes")
+    amount_post_tax: Optional[float] = Field(default=None, description="Total paid after taxes")
     currency: Optional[str] = Field(default=None, description="ISO currency code, e.g. INR, USD")
     bill_date: Optional[str] = Field(default=None, description="Bill date as YYYY-MM-DD")
     confidence: float = Field(default=0.0, description="Overall confidence 0-1")

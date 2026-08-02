@@ -131,17 +131,27 @@ Admins can review events via `GET /sos/{id}/timeline` (admin-gated).
 
 ## 5. Bill upload & pay-online
 1. `POST /crew/expense-bills` (multipart: receipt image/PDF ≤10 MB + merchant/
-   amount/date) → stored to **DigitalOcean Spaces** (`expense_bills/<key>`),
+   bill_number/amount_pre_tax/amount_post_tax/date, optional `shore_pass_id` or
+   `cab_booking_id`) → stored to **DigitalOcean Spaces** (`expense_bills/<key>`),
    local-disk fallback in dev. `GET`/`DELETE` are crew-scoped.
+   - **Trip link:** `GET /crew/expense-bills/linkable-trips` lists the crew's
+     active shore passes / cab bookings plus those ended **within 24 h**; the
+     upload form offers them in a "Link to trip" picker. Server re-validates
+     ownership + the 24 h window (400 if the trip ended earlier).
+   - **Amount visibility:** crew responses show the **post-tax** (paid) amount;
+     `GET /superadmin/expense-bills` (superadmin only) lists all bills with the
+     **pre-tax** amount, crew name, bill no. and trip label → SuperAdmin
+     "Expense Bills" screen.
 2. Pay online (Razorpay): `POST /crew/payments/order` → checkout →
    `POST /crew/payments/verify` (HMAC-SHA256) → `paid`. **Mock mode** when
    `RAZORPAY_*` unset (order `order_mock_…`, empty `key_id`, auto-confirm).
 3. **Auto-extract:** "Extract details" (shown once a file is picked) →
    `POST /crew/expense-bills/extract` (multipart image, crew-gated) → Claude
-   Haiku 4.5 vision returns `{merchant, amount, currency, bill_date, confidence,
-   enabled}` → the form pre-fills; crew reviews and confirms before saving.
-   Nothing is persisted by `/extract`. `ANTHROPIC_API_KEY` unset → `enabled:false`
-   and the UI keeps manual entry.
+   Haiku 4.5 vision returns `{merchant, bill_number, amount, amount_pre_tax,
+   amount_post_tax, currency, bill_date, confidence, enabled}` → the form
+   pre-fills (paid amount + bill no. visible; pre-tax carried for admin
+   reporting); crew reviews and confirms before saving. Nothing is persisted by
+   `/extract`. `ANTHROPIC_API_KEY` unset → `enabled:false`, manual entry.
 
 ---
 

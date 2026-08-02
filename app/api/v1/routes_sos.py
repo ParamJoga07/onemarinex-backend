@@ -36,6 +36,7 @@ class SosAdminOut(BaseModel):
     created_at: datetime
     crew_name: Optional[str] = None
     crew_email: Optional[str] = None
+    crew_phone: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -68,6 +69,7 @@ def list_sos_requests(
             "created_at": sos.created_at,
             "crew_name": sos.crew_profile.full_name if sos.crew_profile else None,
             "crew_email": sos.user.email if sos.user else None,
+            "crew_phone": sos.user.mobile_number if sos.user else None,
         }
         for sos in sos_list
     ]
@@ -85,6 +87,7 @@ class SosTimelineOut(BaseModel):
     status: str
     crew_name: Optional[str] = None
     crew_email: Optional[str] = None
+    crew_phone: Optional[str] = None
     port_name: Optional[str] = None
     vessel: Optional[str] = None
     lat: Optional[float] = None
@@ -145,6 +148,7 @@ def get_sos_timeline(
         status=sos.status,
         crew_name=sos.crew_profile.full_name if sos.crew_profile else None,
         crew_email=sos.user.email if sos.user else None,
+        crew_phone=sos.user.mobile_number if sos.user else None,
         port_name=sos.port_name,
         vessel=sos.vessel,
         lat=sos.lat,
