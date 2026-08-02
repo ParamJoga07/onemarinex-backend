@@ -12,6 +12,7 @@ from typing import Optional, List
 from fastapi import APIRouter, Depends, HTTPException, Query, File, UploadFile
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
+from sqlalchemy.sql import func
 from pydantic import BaseModel, Field
 
 from app.db.session import get_db
@@ -19,6 +20,7 @@ from app.db.models.user import User
 from app.db.models.chat_restricted_word import ChatRestrictedWord
 from app.db.models.chat_moderation_event import ChatModerationEvent
 from app.db.models.chat_moderation_setting import ChatModerationSetting
+from app.db.models.chat import ChatMessage
 from app.api.v1.routes_auth import get_current_user
 from app.services.chat_moderation import reload_restricted_words
 
@@ -83,6 +85,14 @@ class ModerationEventOut(BaseModel):
         from_attributes = True
 
 
+class CrewChatToggleIn(BaseModel):
+    crew_chat_enabled: bool
+
+
+class DeleteMessageRequest(BaseModel):
+    pass
+
+
 class ModerationSettingsIn(BaseModel):
     max_message_length: int = Field(default=200, ge=10, le=5000)
     rate_limit_count: int = Field(default=5, ge=1, le=100)
@@ -94,6 +104,7 @@ class ModerationSettingsIn(BaseModel):
     block_external_links: bool = Field(default=False)
     block_contact_info: bool = Field(default=False)
     block_payment_info: bool = Field(default=False)
+    crew_chat_enabled: bool = Field(default=True)
 
 
 class ModerationSettingsOut(ModerationSettingsIn):
@@ -103,6 +114,11 @@ class ModerationSettingsOut(ModerationSettingsIn):
 
     class Config:
         from_attributes = True
+
+
+class DeleteMessageResponse(BaseModel):
+    success: bool
+    message_id: int
 
 
 class CSVImportResult(BaseModel):
@@ -372,9 +388,76 @@ def update_moderation_settings(
     settings.block_external_links = settings_in.block_external_links
     settings.block_contact_info = settings_in.block_contact_info
     settings.block_payment_info = settings_in.block_payment_info
+    settings.crew_chat_enabled = settings_in.crew_chat_enabled
     settings.updated_by = current_user.email
     settings.updated_at = datetime.utcnow()
 
     db.commit()
     db.refresh(settings)
     return settings
+
+
+@router.get("/chat/crew-chat-enabled", response_model=dict)
+def get_crew_chat_status(
+    db: Session = Depends(get_db),
+) -> dict:
+    """Get crew chat enabled status (public endpoint, no auth required)."""
+    settings = db.query(ChatModerationSetting).filter(ChatModerationSetting.id == 1).first()
+    enabled = settings.crew_chat_enabled if settings else True
+    return {"crew_chat_enabled": enabled}
+
+
+@router.put("/chat/crew-chat-enabled", response_model=ModerationSettingsOut)
+def toggle_crew_chat(
+    toggle_in: CrewChatToggleIn,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> ModerationSettingsOut:
+    """Toggle crew chat enabled/disabled status."""
+    verify_superadmin(current_user)
+    settings = _ensure_settings_row(db)
+    settings.crew_chat_enabled = toggle_in.crew_chat_enabled
+    settings.updated_by = current_user.email
+    settings.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(settings)
+    return settings
+
+
+@router.post("/chat/messages/{message_id}/delete", response_model=DeleteMessageResponse)
+async def delete_chat_message(
+    message_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> DeleteMessageResponse:
+    """Delete a chat message (soft delete - sets deleted_at timestamp).
+
+    Broadcasts deletion to all connected users in the port's WebSocket channel.
+    """
+    verify_superadmin(current_user)
+
+    message = db.query(ChatMessage).filter(ChatMessage.id == message_id).first()
+    if not message:
+        raise HTTPException(status_code=404, detail="Message not found")
+
+    if message.deleted_at:
+        raise HTTPException(status_code=410, detail="Message already deleted")
+
+    port_id = message.port_id
+    message.deleted_at = datetime.utcnow()
+    db.commit()
+
+    logger.info(f"Message {message_id} deleted by {current_user.email}")
+
+    # Broadcast deletion to connected users via WebSocket
+    try:
+        from app.api.v1.routes_chat import manager
+        await manager.broadcast_system_message(
+            port_id,
+            "message_deleted",
+            {"message_id": message_id}
+        )
+    except Exception as e:
+        logger.warning(f"Failed to broadcast message deletion: {e}")
+
+    return DeleteMessageResponse(success=True, message_id=message_id)

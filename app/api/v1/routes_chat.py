@@ -110,10 +110,10 @@ def get_channels(db: Session = Depends(get_db)):
 
 @router.get("/{port_id}/messages")
 def get_chat_history(port_id: int, limit: int = 50, db: Session = Depends(get_db)):
-    """Fetch past messages for a channel."""
+    """Fetch past messages for a channel. Excludes deleted messages."""
     messages = (
         db.query(ChatMessage)
-        .filter(ChatMessage.port_id == port_id)
+        .filter(ChatMessage.port_id == port_id, ChatMessage.deleted_at.is_(None))
         .order_by(ChatMessage.created_at.desc())
         .limit(limit)
         .all()

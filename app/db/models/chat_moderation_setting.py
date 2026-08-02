@@ -16,6 +16,7 @@ class ChatModerationSetting(Base):
     block_external_links = Column(Boolean, default=False)
     block_contact_info = Column(Boolean, default=False)
     block_payment_info = Column(Boolean, default=False)
+    crew_chat_enabled = Column(Boolean, default=True)
     updated_by = Column(String(255), nullable=True)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
