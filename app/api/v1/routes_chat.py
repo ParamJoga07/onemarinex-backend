@@ -3,7 +3,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Optional, Set
 
-from fastapi import APIRouter, Depends, Query, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, Query, WebSocket, WebSocketDisconnect, HTTPException
 from jose import jwt
 from sqlalchemy.orm import Session, joinedload
 
@@ -13,6 +13,7 @@ from app.db.models.port import Port
 from app.db.models.user import User
 from app.db.session import get_db
 from app.services.ai_moderation import moderate_message
+from app.api.v1.routes_auth import get_current_user
 
 router = APIRouter()
 logger = logging.getLogger("heyports.chat")
@@ -197,7 +198,6 @@ def get_moderation_config(
 
 
 # --- WebSocket Endpoint ---
-from app.api.v1.routes_auth import get_current_user
 
 def get_user_from_token(token: str, db: Session) -> Optional[User]:
     try:
