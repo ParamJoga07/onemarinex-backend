@@ -91,19 +91,21 @@ def normalize(text: str) -> str:
     # 8. Collapse multiple punctuation (!!! → !)
     result = re.sub(r'([.!?]){2,}', r'\1', result)
 
-    # 9. Remove intra-word punctuation (s.e.x → sex, f-u-c-k → fuck)
-    # Replace letter + punctuation + letter with just letters
-    while re.search(r'[a-z][._\-/\\*!]+[a-z]', result):
-        result = re.sub(r'([a-z])[._\-/\\*!]+([a-z])', r'\1\2', result)
+    # 9. Remove intra-word obfuscation symbols (p##rn → prn, p@@rn → prn, etc.)
+    # Remove non-alphanumeric chars between letter pairs
+    # Extended character set to catch: # @ * _ + = ~ | \ / $ % ^ & etc.
+    while re.search(r'[a-z][#@*_+=~|\\/$%^&\-\.!]+[a-z]', result):
+        result = re.sub(r'([a-z])[#@*_+=~|\\/$%^&\-\.!]+([a-z])', r'\1\2', result)
 
-    # 10. Remove spaced-out letters (p o r n → porn)
-    # Pattern: letter space letter space...
+    # 10. Remove spaced-out letters (p o r n → porn, s e x → sex)
+    # Pattern: letter space letter space... including repeated letters with spaces
     def remove_letter_spaces(match):
         token = match.group(0)
         letters = sum(1 for c in token if c.isalpha())
         spaces = sum(1 for c in token if c == ' ')
         # If heavily spaced (spaces >= letters - 1), remove spaces
-        if letters > 2 and spaces >= letters - 1:
+        # Catch patterns like: s e, e x, p o (min 2 letters with spaces)
+        if spaces >= letters - 1 and letters >= 2:
             return token.replace(' ', '')
         return token
 
@@ -116,25 +118,32 @@ def normalize(text: str) -> str:
     # Keep: a-z, 0-9, spaces, apostrophes only
     result = re.sub(r'[^a-z0-9\s\']', '', result)
 
-    # 13. Final whitespace collapse and strip
+    # 13. Collapse excessively repeated letters (seeeex → sex, aaaa → a)
+    # After removing symbols, any 2+ identical consecutive letters likely indicate obfuscation
+    result = re.sub(r'([a-z])\1+', r'\1', result)
+
+    # 14. Final whitespace collapse and strip
     result = re.sub(r'\s+', ' ', result).strip()
 
     return result
 
 
 def detect_repeated_characters(text: str) -> bool:
-    """Detect obvious spam patterns with repeated characters.
+    """Detect obvious spam patterns with repeated characters and keyboard smash.
 
     Examples:
-    - pooooooorn (6+ repeated chars)
+    - aaaaaaaaaaaaaaaaaaaa (repeated letter spam)
+    - pooooooorn (6+ repeated chars in word)
     - asdfghjkl (keyboard row)
     - 12345678 (number sequence)
+    - shshrjrjjdkddkjd (random key smash)
+    - 20@@Fhbjsbaacmagd (mixed random chars)
     """
     if len(text) < 3:
         return False
 
-    # 1. Detect 5+ consecutive identical characters
-    if re.search(r'(.)\1{4,}', text):
+    # 1. Detect 4+ consecutive identical characters (aaa, oooo, etc.)
+    if re.search(r'(.)\1{3,}', text):
         return True
 
     # 2. Detect common keyboard patterns
@@ -151,7 +160,84 @@ def detect_repeated_characters(text: str) -> bool:
         if pattern in text_lower:
             return True
 
+    # 3. Detect keyboard smash: random consonant clusters and excessive repeated chars
+    # Pattern: consonant cluster spam like "jdkddkjd" or "rjrjjdk"
+    if _is_keyboard_smash(text_lower):
+        return True
+
     return False
+
+
+def _is_keyboard_smash(text: str) -> bool:
+    """Detect keyboard smash by analyzing randomness and entropy.
+
+    Characteristics of keyboard smash:
+    - High ratio of consonant clusters (3+ consonants in a row)
+    - Excessive character repetition (same char appears 3+ times non-contiguously)
+    - Low vowel ratio (< 15% for alphanumeric text)
+    - No real word patterns
+    - High entropy (random character distribution)
+    """
+    if len(text) < 5:
+        return False
+
+    vowels = 'aeiou'
+    consonants = 'bcdfghjklmnpqrstvwxyz'
+
+    # Count letters only (not numbers)
+    letter_chars = [c for c in text if c.isalpha()]
+    letter_text = ''.join(letter_chars)
+
+    # 1. Check vowel ratio among letters - legitimate text has 30%+ vowels
+    if letter_text and len(letter_text) >= 4:
+        vowel_count = sum(1 for c in letter_text if c in vowels)
+        vowel_ratio = vowel_count / len(letter_text)
+        if vowel_ratio < 0.2:  # Low vowel ratio in letter-only text is suspicious
+            return True
+
+    # 2. Check for excessive consonant clusters (3+ consonants in a row)
+    consonant_clusters = len(re.findall(r'[bcdfghjklmnpqrstvwxyz]{3,}', text))
+    if consonant_clusters >= 2:  # Multiple weird consonant clusters
+        return True
+
+    # 3. Check for character distribution randomness
+    # Legitimate text has predictable char distribution; smash has highly varied
+    if _has_high_entropy(text):
+        return True
+
+    return False
+
+
+def _has_high_entropy(text: str) -> bool:
+    """Detect random character distribution (entropy).
+
+    Keyboard smash has high entropy (many different chars appearing unpredictably).
+    Legitimate text has lower entropy (predictable word patterns).
+    """
+    if len(text) < 5:
+        return False
+
+    # Count character frequency
+    char_freq = {}
+    for c in text:
+        if c.isalnum():  # Only count alphanumeric
+            char_freq[c] = char_freq.get(c, 0) + 1
+
+    if not char_freq:
+        return False
+
+    # Calculate Shannon entropy
+    total = sum(char_freq.values())
+    entropy = 0
+    for count in char_freq.values():
+        if count > 0:
+            p = count / total
+            entropy -= p * (p if p == 0 else __import__('math').log2(p))
+
+    # Legitimate text entropy: 3.5-4.5
+    # Random spam entropy: 3.8+
+    # If we have 4+ distinct chars and high entropy, it's likely smash
+    return entropy > 3.65 and len(char_freq) >= 4
 
 
 def is_excessive_non_ascii(text: str) -> bool:

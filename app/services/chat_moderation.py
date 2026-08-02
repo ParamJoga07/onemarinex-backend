@@ -79,7 +79,7 @@ def reload_restricted_words(db: Session) -> None:
     phrases = []
 
     for w in words:
-        normalized = w.word.lower()
+        normalized = w.word.lower().strip()
         if ' ' in normalized:
             phrases.append(re.escape(normalized))
         else:
@@ -121,176 +121,161 @@ async def moderate_message(
     port_id: int,
     raw_text: str,
 ) -> ModerationResult:
-    """Execute the three-level moderation pipeline.
+    """Execute the moderation pipeline: deterministic → restricted words → AI contextual.
 
-    Returns a ModerationResult with rejection decision and audit fields.
-    Never raises; failures follow fail_closed policy.
+    Policy: Any restricted dictionary word is an immediate, non-negotiable rejection.
+    AI is only called for contextual violations if no dictionary match exists.
+    Fail-closed: when in doubt, reject.
     """
     settings = _ensure_settings(db)
     normalized = normalize(raw_text)
 
-    result = ModerationResult(rejected=False)
+    # TEMPORARY: Debug trace object to collect all decision points
+    trace = {
+        'raw_message': raw_text,
+        'normalized': normalized,
+        'level_1_checks': {},
+        'dictionary': {'size': 0, 'matched_term': None},
+        'ai_calls': {'language_called': False, 'language_verdict': None, 'moderation_called': False, 'moderation_verdict': None},
+    }
 
     if not normalized:
-        result.rejected = True
-        result.code = "empty"
-        result.reason_code = "empty"
-        result.rejected_by = "level_1"
+        result = ModerationResult(rejected=True, code="empty", reason_code="empty", rejected_by="level_1")
+        _print_moderation_trace(trace, result, "empty")
         return result
 
     if len(normalized) > settings.max_message_length:
-        result.rejected = True
-        result.code = "too_long"
-        result.reason_code = "too_long"
-        result.rejected_by = "level_1"
+        result = ModerationResult(rejected=True, code="too_long", reason_code="too_long", rejected_by="level_1")
+        _print_moderation_trace(trace, result, "too_long")
         return result
 
     if _check_flood(user_id, port_id, settings):
-        result.rejected = True
-        result.code = "rate_limited"
-        result.reason_code = "rate_limited"
-        result.rejected_by = "level_1"
+        result = ModerationResult(rejected=True, code="rate_limited", reason_code="rate_limited", rejected_by="level_1")
+        _print_moderation_trace(trace, result, "flood")
         return result
 
     if _check_duplicate(user_id, port_id, normalized, settings):
-        result.rejected = True
-        result.code = "duplicate"
-        result.reason_code = "duplicate"
-        result.rejected_by = "level_1"
+        result = ModerationResult(rejected=True, code="duplicate", reason_code="duplicate", rejected_by="level_1")
+        _print_moderation_trace(trace, result, "duplicate")
         return result
 
     if _check_contact_info(normalized):
-        result.rejected = True
-        result.code = "contact_info"
-        result.reason_code = "contact_info"
-        result.rejected_by = "level_1"
+        result = ModerationResult(rejected=True, code="contact_info", reason_code="contact_info", rejected_by="level_1")
+        _print_moderation_trace(trace, result, "contact_info")
         return result
 
     if settings.block_payment_info and _check_payment_info(normalized):
-        result.rejected = True
-        result.code = "payment_info"
-        result.reason_code = "payment_info"
-        result.rejected_by = "level_1"
+        result = ModerationResult(rejected=True, code="payment_info", reason_code="payment_info", rejected_by="level_1")
+        _print_moderation_trace(trace, result, "payment_info")
         return result
 
     if settings.block_external_links and _check_external_links(normalized):
-        result.rejected = True
-        result.code = "external_link"
-        result.reason_code = "external_link"
-        result.rejected_by = "level_1"
+        result = ModerationResult(rejected=True, code="external_link", reason_code="external_link", rejected_by="level_1")
+        _print_moderation_trace(trace, result, "external_links")
         return result
 
     if _check_raw_spam(raw_text):
-        result.rejected = True
-        result.code = "spam"
-        result.reason_code = "spam"
-        result.rejected_by = "level_1"
+        result = ModerationResult(rejected=True, code="spam", reason_code="spam", rejected_by="level_1")
+        _print_moderation_trace(trace, result, "raw_spam")
         return result
 
     if _check_spam(normalized):
-        result.rejected = True
-        result.code = "spam"
-        result.reason_code = "spam"
-        result.rejected_by = "level_1"
+        result = ModerationResult(rejected=True, code="spam", reason_code="spam", rejected_by="level_1")
+        _print_moderation_trace(trace, result, "spam")
+        return result
+
+    if _check_charset(normalized):
+        result = ModerationResult(rejected=True, code="charset", reason_code="charset", rejected_by="level_1")
+        _print_moderation_trace(trace, result, "charset")
         return result
 
     single_words, phrase_regex = _get_cached_dictionary(db)
-    logger.info(f"DEBUG: Dictionary loaded - single_words count: {len(single_words) if single_words else 0}")
-
     matched_term = _check_dictionary(normalized, single_words, phrase_regex)
-    logger.info(f"DEBUG: Dictionary check result - matched_term: {matched_term}, tokens: {normalized.split()}")
-
-    if _check_charset(normalized):
-        result.rejected = True
-        result.code = "charset"
-        result.reason_code = "charset"
-        result.rejected_by = "level_1"
-        return result
-
-    if not settings.language_ai_enabled and not settings.moderation_ai_enabled:
-        if matched_term:
-            result.rejected = True
-            result.code = "restricted_word"
-            result.reason_code = "restricted_word"
-            result.rejected_by = "level_1"
-            result.matched_term = matched_term
-        else:
-            result.rejected = False
-            result.rejected_by = "backend"
-        return result
-
-    level2_decision = await _route_level2(normalized, settings, matched_term=matched_term, raw_text=raw_text)
-    if level2_decision:
-        result.rejected = True
-        result.rejected_by = level2_decision['rejected_by']
-        result.reason_code = level2_decision['reason_code']
-        result.code = level2_decision['code']
-        result.ai_route = level2_decision.get('ai_route')
-        result.ai_model = level2_decision.get('ai_model')
-        result.ai_latency_ms = level2_decision.get('ai_latency_ms')
-        result.matched_term = level2_decision.get('matched_term', matched_term)
-        return result
-
-    if matched_term and settings.moderation_ai_enabled:
-        # Context AI evaluated as EDUCATIONAL or CLEAN, allow message
-        result.rejected = False
-        result.rejected_by = "moderation_ai_approved"
-        result.matched_term = matched_term
-        return result
+    trace['dictionary']['size'] = len(single_words)
+    trace['dictionary']['matched_term'] = matched_term
 
     if matched_term:
-        result.rejected = True
-        result.code = "restricted_word"
-        result.reason_code = "restricted_word"
-        result.rejected_by = "level_1"
-        result.matched_term = matched_term
+        logger.info(f"Restricted word match: '{matched_term}' in message: {raw_text}")
+        result = ModerationResult(
+            rejected=True,
+            code="restricted_word",
+            reason_code="restricted_word",
+            rejected_by="level_1",
+            matched_term=matched_term
+        )
+        _print_moderation_trace(trace, result, "dictionary")
         return result
 
-    result.rejected = False
-    result.rejected_by = "backend"
+    if settings.moderation_ai_enabled or settings.language_ai_enabled:
+        ai_result = await _check_contextual_violations(normalized, settings, trace)
+        if ai_result:
+            _print_moderation_trace(trace, ai_result, "ai")
+            return ai_result
+
+    result = ModerationResult(rejected=False, rejected_by="backend")
+    _print_moderation_trace(trace, result, "allowed")
     return result
 
 
-async def _route_level2(normalized: str, settings, matched_term: str = None, raw_text: str = None) -> Optional[dict]:
-    """Level 2: Moderation routing. Invoke AI for context evaluation and language detection.
+async def _check_contextual_violations(normalized: str, settings, trace: dict = None) -> Optional[ModerationResult]:
+    """Check for contextual violations that require AI understanding.
 
-    Routes to:
-    - Context AI (if dictionary match found):
-        * Evaluates EDUCATIONAL, CLEAN, HARASSMENT, ABUSE
-        * HARASSMENT/ABUSE → REJECT
-        * EDUCATIONAL/CLEAN → ALLOW
+    This is only called when there are NO restricted dictionary matches.
 
-    - Language AI (for non-English content):
-        * Detects non-English abuse terms
-        * LANGUAGE result → Policy depends on deployment
+    AI Invocation Order (optimized for cost):
+    1. Language AI first - Reject immediately if non-English
+    2. Moderation AI only if Language AI returns ENGLISH
+
+    Language AI detects:
+    - Non-English language messages
+
+    Moderation AI detects:
+    - Threats and violence
+    - Harassment and bullying
+    - Discrimination and hate speech
+    - Encouragement of self-harm
+    - Defamation
+    - Illegal activity
+    - Bribery/corruption
+    - Drug solicitation
+    - Prostitution solicitation
+    - Grooming and coercion
     """
-    if settings.moderation_ai_enabled and matched_term:
-        verdict = await check_context(normalized, matched_term=matched_term)
-        logger.debug(f"Context verdict for '{matched_term}': {verdict.result}")
+    if trace is None:
+        trace = {'ai_calls': {}}
+
+    if settings.language_ai_enabled:
+        trace['ai_calls']['language_called'] = True
+        verdict = await check_language(normalized)
+        trace['ai_calls']['language_verdict'] = verdict.result
+        logger.debug(f"Language check: {verdict.result}")
+
+        if verdict.result == "LANGUAGE":
+            logger.info("Non-English message detected - rejecting without Moderation AI call")
+            return ModerationResult(
+                rejected=True,
+                code="language_violation",
+                reason_code="language_violation",
+                rejected_by="language_ai",
+                ai_route="language",
+                ai_model="claude-haiku-4-5"
+            )
+
+    if settings.moderation_ai_enabled:
+        trace['ai_calls']['moderation_called'] = True
+        verdict = await check_context(normalized)
+        trace['ai_calls']['moderation_verdict'] = verdict.result
+        logger.debug(f"Moderation AI verdict: {verdict.result}")
 
         if verdict.result in ("HARASSMENT", "ABUSE"):
-            return {
-                'rejected_by': 'moderation_ai',
-                'reason_code': 'guidelines_violation',
-                'code': 'guidelines_violation',
-                'ai_route': 'context',
-                'ai_model': 'claude-haiku-4-5',
-                'matched_term': matched_term,
-            }
-        # EDUCATIONAL and CLEAN context → Allow (will be handled by caller)
-
-    if settings.language_ai_enabled and not matched_term:
-        # Only check language if no dictionary match (performance optimization)
-        verdict = await check_language(normalized)
-        if verdict.result == "LANGUAGE":
-            logger.debug(f"Non-English content detected")
-            return {
-                'rejected_by': 'language_ai',
-                'reason_code': 'language_violation',
-                'code': 'language_violation',
-                'ai_route': 'language',
-                'ai_model': 'claude-haiku-4-5',
-            }
+            return ModerationResult(
+                rejected=True,
+                code="guidelines_violation",
+                reason_code="guidelines_violation",
+                rejected_by="moderation_ai",
+                ai_route="context",
+                ai_model="claude-haiku-4-5"
+            )
 
     return None
 
@@ -372,18 +357,24 @@ def _check_spam(normalized: str) -> bool:
 
 def _check_raw_spam(raw_text: str) -> bool:
     """Check raw text for obvious spam patterns before normalization.
-    Only detects high-confidence spam to avoid false positives.
 
-    Keyboard smash detection removed due to high false positive rate on legitimate text.
-    Keyboard smash will be caught by Level 2 AI moderation if needed.
+    Detects:
+    - Very low letter ratio (mostly symbols)
+    - Keyboard smash patterns (repeated chars, consonant clusters, high entropy)
+    - Random character sequences
     """
     if not raw_text or len(raw_text) < 3:
         return False
+
+    from app.utils.text_normalization import detect_repeated_characters
 
     letters = sum(1 for c in raw_text if c.isalpha())
     total = len(raw_text)
 
     if total > 0 and (letters / total) < 0.2:
+        return True
+
+    if detect_repeated_characters(raw_text):
         return True
 
     return False
@@ -413,15 +404,60 @@ def _check_dictionary(normalized: str, single_words: Set[str], phrase_regex: Opt
 
 
 def _check_charset(normalized: str) -> bool:
-    """Check for keyboard-smash (low alpha-char ratio)."""
+    """Check for keyboard-smash and gibberish (low alphanumeric ratio, random patterns)."""
     if not normalized:
         return False
+
+    from app.utils.text_normalization import detect_repeated_characters
 
     non_space = sum(1 for c in normalized if c != ' ')
     alpha = sum(1 for c in normalized if c.isalpha())
 
     if non_space > 0:
         ratio = alpha / non_space
-        return ratio < 0.3
+        if ratio < 0.3:
+            return True
+
+    if detect_repeated_characters(normalized):
+        return True
 
     return False
+
+
+def _print_moderation_trace(trace: dict, result: ModerationResult, checkpoint: str = ""):
+    """TEMPORARY DEBUG: Print complete moderation trace to terminal."""
+    print("\n" + "="*70)
+    print("MODERATION TRACE")
+    print("="*70)
+
+    print(f"\nRAW MESSAGE:\n  {repr(trace['raw_message'][:100])}")
+    print(f"\nNORMALIZED:\n  {repr(trace['normalized'][:100])}")
+
+    print("\nLEVEL 1 CHECKS")
+    print("-"*70)
+    print(f"  Checkpoint: {checkpoint}")
+
+    print("\nDICTIONARY")
+    print("-"*70)
+    print(f"  Dictionary Size: {trace.get('dictionary', {}).get('size', 'N/A')}")
+    print(f"  Matched Term: {trace.get('dictionary', {}).get('matched_term', 'None')}")
+
+    print("\nAI CALLS")
+    print("-"*70)
+    ai_calls = trace.get('ai_calls', {})
+    print(f"  Language AI Called: {'YES' if ai_calls.get('language_called') else 'NO'}")
+    if ai_calls.get('language_verdict'):
+        print(f"    → Verdict: {ai_calls['language_verdict']}")
+    print(f"  Moderation AI Called: {'YES' if ai_calls.get('moderation_called') else 'NO'}")
+    if ai_calls.get('moderation_verdict'):
+        print(f"    → Verdict: {ai_calls['moderation_verdict']}")
+
+    print("\nFINAL DECISION")
+    print("-"*70)
+    print(f"  Allowed: {'YES' if not result.rejected else 'NO'}")
+    print(f"  Rejected By: {result.rejected_by}")
+    print(f"  Reason: {result.reason_code or result.code}")
+    if result.matched_term:
+        print(f"  Matched Term: {result.matched_term}")
+
+    print("="*70 + "\n")

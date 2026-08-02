@@ -3,6 +3,9 @@ from sqlalchemy.orm import Session
 from typing import List, Dict, Set
 from datetime import datetime
 import json
+import logging
+
+logger = logging.getLogger(__name__)
 
 from app.db.session import get_db
 from app.db.models.user import User
@@ -160,42 +163,52 @@ from app.core.config import settings
 
 def get_user_from_token(token: str, db: Session) -> User:
     try:
+        logger.info(f"🔴 get_user_from_token called with token: {token[:20]}...")
         # The token sub contains the email, not the ID
         payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
         email = payload.get("sub")
+        logger.info(f"🔴 Decoded email from token: {email}")
         if email is None:
+            logger.error("🔴 Email is None from token")
             return None
-        return db.query(User).filter(User.email == email).first()
+        user = db.query(User).filter(User.email == email).first()
+        logger.info(f"🔴 User from DB: {user.email if user else 'NOT FOUND'}")
+        return user
     except Exception as e:
-        print(f"[WS] Token decode error: {e}")
+        logger.error(f"🔴 Token decode error: {e}")
         return None
 
 @router.websocket("/ws/{port_id}")
 async def websocket_endpoint(websocket: WebSocket, port_id: int, token: str = Query(...), db: Session = Depends(get_db)):
+    logger.info("🔴 ENTERED websocket_endpoint")
     user = get_user_from_token(token, db)
     if not user:
+        logger.error("🔴 NO USER FROM TOKEN")
         await websocket.close(code=1008)  # Policy Violation
         return
 
     # Check if port exists
     port = db.query(Port).filter(Port.id == port_id, Port.is_active == True).first()
     if not port:
+        logger.error(f"🔴 PORT {port_id} NOT FOUND")
         await websocket.close(code=1008)
         return
 
     await manager.connect(websocket, port_id, user.id)
-    print(f"[WS] User {user.id} ({user.email}) connected to port {port_id}")
+    logger.info(f"🔴 User {user.id} ({user.email}) connected to port {port_id}")
     try:
         while True:
             # Receive message
             data = await websocket.receive_text()
-            print(f"[WS] Received data from user {user.id} on port {port_id}: {data}")
+            logger.info(f"🔴 Received data from user {user.id} on port {port_id}: {data}")
             try:
                 msg_data = json.loads(data)
                 text = msg_data.get("message", "").strip()
 
                 if text:
+                    logger.info(f"🔴 ABOUT TO CALL moderate_message for: {text}")
                     result = await moderate_message(db, user.id, port_id, text)
+                    logger.info(f"🔴 MODERATION RESULT: rejected={result.rejected}, code={result.code}, matched_term={result.matched_term}")
 
                     if result.rejected:
                         error_messages = {

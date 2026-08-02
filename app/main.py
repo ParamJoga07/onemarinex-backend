@@ -101,6 +101,8 @@ origins = [
     "http://127.0.0.1:5173",
     "http://localhost:5174",
     "http://127.0.0.1:5174",
+    "http://localhost:5175",
+    "http://127.0.0.1:5175",
     "https://heyports-56we8.ondigitalocean.app",  # Production frontend
     "https://www.heyports-56we8.ondigitalocean.app",
     "https://heyports-dev-5285u.ondigitalocean.app",
@@ -113,6 +115,19 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# WebSocket connection logging middleware
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+
+class WebSocketLoggingMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        if request.url.path.startswith("/api/v1/chat/ws"):
+            logger = logging.getLogger("websocket_middleware")
+            logger.info(f"🟢 [MIDDLEWARE] WebSocket request to {request.url.path}?{request.url.query}")
+        return await call_next(request)
+
+app.add_middleware(WebSocketLoggingMiddleware)
 
 scheduler = BackgroundScheduler()
 

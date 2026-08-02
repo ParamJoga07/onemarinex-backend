@@ -57,72 +57,69 @@ class LanguageVerdict(BaseModel):
 
 
 class ContextVerdict(BaseModel):
-    result: Literal["EDUCATIONAL", "HARASSMENT", "ABUSE", "CLEAN"]
+    result: Literal["CLEAN", "HARASSMENT", "ABUSE"]
     confidence: float = 0.9
     reason: str = ""
 
 
-_LANGUAGE_SYSTEM_PROMPT = """You are a language classifier for a community chat. Determine if text is primarily English or non-English.
+_LANGUAGE_SYSTEM_PROMPT = """You are the language classifier for HeyPorts Crew Chat.
 
-RULES:
-1. ENGLISH = Text in English language, including English with proper names
-   - "Hello world" = ENGLISH
-   - "Raj Kumar is amazing" = ENGLISH (English + Indian name)
-   - "Joshan said goodbye" = ENGLISH (English + proper name)
-   - "good morning everyone" = ENGLISH (English words only)
+Return exactly one word:
 
-2. LANGUAGE = Text primarily in non-English language or untranslatable transliteration
-   - "dengutha" = LANGUAGE (Telugu)
-   - "hola amigo" = LANGUAGE (Spanish)
-   - "你好" = LANGUAGE (Chinese)
-   - "namaste" = LANGUAGE (Sanskrit)
-   - Pure gibberish/keyboard smash = ENGLISH (default)
-
-CRITICAL: Never reject English text with Indian names. When uncertain, default to ENGLISH.
-
-Respond with ONE word:
 ENGLISH
-or
+- Message is primarily English.
+- English containing names, places, ports or company names.
+- Gibberish or unreadable text.
+
 LANGUAGE
+- Message is primarily a non-English language.
+- Transliterated non-English (Telugu, Hindi, Tamil, etc.).
 
-No explanation."""
+If uncertain, return ENGLISH.
 
-_CONTEXT_SYSTEM_PROMPT = """You are a content moderator evaluating the CONTEXT and INTENT of text containing a flagged word.
+Respond with only:
 
-The goal is to determine if the text is:
-1. EDUCATIONAL - Academic/medical/informational use (e.g., "Porn addiction affects the brain")
-2. CLEAN - Simple mention without intent to violate (e.g., "I like vanilla, not strawberry")
-3. HARASSMENT - Personal attack or abuse directed at someone (e.g., "You are an idiot")
-4. ABUSE - Explicit abuse, sexual solicitation, or hate speech (e.g., "Let's have sex", "I sell porn")
+ENGLISH
+LANGUAGE"""
 
-CLASSIFICATION RULES:
-- EDUCATIONAL: Discussing a flagged term in informational/academic context
-  * Example: "Porn addiction research shows brain changes"
-  * Example: "Vaginal cancer symptoms include..."
-  * Example: "Drug addiction treatment options"
+_CONTEXT_SYSTEM_PROMPT = """You are the moderator for HeyPorts Crew Chat.
 
-- CLEAN: Legitimate mention without context suggesting violation
-  * Example: "The word 'porn' has multiple meanings"
-  * Example: "Criticism of policies is allowed"
+Classify the message into exactly one category.
 
-- HARASSMENT: Direct personal attack or name-calling
-  * Example: "You are an idiot"
-  * Example: "All X people are criminals"
-  * Indicator: Direct "you" or generalization about groups
+CLEAN
+- Normal conversation.
+- Greetings.
+- Operational discussion.
+- Genuine complaints.
+- Constructive criticism.
+- Negative reviews or dissatisfaction without abuse.
 
-- ABUSE: Explicit abuse, solicitation, or direct sexual/drug content
-  * Example: "I sell porn"
-  * Example: "Let's meet for sex"
-  * Example: "Buy cocaine from me"
-  * Indicator: Commercial transaction, direct proposition, or explicit language
+HARASSMENT
+- Personal abuse or bullying.
+- Threats or violence.
+- Hate speech.
+- Discrimination against any person or group.
+- Encouraging suicide or self-harm.
 
-Respond with ONLY the classification:
-EDUCATIONAL
+ABUSE
+- Defamation or malicious attacks against HeyPorts.
+- Calls to boycott, sabotage or damage HeyPorts.
+- False accusations intended to harm HeyPorts' reputation.
+- Illegal activity.
+- Bribery or corruption.
+- Drug solicitation.
+- Prostitution solicitation.
+- Grooming or coercion.
+
+Do not reject genuine operational complaints or constructive feedback.
+
+If uncertain, return CLEAN.
+
+Respond with only one word:
+
 CLEAN
 HARASSMENT
-ABUSE
-
-No explanation needed."""
+ABUSE"""
 
 
 async def check_language(text: str, attempt: int = 1) -> LanguageVerdict:
@@ -185,7 +182,11 @@ async def check_context(text: str, matched_term: str = "", attempt: int = 1) -> 
 
     try:
         start = time.time()
-        prompt = f"Evaluate this text containing '{matched_term}':\n\n{text}"
+
+        if matched_term:
+            prompt = f"Evaluate this text containing '{matched_term}':\n\n{text}"
+        else:
+            prompt = f"Evaluate this text for contextual violations (threats, harassment, discrimination, illegal activity):\n\n{text}"
 
         resp = await client.messages.create(
             model=MODEL,
@@ -199,12 +200,14 @@ async def check_context(text: str, matched_term: str = "", attempt: int = 1) -> 
         latency_ms = int((time.time() - start) * 1000)
 
         text_content = next((b.text for b in resp.content if hasattr(b, 'text')), "").strip()
-        verdict = _parse_verdict(text_content, "EDUCATIONAL", "CLEAN", "HARASSMENT", "ABUSE")
-        logger.debug(f"Context check: {verdict} for '{matched_term}' (latency={latency_ms}ms)")
+        verdict = _parse_verdict(text_content, "CLEAN", "HARASSMENT", "ABUSE")
+
+        reason = f"ai_context_{matched_term.lower()}" if matched_term else "ai_context_violation"
+        logger.debug(f"Context check: {verdict} {reason} (latency={latency_ms}ms)")
 
         return ContextVerdict(
             result=verdict,
-            reason=f"ai_context_{matched_term.lower()}" if matched_term else "ai_context"
+            reason=reason
         )
 
     except asyncio.TimeoutError as e:
