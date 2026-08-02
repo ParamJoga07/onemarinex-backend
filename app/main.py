@@ -140,6 +140,7 @@ def on_startup():
     ensure_expense_bill_columns()
     ensure_chat_message_columns()
     ensure_magic_link_hardening_schema()
+    ensure_alembic_baseline()
     _log_whatsapp_config()
     _log_chat_moderation_config()
     scheduler.add_job(run_shore_pass_reminders, "interval", minutes=5, id="shore_pass_reminders", replace_existing=True)
@@ -391,6 +392,36 @@ def ensure_magic_link_hardening_schema():
         log.exception(
             "ensure_magic_link_hardening_schema failed — driver magic-link actions may be degraded"
         )
+
+def ensure_alembic_baseline():
+    """Make Alembic usable against a database that was never stamped.
+
+    Every deployment so far built its schema with `create_all()` and never ran
+    Alembic, so there is no `alembic_version` row. Alembic cannot fix that
+    itself: this project's history is not replayable from base — the earliest
+    revision alters `rfqs` / `rfq_quotes`, tables from a retired product, and
+    dies with UndefinedTable on an empty database.
+
+    Stamping records that the schema `create_all()` produced is equivalent to
+    head, which is what lets future revisions apply as ordinary deltas. It runs
+    no migration DDL, so it cannot fail partway.
+
+    A pre-deploy job (`python -m app.db.migrate`) is the intended place for
+    applying deltas. This is only the safety net that guarantees the baseline
+    exists even if that job is never configured.
+    """
+    log = logging.getLogger("app.startup")
+    try:
+        from app.db.migrate import baseline_if_unstamped
+
+        if baseline_if_unstamped():
+            log.info("alembic baseline stamped at head")
+    except Exception:
+        log.exception(
+            "ensure_alembic_baseline failed — Alembic migrations will not apply "
+            "until this database is stamped"
+        )
+
 
 # --- Routes ---
 app.include_router(routes_auth.router,    prefix="/api/v1/auth",    tags=["authentication"])
