@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Float, JSON, func
+from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Float, JSON, UniqueConstraint, func
 from sqlalchemy.orm import relationship
 
 from app.db.base import Base
@@ -23,6 +23,10 @@ class DriverMagicLink(Base):
         index=True,
     )
     itinerary_stops = Column(JSON, nullable=False)
+    otp_verified_at = Column(DateTime(timezone=True), nullable=True)
+    otp_failed_attempts = Column(Integer, nullable=False, default=0, server_default="0")
+    otp_last_attempt_at = Column(DateTime(timezone=True), nullable=True)
+    otp_locked_until = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 
@@ -38,6 +42,13 @@ class DriverMagicLink(Base):
 
 class DriverMagicLinkReachEvent(Base):
     __tablename__ = "driver_magic_link_reach_events"
+    __table_args__ = (
+        UniqueConstraint(
+            "magic_link_id",
+            "stop_id",
+            name="uq_driver_magic_link_reach_event_stop",
+        ),
+    )
 
     id = Column(Integer, primary_key=True, index=True)
     magic_link_id = Column(

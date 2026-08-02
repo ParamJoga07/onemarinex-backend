@@ -139,6 +139,7 @@ def on_startup():
     ensure_legacy_schema_columns()
     ensure_expense_bill_columns()
     ensure_chat_message_columns()
+    ensure_magic_link_hardening_schema()
     _log_whatsapp_config()
     _log_chat_moderation_config()
     scheduler.add_job(run_shore_pass_reminders, "interval", minutes=5, id="shore_pass_reminders", replace_existing=True)
@@ -294,6 +295,102 @@ def ensure_expense_bill_columns():
     with engine.begin() as connection:
         for name, ddl in missing.items():
             connection.execute(text(f"ALTER TABLE expense_bills ADD COLUMN IF NOT EXISTS {name} {ddl}"))
+
+
+def ensure_magic_link_hardening_schema():
+    """Apply the additive magic-link hardening schema on deployments that do
+    not run Alembic before boot.
+
+    The matching Alembic revisions remain the canonical migration path. These
+    guarded statements make an existing DigitalOcean database safe before the
+    ORM queries the new OTP fields, regardless of whether migration or app
+    startup happens first.
+    """
+    log = logging.getLogger("app.startup")
+    try:
+        inspector = inspect(engine)
+        table_names = set(inspector.get_table_names())
+
+        link_table = "driver_magic_links"
+        event_table = "driver_magic_link_reach_events"
+        constraint_name = "uq_driver_magic_link_reach_event_stop"
+
+        link_additions = {}
+        if link_table in table_names:
+            existing_columns = {
+                column["name"] for column in inspector.get_columns(link_table)
+            }
+            additions = {
+                "otp_verified_at": "TIMESTAMP WITH TIME ZONE",
+                "otp_failed_attempts": "INTEGER DEFAULT 0 NOT NULL",
+                "otp_last_attempt_at": "TIMESTAMP WITH TIME ZONE",
+                "otp_locked_until": "TIMESTAMP WITH TIME ZONE",
+            }
+            link_additions = {
+                name: ddl
+                for name, ddl in additions.items()
+                if name not in existing_columns
+            }
+
+        need_event_constraint = False
+        if event_table in table_names:
+            constraint_names = {
+                constraint.get("name")
+                for constraint in inspector.get_unique_constraints(event_table)
+            }
+            need_event_constraint = constraint_name not in constraint_names
+
+        if not link_additions and not need_event_constraint:
+            return
+
+        with engine.begin() as connection:
+            for name, ddl in link_additions.items():
+                connection.execute(
+                    text(
+                        f"ALTER TABLE {link_table} "
+                        f"ADD COLUMN IF NOT EXISTS {name} {ddl}"
+                    )
+                )
+
+            if need_event_constraint:
+                connection.execute(
+                    text(
+                        f"""
+                        DELETE FROM {event_table}
+                        WHERE id IN (
+                            SELECT id
+                            FROM (
+                                SELECT
+                                    id,
+                                    ROW_NUMBER() OVER (
+                                        PARTITION BY magic_link_id, stop_id
+                                        ORDER BY reached_at DESC, id DESC
+                                    ) AS duplicate_rank
+                                FROM {event_table}
+                            ) ranked_events
+                            WHERE duplicate_rank > 1
+                        )
+                        """
+                    )
+                )
+                connection.execute(
+                    text(
+                        f"DO $$ BEGIN "
+                        f"ALTER TABLE {event_table} ADD CONSTRAINT {constraint_name} "
+                        "UNIQUE (magic_link_id, stop_id); "
+                        "EXCEPTION WHEN duplicate_object THEN NULL; END $$;"
+                    )
+                )
+
+        log.info(
+            "driver magic-link schema patched (columns=%s unique_stop=%s)",
+            sorted(link_additions),
+            need_event_constraint,
+        )
+    except Exception:
+        log.exception(
+            "ensure_magic_link_hardening_schema failed — driver magic-link actions may be degraded"
+        )
 
 # --- Routes ---
 app.include_router(routes_auth.router,    prefix="/api/v1/auth",    tags=["authentication"])

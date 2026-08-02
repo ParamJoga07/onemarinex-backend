@@ -1,8 +1,9 @@
 import secrets
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import HTTPException
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, joinedload
 
 from app.db.models.cab_booking import CabBooking
@@ -149,6 +150,10 @@ def create_or_refresh_magic_link(
         magic_link.token = token
         magic_link.created_by_aggregator_id = aggregator_id
         magic_link.itinerary_stops = stops
+        magic_link.otp_verified_at = None
+        magic_link.otp_failed_attempts = 0
+        magic_link.otp_last_attempt_at = None
+        magic_link.otp_locked_until = None
     else:
         magic_link = DriverMagicLink(
             booking_id=booking.id,
@@ -233,6 +238,7 @@ def serialize_magic_link_public_payload(magic_link: DriverMagicLink) -> Dict[str
     return {
         "booking_id": booking.booking_id,
         "booking_status": booking.status.value if booking.status else None,
+        "otp_verified": magic_link.otp_verified_at is not None,
         "magic_token": magic_link.token,
         "fare": {
             "estimated_price": float(booking.estimated_price) if booking.estimated_price else None,
@@ -288,7 +294,7 @@ def mark_stop_reached(
     latitude: float,
     longitude: float,
     notes: Optional[str] = None,
-) -> DriverMagicLinkReachEvent:
+) -> Tuple[DriverMagicLinkReachEvent, bool]:
     matching_stop = None
     for stop in magic_link.itinerary_stops or []:
         if str(stop.get("id")) == stop_id:
@@ -297,6 +303,17 @@ def mark_stop_reached(
 
     if not matching_stop:
         raise HTTPException(status_code=404, detail="Stop not found in itinerary")
+
+    existing_event = (
+        db.query(DriverMagicLinkReachEvent)
+        .filter(
+            DriverMagicLinkReachEvent.magic_link_id == magic_link.id,
+            DriverMagicLinkReachEvent.stop_id == stop_id,
+        )
+        .first()
+    )
+    if existing_event:
+        return existing_event, False
 
     event = DriverMagicLinkReachEvent(
         magic_link_id=magic_link.id,
@@ -307,9 +324,25 @@ def mark_stop_reached(
         notes=notes,
     )
     db.add(event)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        # A concurrent retry may have inserted the same stop after the lookup.
+        # The database constraint is the final idempotency boundary.
+        db.rollback()
+        existing_event = (
+            db.query(DriverMagicLinkReachEvent)
+            .filter(
+                DriverMagicLinkReachEvent.magic_link_id == magic_link.id,
+                DriverMagicLinkReachEvent.stop_id == stop_id,
+            )
+            .first()
+        )
+        if existing_event:
+            return existing_event, False
+        raise
     db.refresh(event)
-    return event
+    return event, True
 
 
 def add_stop_to_magic_link(

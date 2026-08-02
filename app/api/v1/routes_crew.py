@@ -45,6 +45,62 @@ from pydantic import BaseModel, Field
 router = APIRouter()
 logger = logging.getLogger(__name__)
 DEFAULT_TRIP_SPEED_KMPH = 28.0
+HHMM_PATTERN = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)(?::[0-5]\d)?$")
+
+
+def _minutes_from_hhmm(value: str) -> int:
+    match = HHMM_PATTERN.fullmatch((value or "").strip())
+    if not match:
+        raise ValueError("Time must use HH:MM format")
+    return int(match.group(1)) * 60 + int(match.group(2))
+
+
+def _planned_return_is_after_closing(
+    pickup_at: datetime,
+    planned_return: str,
+    closing_time: str,
+) -> bool:
+    pickup_minutes = pickup_at.hour * 60 + pickup_at.minute
+    return_minutes = _minutes_from_hhmm(planned_return)
+    closing_minutes = _minutes_from_hhmm(closing_time)
+
+    # A time before a late-evening pickup belongs to the following day. This
+    # supports ports whose configured closing time is after midnight.
+    is_late_pickup = pickup_minutes >= 12 * 60
+    if is_late_pickup and return_minutes < pickup_minutes and return_minutes < 12 * 60:
+        return_minutes += 24 * 60
+    if is_late_pickup and closing_minutes < pickup_minutes and closing_minutes < 12 * 60:
+        closing_minutes += 24 * 60
+
+    return return_minutes > closing_minutes
+
+
+def _planned_return_is_before_pickup(
+    pickup_at: datetime,
+    planned_return: str,
+    closing_time: Optional[str] = None,
+) -> bool:
+    pickup_minutes = pickup_at.hour * 60 + pickup_at.minute
+    return_minutes = _minutes_from_hhmm(planned_return)
+
+    # A return earlier on the clock is next-day only when a late pickup's port
+    # closing schedule actually crosses midnight. Otherwise it is an invalid
+    # same-day return before pickup.
+    if closing_time:
+        closing_minutes = _minutes_from_hhmm(closing_time)
+        closing_crosses_midnight = (
+            pickup_minutes >= 12 * 60
+            and closing_minutes < pickup_minutes
+            and closing_minutes < 12 * 60
+        )
+        if (
+            closing_crosses_midnight
+            and return_minutes < pickup_minutes
+            and return_minutes < 12 * 60
+        ):
+            return_minutes += 24 * 60
+
+    return return_minutes < pickup_minutes
 
 
 def _extract_package_duration_label(vehicle_name: str) -> str:
@@ -239,6 +295,7 @@ class CabBookingCreateIn(BaseModel):
     port: Optional[str] = None
     crew_member_ids: Optional[List[str]] = None
     scheduled_time: Optional[datetime] = None
+    planned_return: Optional[str] = None
     otp: Optional[str] = None
     ride_type: str  # flexible_ride | guaranteed_coordinated_ride
     trip_type: Optional[str] = None  # package_trip | coordinated_transfer
@@ -1717,6 +1774,87 @@ def book_cab(
         raise HTTPException(status_code=400, detail="Invalid ride type")
 
     port_value = body.port or profile.current_port
+    resolved_trip_type = body.trip_type or (
+        "package_trip" if body.scheduled_time is None else "coordinated_transfer"
+    )
+
+    if resolved_trip_type == "coordinated_transfer":
+        if body.scheduled_time is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Scheduled pickup time is required for a coordinated transfer",
+            )
+
+    if resolved_trip_type == "coordinated_transfer" and body.planned_return:
+        try:
+            _minutes_from_hhmm(body.planned_return)
+        except ValueError:
+            raise HTTPException(
+                status_code=400,
+                detail="Planned return time must use HH:MM format",
+            )
+
+        port = resolve_port_for_pricing(db, port_value)
+        port_candidates = [
+            candidate
+            for candidate in [
+                port.code if port else None,
+                port.name if port else None,
+                port_value,
+            ]
+            if candidate
+        ]
+        port_rule = (
+            db.query(PortRule)
+            .filter(PortRule.port_name.in_(port_candidates))
+            .first()
+            if port_candidates
+            else None
+        )
+        closing_time = port_rule.closing_time if port_rule else None
+        try:
+            return_before_pickup = _planned_return_is_before_pickup(
+                body.scheduled_time,
+                body.planned_return,
+                closing_time,
+            )
+        except ValueError:
+            # A malformed configured closing time must not disable the basic
+            # same-day ordering check.
+            return_before_pickup = _planned_return_is_before_pickup(
+                body.scheduled_time,
+                body.planned_return,
+            )
+
+        if return_before_pickup:
+            raise HTTPException(
+                status_code=400,
+                detail="Planned return time cannot be earlier than pickup time",
+            )
+
+        if port_rule and port_rule.closing_time:
+            try:
+                return_after_closing = _planned_return_is_after_closing(
+                    body.scheduled_time,
+                    body.planned_return,
+                    port_rule.closing_time,
+                )
+            except ValueError:
+                logger.warning(
+                    "Skipping planned-return validation for invalid closing time %r on port %r",
+                    port_rule.closing_time,
+                    port_value,
+                )
+            else:
+                if return_after_closing:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            "Planned return time cannot be later than the port "
+                            f"closing time ({port_rule.closing_time[:5]})"
+                        ),
+                    )
+
     resolved_vehicle_type = map_dynamic_vehicle_type(
         body.vehicle_type,
         body.vehicle_name,
@@ -1759,15 +1897,6 @@ def book_cab(
     booking_id = f"CAB-{uuid.uuid4().hex[:8].upper()}"
     otp = body.otp or (profile.ride_otp if profile else None) or "1234"
     now = datetime.utcnow()
-
-    # Prefer the explicit trip_type sent by the frontend; fall back to the
-    # scheduled_time heuristic (package bookings never send scheduled_time,
-    # transfer bookings always do) only for older/cached frontend builds that
-    # don't send trip_type yet. This is purely a notification-selection
-    # detail — never let it block booking creation.
-    resolved_trip_type = body.trip_type or (
-        "package_trip" if body.scheduled_time is None else "coordinated_transfer"
-    )
 
     new_booking = CabBooking(
         booking_id=booking_id,

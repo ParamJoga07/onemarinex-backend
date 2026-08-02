@@ -35,12 +35,13 @@ MAX_SIZE_BYTES = 10 * 1024 * 1024  # 10 MB
 # within this grace window.
 TRIP_LINK_GRACE = timedelta(hours=24)
 
-# Cab statuses that mean the ride is upcoming or underway (linkable while active).
+# Cab statuses that mean the ride is underway or has a confirmed provider.
 _CAB_ACTIVE_STATUSES = {
     BookingStatus.DRIVER_ASSIGNED, BookingStatus.DRIVER_ACCEPTED, BookingStatus.ON_TRIP,
     BookingStatus.ARRIVED, BookingStatus.IN_PROGRESS, BookingStatus.CONFIRMED,
     BookingStatus.PROVIDER_ACCEPTED,
 }
+_CAB_ACTIVE_STATUS_VALUES = {status.value for status in _CAB_ACTIVE_STATUSES}
 
 
 def _utcnow() -> datetime:
@@ -56,22 +57,58 @@ def _as_aware(dt: Optional[datetime]) -> Optional[datetime]:
 
 def _shore_pass_ended_at(sp: ShorePass) -> Optional[datetime]:
     """When the shore leave ended: crew checked back in, or the pass expired."""
+    now = _utcnow()
     in_time = _as_aware(sp.in_time)
     expires = _as_aware(sp.expires_at)
-    if in_time:
+    # Some legacy approvals pre-fill in_time with the future expiry time. That
+    # is still an active shore leave until the timestamp is actually reached.
+    if in_time and in_time <= now:
         return in_time
-    if expires and expires < _utcnow():
+    if expires and expires <= now:
         return expires
     return None  # still out / not expired -> active
 
 
 def _cab_ended_at(cb: CabBooking) -> Optional[datetime]:
-    return _as_aware(cb.trip_completed_at) or _as_aware(cb.completed_at)
+    explicit_end = _as_aware(cb.trip_completed_at) or _as_aware(cb.completed_at)
+    if explicit_end:
+        return explicit_end
+    # Older completed rows did not always populate a completion timestamp.
+    # updated_at is the closest reliable boundary for their 24-hour window.
+    if _cab_status(cb) == BookingStatus.COMPLETED.value:
+        return _as_aware(cb.updated_at) or _as_aware(cb.created_at)
+    return None
 
 
-def _linkable(ended_at: Optional[datetime]) -> bool:
-    """Active trips (no end time) and trips ended within the grace window."""
-    return ended_at is None or (_utcnow() - ended_at) <= TRIP_LINK_GRACE
+def _cab_status(cb: CabBooking) -> str:
+    status = cb.status
+    return str(getattr(status, "value", status)).strip().lower()
+
+
+def _ended_within_grace(ended_at: Optional[datetime]) -> bool:
+    if ended_at is None:
+        return False
+    age = _utcnow() - ended_at
+    return timedelta(0) <= age <= TRIP_LINK_GRACE
+
+
+def _shore_pass_link_state(sp: ShorePass) -> tuple[bool, Optional[datetime]]:
+    """Return whether a shore pass is current/recent and its end timestamp."""
+    if (sp.status or "").strip().lower() != "approved" or not sp.is_verified:
+        return False, None
+    ended_at = _shore_pass_ended_at(sp)
+    return ended_at is None or _ended_within_grace(ended_at), ended_at
+
+
+def _cab_link_state(cb: CabBooking) -> tuple[bool, Optional[datetime]]:
+    """Return whether a cab ride is active/recent and its end timestamp."""
+    status = _cab_status(cb)
+    if status in _CAB_ACTIVE_STATUS_VALUES:
+        return True, None
+    if status != BookingStatus.COMPLETED.value:
+        return False, None
+    ended_at = _cab_ended_at(cb)
+    return _ended_within_grace(ended_at), ended_at
 
 
 def _validate_trip_link(
@@ -80,7 +117,12 @@ def _validate_trip_link(
     shore_pass_id: Optional[int],
     cab_booking_id: Optional[int],
 ) -> None:
-    """Ownership + recency checks for an optional bill->trip link."""
+    """Require exactly one owned trip that is active or ended within 24 hours."""
+    if shore_pass_id is None and cab_booking_id is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Select the current trip or a trip that ended within the last 24 hours",
+        )
     if shore_pass_id is not None and cab_booking_id is not None:
         raise HTTPException(status_code=400, detail="Link the bill to either a shore pass or a cab booking, not both")
 
@@ -91,10 +133,11 @@ def _validate_trip_link(
         ).first()
         if not sp:
             raise HTTPException(status_code=404, detail="Shore pass not found")
-        if not _linkable(_shore_pass_ended_at(sp)):
+        linkable, _ = _shore_pass_link_state(sp)
+        if not linkable:
             raise HTTPException(
                 status_code=400,
-                detail="This shore leave ended more than 24 hours ago — bills can no longer be linked to it",
+                detail="This shore leave is not active and did not end within the last 24 hours",
             )
 
     if cab_booking_id is not None:
@@ -104,12 +147,11 @@ def _validate_trip_link(
         ).first()
         if not cb:
             raise HTTPException(status_code=404, detail="Cab booking not found")
-        if cb.status in {BookingStatus.CANCELLED, BookingStatus.PROVIDER_REJECTED}:
-            raise HTTPException(status_code=400, detail="Bills can't be linked to a cancelled booking")
-        if not _linkable(_cab_ended_at(cb)):
+        linkable, _ = _cab_link_state(cb)
+        if not linkable:
             raise HTTPException(
                 status_code=400,
-                detail="This trip ended more than 24 hours ago — bills can no longer be linked to it",
+                detail="This cab trip is not active and did not end within the last 24 hours",
             )
 
 
@@ -280,47 +322,51 @@ def linkable_trips(
     """Trips this crew member can link a bill to right now: active shore
     passes / cab bookings, plus ones that ended within the last 24 hours."""
     profile = _crew_profile(db, current_user)
-    cutoff = _utcnow() - TRIP_LINK_GRACE
-    out: List[LinkableTripOut] = []
+    active: List[LinkableTripOut] = []
+    recent: List[LinkableTripOut] = []
 
     passes = (
         db.query(ShorePass)
-        .filter(ShorePass.crew_profile_id == profile.id)
+        .filter(
+            ShorePass.crew_profile_id == profile.id,
+            ShorePass.status == "approved",
+            ShorePass.is_verified.is_(True),
+        )
         .order_by(ShorePass.id.desc())
-        .limit(50)
         .all()
     )
     for sp in passes:
-        ended = _shore_pass_ended_at(sp)
-        if not _linkable(ended):
+        is_linkable, ended = _shore_pass_link_state(sp)
+        if not is_linkable:
             continue
         bits = [b for b in (sp.port_name, sp.vessel_name) if b]
         label = f"Shore leave {sp.shore_pass_id}" + (f" — {' / '.join(bits)}" if bits else "")
-        out.append(LinkableTripOut(kind="shore_pass", id=sp.id, label=label, ended_at=ended))
+        target = active if ended is None else recent
+        target.append(LinkableTripOut(kind="shore_pass", id=sp.id, label=label, ended_at=ended))
 
     bookings = (
         db.query(CabBooking)
-        .filter(CabBooking.crew_id == profile.id)
-        .filter(CabBooking.status.notin_([BookingStatus.CANCELLED, BookingStatus.PROVIDER_REJECTED]))
+        .filter(
+            CabBooking.crew_id == profile.id,
+            CabBooking.status.in_(_CAB_ACTIVE_STATUSES | {BookingStatus.COMPLETED}),
+        )
         .order_by(CabBooking.id.desc())
-        .limit(50)
         .all()
     )
     for cb in bookings:
-        ended = _cab_ended_at(cb)
-        if not _linkable(ended):
+        is_linkable, ended = _cab_link_state(cb)
+        if not is_linkable:
             continue
-        # Skip stale never-completed bookings so the picker stays short: if a
-        # ride was created before the grace window and never reached an active
-        # or completed state, it's noise.
-        if ended is None and cb.status not in _CAB_ACTIVE_STATUSES:
-            created = _as_aware(cb.created_at)
-            if created and created < cutoff:
-                continue
         label = f"Cab {cb.booking_id} — {cb.drop_address[:40]}"
-        out.append(LinkableTripOut(kind="cab_booking", id=cb.id, label=label, ended_at=ended))
+        target = active if ended is None else recent
+        target.append(LinkableTripOut(kind="cab_booking", id=cb.id, label=label, ended_at=ended))
 
-    return out
+    recent.sort(
+        key=lambda trip: _as_aware(trip.ended_at)
+        or datetime.min.replace(tzinfo=timezone.utc),
+        reverse=True,
+    )
+    return active + recent
 
 
 @router.get("", response_model=List[BillOut])
