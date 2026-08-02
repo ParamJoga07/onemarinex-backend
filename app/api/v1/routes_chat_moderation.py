@@ -12,7 +12,6 @@ from typing import Optional, List
 from fastapi import APIRouter, Depends, HTTPException, Query, File, UploadFile
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
-from sqlalchemy.sql import func
 from pydantic import BaseModel, Field
 
 from app.db.session import get_db
