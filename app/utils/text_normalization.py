@@ -109,7 +109,7 @@ def normalize(text: str) -> str:
             return token.replace(' ', '')
         return token
 
-    result = re.sub(r'[a-z](?:\s[a-z])+', remove_letter_spaces, result)
+    result = re.sub(r'\b[a-z](?:\s[a-z])+\b', remove_letter_spaces, result)
 
     # 11. Leetspeak normalization (numeric ONLY)
     result = ''.join(_LEET_TABLE.get(c, c) for c in result)

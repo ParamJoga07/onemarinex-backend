@@ -191,21 +191,34 @@ async def moderate_message(
 
     single_words, phrase_regex = _get_cached_dictionary(db)
 
-    # DEBUG: Log dictionary state
-    logger.info(f"DEBUG DICT: Raw message: {repr(raw_text)}")
-    logger.info(f"DEBUG DICT: Normalized: {repr(normalized)}")
-    logger.info(f"DEBUG DICT: Tokens: {normalized.split()}")
-    logger.info(f"DEBUG DICT: Dictionary size: {len(single_words)}")
-    if single_words:
-        first_20 = sorted(list(single_words))[:20]
-        logger.info(f"DEBUG DICT: First 20 words in dict: {first_20}")
+    # COMPREHENSIVE DEBUG TRACE
+    logger.info("\n" + "="*70)
+    logger.info("MODERATION TRACE")
+    logger.info("="*70)
+    logger.info(f"\nRaw message:\n  {repr(raw_text)}")
+    logger.info(f"\nNormalized message:\n  {repr(normalized)}")
+    logger.info(f"\nDictionary size: {len(single_words)}")
 
-    matched_term = _check_dictionary(normalized, single_words, phrase_regex)
+    # Check for specific words in dictionary
+    check_words = ["porn", "kill", "jagadeesh", "raju"]
+    logger.info(f"\nDoes dictionary contain:")
+    for word in check_words:
+        in_dict = word in single_words
+        logger.info(f"  - {word}: {in_dict}")
+
+    tokens = normalized.split()
+    logger.info(f"\nTokens after normalization: {tokens}")
+
+    matched_term = _check_dictionary(normalized, single_words, phrase_regex, tokens)
     trace['dictionary']['size'] = len(single_words)
     trace['dictionary']['matched_term'] = matched_term
 
+    logger.info(f"\nWhich branch executes next?")
+
     if matched_term:
-        logger.info(f"DEBUG BRANCH: DICTIONARY MATCH - Restricting word: '{matched_term}'")
+        logger.info(f"  Level 1 rejected? YES (matched_term='{matched_term}')")
+        logger.info(f"  Language AI called? NO")
+        logger.info(f"  Moderation AI called? NO")
         result = ModerationResult(
             rejected=True,
             code="restricted_word",
@@ -213,18 +226,37 @@ async def moderate_message(
             rejected_by="level_1",
             matched_term=matched_term
         )
+        logger.info(f"\nFinal ModerationResult:")
+        logger.info(f"  rejected=True")
+        logger.info(f"  reason_code=restricted_word")
+        logger.info(f"  rejected_by=level_1")
+        logger.info("="*70 + "\n")
         _print_moderation_trace(trace, result, "dictionary")
         return result
 
-    logger.info(f"DEBUG BRANCH: NO DICTIONARY MATCH - Proceeding to AI checks")
+    logger.info(f"  Level 1 rejected? NO")
+    logger.info(f"\n  Proceeding to AI checks...")
+
     if settings.moderation_ai_enabled or settings.language_ai_enabled:
         ai_result = await _check_contextual_violations(normalized, settings, trace)
         if ai_result:
-            logger.info(f"DEBUG BRANCH: AI REJECTED - {ai_result.rejected_by}")
+            logger.info(f"  Language AI called? {trace.get('ai_calls', {}).get('language_called', False)}")
+            logger.info(f"  Moderation AI called? {trace.get('ai_calls', {}).get('moderation_called', False)}")
+            logger.info(f"\nFinal ModerationResult:")
+            logger.info(f"  rejected={ai_result.rejected}")
+            logger.info(f"  reason_code={ai_result.reason_code}")
+            logger.info(f"  rejected_by={ai_result.rejected_by}")
+            logger.info("="*70 + "\n")
             _print_moderation_trace(trace, ai_result, "ai")
             return ai_result
 
-    logger.info(f"DEBUG BRANCH: ALLOWED - No violations found")
+    logger.info(f"  Language AI called? {trace.get('ai_calls', {}).get('language_called', False)}")
+    logger.info(f"  Moderation AI called? {trace.get('ai_calls', {}).get('moderation_called', False)}")
+    logger.info(f"\nFinal ModerationResult:")
+    logger.info(f"  rejected=False")
+    logger.info(f"  reason_code=None")
+    logger.info(f"  rejected_by=backend")
+    logger.info("="*70 + "\n")
     result = ModerationResult(rejected=False, rejected_by="backend")
     _print_moderation_trace(trace, result, "allowed")
     return result
@@ -393,26 +425,27 @@ def _check_raw_spam(raw_text: str) -> bool:
     return False
 
 
-def _check_dictionary(normalized: str, single_words: Set[str], phrase_regex: Optional[re.Pattern]) -> Optional[str]:
+def _check_dictionary(normalized: str, single_words: Set[str], phrase_regex: Optional[re.Pattern], tokens_list: list = None) -> Optional[str]:
     """Check against restricted words and phrases."""
-    tokens = normalized.split()
-    logger.info(f"DEBUG _check_dictionary: Checking {len(tokens)} tokens against {len(single_words)} words")
+    if tokens_list is None:
+        tokens_list = normalized.split()
 
-    for token in tokens:
+    logger.info(f"\nFor each token:")
+    for token in tokens_list:
         clean_token = re.sub(r'[^a-z0-9]', '', token)
         in_dict = clean_token in single_words if single_words else False
-        logger.info(f"DEBUG TOKEN: token='{token}' -> clean='{clean_token}' -> in_dict={in_dict}")
+        logger.info(f"  token='{token}' -> cleaned_token='{clean_token}' -> in_dict={in_dict}")
         if clean_token and in_dict:
-            logger.info(f"DEBUG _check_dictionary: MATCH FOUND: '{clean_token}'")
+            logger.info(f"\n[DICTIONARY MATCH] matched_term='{clean_token}'")
             return clean_token
 
     if phrase_regex:
         match = phrase_regex.search(normalized)
         if match:
-            logger.info(f"DEBUG _check_dictionary: PHRASE MATCH: '{match.group(1)}'")
+            logger.info(f"\n[PHRASE MATCH] matched_term='{match.group(1)}'")
             return match.group(1)
 
-    logger.info(f"DEBUG _check_dictionary: NO MATCH FOUND in {len(tokens)} tokens")
+    logger.info(f"\nmatched_term returned by _check_dictionary(): None")
     return None
 
 
