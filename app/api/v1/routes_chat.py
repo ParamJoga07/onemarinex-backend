@@ -3,7 +3,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Optional, Set
 
-from fastapi import APIRouter, Depends, Query, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, Query, WebSocket, WebSocketDisconnect, HTTPException
 from jose import jwt
 from sqlalchemy.orm import Session, joinedload
 
@@ -12,11 +12,49 @@ from app.db.models.chat import ChatMessage
 from app.db.models.port import Port
 from app.db.models.user import User
 from app.db.session import get_db
-from app.services.ai_moderation import moderate_message
-
+from app.services.chat_moderation import moderate_message
+from app.services.moderation_logger import ModerationLogger
+from app.services.moderation_policy import PolicyVerdict, Decision, Category
+from app.utils.text_normalization import normalize
+from app.api.v1.routes_auth import get_current_user
 
 router = APIRouter()
 logger = logging.getLogger("heyports.chat")
+
+
+def _moderation_result_to_verdict(mod_result):
+    """Convert ModerationResult to PolicyVerdict for logging."""
+    if mod_result.rejected:
+        decision = Decision.REJECT
+        if mod_result.reason_code == "duplicate":
+            category = Category.DUPLICATE
+        elif mod_result.reason_code == "rate_limited":
+            category = Category.FLOOD
+        elif mod_result.reason_code == "restricted_word":
+            category = Category.PROFANITY
+        elif mod_result.reason_code == "contact_info":
+            category = Category.CONTACT_INFO
+        elif mod_result.reason_code == "payment_info":
+            category = Category.PAYMENT_INFO
+        elif mod_result.reason_code == "external_link":
+            category = Category.EXTERNAL_LINK
+        elif mod_result.reason_code == "language_violation":
+            category = Category.LANGUAGE_VIOLATION
+        elif mod_result.reason_code == "guidelines_violation":
+            category = Category.HARASSMENT
+        else:
+            category = Category.CLEAN
+    else:
+        decision = Decision.ALLOW
+        category = Category.CLEAN
+
+    return PolicyVerdict(
+        decision=decision,
+        category=category,
+        confidence=0.95,
+        reason=mod_result.reason_code or "No reason provided",
+        level=mod_result.rejected_by or "unknown"
+    )
 
 MAX_MESSAGE_LENGTH = 4000
 MESSAGE_EDIT_WINDOW = timedelta(hours=1)
@@ -162,16 +200,42 @@ def get_chat_history(
     limit: int = 50,
     db: Session = Depends(get_db),
 ):
-    """Fetch the latest messages for a channel, oldest first."""
+    """Fetch the latest messages for a channel, oldest first. Excludes deleted messages."""
     messages = (
         _message_query(db)
-        .filter(ChatMessage.port_id == port_id)
+        .filter(ChatMessage.port_id == port_id, ChatMessage.deleted_at.is_(None))
         .order_by(ChatMessage.created_at.desc())
         .limit(min(max(limit, 1), 100))
         .all()
     )
     return [_serialize_message(message) for message in messages[::-1]]
 
+
+@router.get("/moderation-config")
+def get_moderation_config(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Get moderation config for frontend (authenticated crew only).
+
+    Only crew members can access community chat moderation config.
+    """
+    if current_user.role != "crew":
+        raise HTTPException(status_code=403, detail="Crew access required for community chat")
+
+    from app.db.models.chat_moderation_setting import ChatModerationSetting
+    settings = db.query(ChatModerationSetting).filter(ChatModerationSetting.id == 1).first()
+    if not settings:
+        settings = ChatModerationSetting(id=1)
+        db.add(settings)
+        db.commit()
+        db.refresh(settings)
+    return {
+        "max_message_length": settings.max_message_length,
+    }
+
+
+# --- WebSocket Endpoint ---
 
 def get_user_from_token(token: str, db: Session) -> Optional[User]:
     try:
@@ -226,6 +290,7 @@ async def websocket_endpoint(
         .first()
     )
     if not port:
+        logger.error(f"🔴 PORT {port_id} NOT FOUND")
         await websocket.close(code=1008)
         return
 
@@ -267,17 +332,34 @@ async def websocket_endpoint(
                             )
                             continue
 
-                    is_blocked, tier_used = await moderate_message(text, user_id=user.id)
-                    if is_blocked:
+                    mod_result = await moderate_message(db, user.id, port_id, text)
+
+                    if mod_result.rejected:
                         await websocket.send_json(
                             {
                                 "type": "error",
                                 "data": {
                                     "message": "Your message couldn't be sent because it violates our community guidelines.",
-                                    "code": "moderation_blocked",
-                                    "tier": tier_used,
+                                    "code": mod_result.code,
+                                    "tier": mod_result.rejected_by,
                                 },
                             }
+                        )
+                        normalized_text = normalize(text)
+                        policy_verdict = _moderation_result_to_verdict(mod_result)
+                        ModerationLogger.log_event(
+                            db=db,
+                            user_id=user.id,
+                            port_id=port_id,
+                            raw_message=text,
+                            normalized_message=normalized_text,
+                            policy_verdict=policy_verdict,
+                            matched_term=mod_result.matched_term,
+                            rejected_by=mod_result.rejected_by,
+                            reason_code=mod_result.reason_code,
+                            ai_route=mod_result.ai_route,
+                            ai_model=mod_result.ai_model,
+                            ai_latency_ms=mod_result.ai_latency_ms,
                         )
                         continue
 
@@ -290,6 +372,25 @@ async def websocket_endpoint(
                     db.add(new_message)
                     db.commit()
                     db.refresh(new_message)
+
+                    normalized_text = normalize(text)
+                    policy_verdict = _moderation_result_to_verdict(mod_result)
+                    ModerationLogger.log_event(
+                        db=db,
+                        user_id=user.id,
+                        port_id=port_id,
+                        raw_message=text,
+                        normalized_message=normalized_text,
+                        policy_verdict=policy_verdict,
+                        matched_term=mod_result.matched_term,
+                        rejected_by=mod_result.rejected_by,
+                        reason_code=mod_result.reason_code,
+                        ai_route=mod_result.ai_route,
+                        ai_model=mod_result.ai_model,
+                        ai_latency_ms=mod_result.ai_latency_ms,
+                        chat_message_id=new_message.id,
+                    )
+
                     payload = _serialize_message(
                         _message_query(db).filter(ChatMessage.id == new_message.id).one()
                     )
@@ -329,23 +430,59 @@ async def websocket_endpoint(
                         )
                         continue
 
-                    is_blocked, tier_used = await moderate_message(text, user_id=user.id)
-                    if is_blocked:
+                    mod_result = await moderate_message(db, user.id, port_id, text)
+                    if mod_result.rejected:
                         await websocket.send_json(
                             {
                                 "type": "error",
                                 "data": {
                                     "message": "Your edit couldn't be saved because it violates our community guidelines.",
-                                    "code": "moderation_blocked",
-                                    "tier": tier_used,
+                                    "code": mod_result.code,
+                                    "tier": mod_result.rejected_by,
                                 },
                             }
+                        )
+                        normalized_text = normalize(text)
+                        policy_verdict = _moderation_result_to_verdict(mod_result)
+                        ModerationLogger.log_event(
+                            db=db,
+                            user_id=user.id,
+                            port_id=port_id,
+                            raw_message=text,
+                            normalized_message=normalized_text,
+                            policy_verdict=policy_verdict,
+                            matched_term=mod_result.matched_term,
+                            rejected_by=mod_result.rejected_by,
+                            reason_code=mod_result.reason_code,
+                            ai_route=mod_result.ai_route,
+                            ai_model=mod_result.ai_model,
+                            ai_latency_ms=mod_result.ai_latency_ms,
+                            chat_message_id=message.id,
                         )
                         continue
 
                     message.message = text
                     message.edited_at = datetime.now(timezone.utc)
                     db.commit()
+
+                    normalized_text = normalize(text)
+                    policy_verdict = _moderation_result_to_verdict(mod_result)
+                    ModerationLogger.log_event(
+                        db=db,
+                        user_id=user.id,
+                        port_id=port_id,
+                        raw_message=text,
+                        normalized_message=normalized_text,
+                        policy_verdict=policy_verdict,
+                        matched_term=mod_result.matched_term,
+                        rejected_by=mod_result.rejected_by,
+                        reason_code=mod_result.reason_code,
+                        ai_route=mod_result.ai_route,
+                        ai_model=mod_result.ai_model,
+                        ai_latency_ms=mod_result.ai_latency_ms,
+                        chat_message_id=message.id,
+                    )
+
                     payload = _serialize_message(
                         _message_query(db).filter(ChatMessage.id == message.id).one()
                     )

@@ -37,7 +37,7 @@ from app.db.session import engine
 from app.db.base import Base
 from app.services.shore_pass_reminders import run_shore_pass_reminders
 
-from app.api.v1 import routes_auth, routes_contact, routes_files, routes_users, registration, routes_crew, routes_pubs, routes_hotels, routes_restaurants, routes_incidents, routes_ports, routes_drivers, routes_early_access, routes_chat, routes_superadmin, routes_reviews, routes_sightseeing, routes_notifications, routes_sos, routes_pricing_controls, routes_facilities
+from app.api.v1 import routes_auth, routes_contact, routes_files, routes_users, registration, routes_crew, routes_pubs, routes_hotels, routes_restaurants, routes_incidents, routes_ports, routes_drivers, routes_early_access, routes_chat, routes_superadmin, routes_reviews, routes_sightseeing, routes_notifications, routes_sos, routes_pricing_controls, routes_facilities, routes_chat_moderation
 
 from app.api.v1.routes_vendor import router as vendor_router
 from app.api.v1.routes_rfqs import router as rfq_router
@@ -101,6 +101,8 @@ origins = [
     "http://127.0.0.1:5173",
     "http://localhost:5174",
     "http://127.0.0.1:5174",
+    "http://localhost:5175",
+    "http://127.0.0.1:5175",
     "https://heyports-56we8.ondigitalocean.app",  # Production frontend
     "https://www.heyports-56we8.ondigitalocean.app",
     "https://heyports-dev-5285u.ondigitalocean.app",
@@ -114,6 +116,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# WebSocket connection logging middleware
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+
+class WebSocketLoggingMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        if request.url.path.startswith("/api/v1/chat/ws"):
+            logger = logging.getLogger("websocket_middleware")
+            logger.info(f"🟢 [MIDDLEWARE] WebSocket request to {request.url.path}?{request.url.query}")
+        return await call_next(request)
+
+app.add_middleware(WebSocketLoggingMiddleware)
+
 scheduler = BackgroundScheduler()
 
 # --- Startup event: ensure tables exist ---
@@ -125,6 +140,7 @@ def on_startup():
     ensure_expense_bill_columns()
     ensure_chat_message_columns()
     _log_whatsapp_config()
+    _log_chat_moderation_config()
     scheduler.add_job(run_shore_pass_reminders, "interval", minutes=5, id="shore_pass_reminders", replace_existing=True)
     scheduler.start()
 
@@ -153,6 +169,23 @@ def _log_whatsapp_config() -> None:
     elif not (settings.WHATSAPP_ACCESS_TOKEN and settings.WHATSAPP_PHONE_NUMBER_ID):
         logging.getLogger("app.startup").warning(
             "WhatsApp is enabled but credentials are missing — every send will be skipped."
+        )
+
+
+def _log_chat_moderation_config() -> None:
+    """State chat moderation config at boot without printing secrets."""
+    from app.services.moderation_ai import moderation_enabled
+
+    logging.getLogger("app.startup").info(
+        "Chat moderation config: ai_enabled=%s model=%s timeout=%s fail_closed=%s",
+        moderation_enabled(),
+        os.getenv("CHAT_MODERATION_MODEL", "claude-opus-5"),
+        os.getenv("CHAT_MODERATION_TIMEOUT", "8.0"),
+        os.getenv("CHAT_MODERATION_FAIL_CLOSED", "true"),
+    )
+    if not moderation_enabled():
+        logging.getLogger("app.startup").warning(
+            "ANTHROPIC_API_KEY unset — AI moderation disabled, Level 0+1 checks only."
         )
 
 
@@ -289,6 +322,7 @@ app.include_router(routes_drivers.router, prefix="/api/v1/drivers", tags=["drive
 app.include_router(routes_chat.router, prefix="/api/v1/chat", tags=["chat"])
 app.include_router(routes_superadmin.router, prefix="/api/v1/superadmin", tags=["superadmin"])
 app.include_router(routes_pricing_controls.router, prefix="/api/v1/superadmin", tags=["pricing-controls"])
+app.include_router(routes_chat_moderation.router, prefix="/api/v1/superadmin", tags=["chat-moderation"])
 app.include_router(routes_reviews.router, prefix="/api/v1/reviews", tags=["reviews"])
 app.include_router(routes_notifications.router, prefix="/api/v1/notifications", tags=["notifications"])
 app.include_router(routes_sos.router, prefix="/api/v1/sos", tags=["sos"])

@@ -52,3 +52,6 @@ from app.db.models import expense_bill  # noqa: F401
 from app.db.models import payment  # noqa: F401
 from app.db.models import email_verification  # noqa: F401
 from app.db.models.shore_pass_reminder import ShorePassReminder # noqa: F401
+from app.db.models.chat_restricted_word import ChatRestrictedWord # noqa: F401
+from app.db.models.chat_moderation_event import ChatModerationEvent # noqa: F401
+from app.db.models.chat_moderation_setting import ChatModerationSetting # noqa: F401
