@@ -123,6 +123,7 @@ def on_startup():
     Base.metadata.create_all(bind=engine)
     ensure_legacy_schema_columns()
     ensure_expense_bill_columns()
+    ensure_chat_message_columns()
     _log_whatsapp_config()
     scheduler.add_job(run_shore_pass_reminders, "interval", minutes=5, id="shore_pass_reminders", replace_existing=True)
     scheduler.start()
@@ -171,6 +172,71 @@ def ensure_legacy_schema_columns():
         connection.execute(
             text("ALTER TABLE aggregator_profiles ADD COLUMN provider_type VARCHAR(32) DEFAULT 'aggregator' NOT NULL")
         )
+
+
+def ensure_chat_message_columns():
+    """Reply / edit / soft-delete columns for `chat_messages`.
+
+    Alembic migration a8e1c2d3f4b5 defines these, but nothing runs
+    `alembic upgrade head` on deploy and create_all never ALTERs an existing
+    table — so without this the chat endpoints would 500 with UndefinedColumn.
+
+    Everything here is idempotent and additive, and the migration itself is
+    guarded the same way, so running Alembic before or after this is safe.
+    Failures are logged rather than raised: a patch problem must not stop the
+    whole app from booting.
+    """
+    log = logging.getLogger("app.startup")
+    try:
+        inspector = inspect(engine)
+        if "chat_messages" not in inspector.get_table_names():
+            return  # fresh deploy: create_all built it with all columns
+
+        existing = {c["name"] for c in inspector.get_columns("chat_messages")}
+        additions = {
+            "reply_to_id": "INTEGER",
+            "edited_at": "TIMESTAMP WITH TIME ZONE",
+            "deleted_at": "TIMESTAMP WITH TIME ZONE",
+        }
+        missing = {n: ddl for n, ddl in additions.items() if n not in existing}
+
+        index_names = {i["name"] for i in inspector.get_indexes("chat_messages")}
+        fk_names = {f.get("name") for f in inspector.get_foreign_keys("chat_messages")}
+        need_index = "ix_chat_messages_reply_to_id" not in index_names
+        need_fk = "fk_chat_messages_reply_to_id" not in fk_names
+
+        if not missing and not need_index and not need_fk:
+            return
+
+        with engine.begin() as connection:
+            for name, ddl in missing.items():
+                connection.execute(
+                    text(f"ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS {name} {ddl}")
+                )
+            if need_index:
+                connection.execute(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS ix_chat_messages_reply_to_id "
+                        "ON chat_messages (reply_to_id)"
+                    )
+                )
+            if need_fk:
+                # Postgres has no ADD CONSTRAINT IF NOT EXISTS; the name check
+                # above plus this guard keeps a concurrent boot from erroring.
+                connection.execute(
+                    text(
+                        "DO $$ BEGIN "
+                        "ALTER TABLE chat_messages ADD CONSTRAINT fk_chat_messages_reply_to_id "
+                        "FOREIGN KEY (reply_to_id) REFERENCES chat_messages (id) ON DELETE SET NULL; "
+                        "EXCEPTION WHEN duplicate_object THEN NULL; END $$;"
+                    )
+                )
+        log.info(
+            "chat_messages patched (columns=%s index=%s fk=%s)",
+            sorted(missing), need_index, need_fk,
+        )
+    except Exception:
+        log.exception("ensure_chat_message_columns failed — chat features may be degraded")
 
 
 def ensure_expense_bill_columns():

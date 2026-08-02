@@ -492,6 +492,8 @@ def track_cab_bookings(
         CrewProfile.full_name.label("crew_name"),
         CrewProfile.hpid.label("crew_hpid"),
         CrewProfile.vessel.label("crew_vessel"),
+        # The crew's contact number lives on the linked user row.
+        User.mobile_number.label("crew_mobile_number"),
         AggregatorProfile.company_name.label("provider_company_name"),
         AggregatorProfile.provider_type.label("provider_type"),
         Driver.name.label("assigned_driver_name"),
@@ -499,6 +501,7 @@ def track_cab_bookings(
         Driver.vehicle_number.label("assigned_driver_vehicle_number"),
     )
     query = query.outerjoin(CrewProfile, CabBooking.crew_id == CrewProfile.id)
+    query = query.outerjoin(User, CrewProfile.user_id == User.id)
     query = query.outerjoin(
         AggregatorProfile,
         or_(
@@ -545,6 +548,7 @@ def track_cab_bookings(
                     "name": booking.crew_name,
                     "hp_id": booking.crew_hpid,
                     "vessel": booking.crew_vessel,
+                    "mobile_number": booking.crew_mobile_number,
                 },
                 "pickup_address": booking.pickup_address,
                 "drop_address": booking.drop_address,
