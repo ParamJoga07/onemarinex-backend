@@ -107,11 +107,9 @@ def _get_cached_dictionary(db: Session) -> tuple:
     )
 
     if needs_refresh:
-        logger.info("DEBUG: Reloading restricted words dictionary")
         reload_restricted_words(db)
 
     result_dict = _dictionary_cache or set()
-    logger.info(f"DEBUG: Returning dictionary with {len(result_dict)} words")
     return result_dict, _phrase_regex
 
 
@@ -130,95 +128,50 @@ async def moderate_message(
     settings = _ensure_settings(db)
     normalized = normalize(raw_text)
 
-    # TEMPORARY: Debug trace object to collect all decision points
-    trace = {
-        'raw_message': raw_text,
-        'normalized': normalized,
-        'level_1_checks': {},
-        'dictionary': {'size': 0, 'matched_term': None},
-        'ai_calls': {'language_called': False, 'language_verdict': None, 'moderation_called': False, 'moderation_verdict': None},
-    }
-
     if not normalized:
         result = ModerationResult(rejected=True, code="empty", reason_code="empty", rejected_by="level_1")
-        _print_moderation_trace(trace, result, "empty")
         return result
 
     if len(normalized) > settings.max_message_length:
         result = ModerationResult(rejected=True, code="too_long", reason_code="too_long", rejected_by="level_1")
-        _print_moderation_trace(trace, result, "too_long")
         return result
 
     if _check_flood(user_id, port_id, settings):
         result = ModerationResult(rejected=True, code="rate_limited", reason_code="rate_limited", rejected_by="level_1")
-        _print_moderation_trace(trace, result, "flood")
         return result
 
     if _check_duplicate(user_id, port_id, normalized, settings):
         result = ModerationResult(rejected=True, code="duplicate", reason_code="duplicate", rejected_by="level_1")
-        _print_moderation_trace(trace, result, "duplicate")
         return result
 
     if _check_contact_info(normalized):
         result = ModerationResult(rejected=True, code="contact_info", reason_code="contact_info", rejected_by="level_1")
-        _print_moderation_trace(trace, result, "contact_info")
         return result
 
     if settings.block_payment_info and _check_payment_info(normalized):
         result = ModerationResult(rejected=True, code="payment_info", reason_code="payment_info", rejected_by="level_1")
-        _print_moderation_trace(trace, result, "payment_info")
         return result
 
     if settings.block_external_links and _check_external_links(normalized):
         result = ModerationResult(rejected=True, code="external_link", reason_code="external_link", rejected_by="level_1")
-        _print_moderation_trace(trace, result, "external_links")
         return result
 
     if _check_raw_spam(raw_text):
         result = ModerationResult(rejected=True, code="spam", reason_code="spam", rejected_by="level_1")
-        _print_moderation_trace(trace, result, "raw_spam")
         return result
 
     if _check_spam(normalized):
         result = ModerationResult(rejected=True, code="spam", reason_code="spam", rejected_by="level_1")
-        _print_moderation_trace(trace, result, "spam")
         return result
 
     if _check_charset(normalized):
         result = ModerationResult(rejected=True, code="charset", reason_code="charset", rejected_by="level_1")
-        _print_moderation_trace(trace, result, "charset")
         return result
 
     single_words, phrase_regex = _get_cached_dictionary(db)
-
-    # COMPREHENSIVE DEBUG TRACE
-    logger.info("\n" + "="*70)
-    logger.info("MODERATION TRACE")
-    logger.info("="*70)
-    logger.info(f"\nRaw message:\n  {repr(raw_text)}")
-    logger.info(f"\nNormalized message:\n  {repr(normalized)}")
-    logger.info(f"\nDictionary size: {len(single_words)}")
-
-    # Check for specific words in dictionary
-    check_words = ["porn", "kill", "jagadeesh", "raju"]
-    logger.info(f"\nDoes dictionary contain:")
-    for word in check_words:
-        in_dict = word in single_words
-        logger.info(f"  - {word}: {in_dict}")
-
-    tokens = normalized.split()
-    logger.info(f"\nTokens after normalization: {tokens}")
-
-    matched_term = _check_dictionary(normalized, single_words, phrase_regex, tokens)
-    trace['dictionary']['size'] = len(single_words)
-    trace['dictionary']['matched_term'] = matched_term
-
-    logger.info(f"\nWhich branch executes next?")
+    matched_term = _check_dictionary(normalized, single_words, phrase_regex)
 
     if matched_term:
-        logger.info(f"  Level 1 rejected? YES (matched_term='{matched_term}')")
-        logger.info(f"  Language AI called? NO")
-        logger.info(f"  Moderation AI called? NO")
         result = ModerationResult(
             rejected=True,
             code="restricted_word",
@@ -226,39 +179,14 @@ async def moderate_message(
             rejected_by="level_1",
             matched_term=matched_term
         )
-        logger.info(f"\nFinal ModerationResult:")
-        logger.info(f"  rejected=True")
-        logger.info(f"  reason_code=restricted_word")
-        logger.info(f"  rejected_by=level_1")
-        logger.info("="*70 + "\n")
-        _print_moderation_trace(trace, result, "dictionary")
         return result
 
-    logger.info(f"  Level 1 rejected? NO")
-    logger.info(f"\n  Proceeding to AI checks...")
-
     if settings.moderation_ai_enabled or settings.language_ai_enabled:
-        ai_result = await _check_contextual_violations(normalized, settings, trace)
+        ai_result = await _check_contextual_violations(normalized, settings)
         if ai_result:
-            logger.info(f"  Language AI called? {trace.get('ai_calls', {}).get('language_called', False)}")
-            logger.info(f"  Moderation AI called? {trace.get('ai_calls', {}).get('moderation_called', False)}")
-            logger.info(f"\nFinal ModerationResult:")
-            logger.info(f"  rejected={ai_result.rejected}")
-            logger.info(f"  reason_code={ai_result.reason_code}")
-            logger.info(f"  rejected_by={ai_result.rejected_by}")
-            logger.info("="*70 + "\n")
-            _print_moderation_trace(trace, ai_result, "ai")
             return ai_result
 
-    logger.info(f"  Language AI called? {trace.get('ai_calls', {}).get('language_called', False)}")
-    logger.info(f"  Moderation AI called? {trace.get('ai_calls', {}).get('moderation_called', False)}")
-    logger.info(f"\nFinal ModerationResult:")
-    logger.info(f"  rejected=False")
-    logger.info(f"  reason_code=None")
-    logger.info(f"  rejected_by=backend")
-    logger.info("="*70 + "\n")
     result = ModerationResult(rejected=False, rejected_by="backend")
-    _print_moderation_trace(trace, result, "allowed")
     return result
 
 
@@ -286,13 +214,8 @@ async def _check_contextual_violations(normalized: str, settings, trace: dict = 
     - Prostitution solicitation
     - Grooming and coercion
     """
-    if trace is None:
-        trace = {'ai_calls': {}}
-
     if settings.language_ai_enabled:
-        trace['ai_calls']['language_called'] = True
         verdict = await check_language(normalized)
-        trace['ai_calls']['language_verdict'] = verdict.result
         logger.debug(f"Language check: {verdict.result}")
 
         if verdict.result == "LANGUAGE":
@@ -307,9 +230,7 @@ async def _check_contextual_violations(normalized: str, settings, trace: dict = 
             )
 
     if settings.moderation_ai_enabled:
-        trace['ai_calls']['moderation_called'] = True
         verdict = await check_context(normalized)
-        trace['ai_calls']['moderation_verdict'] = verdict.result
         logger.debug(f"Moderation AI verdict: {verdict.result}")
 
         if verdict.result in ("HARASSMENT", "ABUSE"):
@@ -425,27 +346,21 @@ def _check_raw_spam(raw_text: str) -> bool:
     return False
 
 
-def _check_dictionary(normalized: str, single_words: Set[str], phrase_regex: Optional[re.Pattern], tokens_list: list = None) -> Optional[str]:
+def _check_dictionary(normalized: str, single_words: Set[str], phrase_regex: Optional[re.Pattern]) -> Optional[str]:
     """Check against restricted words and phrases."""
-    if tokens_list is None:
-        tokens_list = normalized.split()
+    tokens = normalized.split()
 
-    logger.info(f"\nFor each token:")
-    for token in tokens_list:
+    for token in tokens:
         clean_token = re.sub(r'[^a-z0-9]', '', token)
         in_dict = clean_token in single_words if single_words else False
-        logger.info(f"  token='{token}' -> cleaned_token='{clean_token}' -> in_dict={in_dict}")
         if clean_token and in_dict:
-            logger.info(f"\n[DICTIONARY MATCH] matched_term='{clean_token}'")
             return clean_token
 
     if phrase_regex:
         match = phrase_regex.search(normalized)
         if match:
-            logger.info(f"\n[PHRASE MATCH] matched_term='{match.group(1)}'")
             return match.group(1)
 
-    logger.info(f"\nmatched_term returned by _check_dictionary(): None")
     return None
 
 
@@ -468,42 +383,3 @@ def _check_charset(normalized: str) -> bool:
         return True
 
     return False
-
-
-def _print_moderation_trace(trace: dict, result: ModerationResult, checkpoint: str = ""):
-    """TEMPORARY DEBUG: Print complete moderation trace to terminal."""
-    print("\n" + "="*70)
-    print("MODERATION TRACE")
-    print("="*70)
-
-    print(f"\nRAW MESSAGE:\n  {repr(trace['raw_message'][:100])}")
-    print(f"\nNORMALIZED:\n  {repr(trace['normalized'][:100])}")
-
-    print("\nLEVEL 1 CHECKS")
-    print("-"*70)
-    print(f"  Checkpoint: {checkpoint}")
-
-    print("\nDICTIONARY")
-    print("-"*70)
-    print(f"  Dictionary Size: {trace.get('dictionary', {}).get('size', 'N/A')}")
-    print(f"  Matched Term: {trace.get('dictionary', {}).get('matched_term', 'None')}")
-
-    print("\nAI CALLS")
-    print("-"*70)
-    ai_calls = trace.get('ai_calls', {})
-    print(f"  Language AI Called: {'YES' if ai_calls.get('language_called') else 'NO'}")
-    if ai_calls.get('language_verdict'):
-        print(f"    -> Verdict: {ai_calls['language_verdict']}")
-    print(f"  Moderation AI Called: {'YES' if ai_calls.get('moderation_called') else 'NO'}")
-    if ai_calls.get('moderation_verdict'):
-        print(f"    -> Verdict: {ai_calls['moderation_verdict']}")
-
-    print("\nFINAL DECISION")
-    print("-"*70)
-    print(f"  Allowed: {'YES' if not result.rejected else 'NO'}")
-    print(f"  Rejected By: {result.rejected_by}")
-    print(f"  Reason: {result.reason_code or result.code}")
-    if result.matched_term:
-        print(f"  Matched Term: {result.matched_term}")
-
-    print("="*70 + "\n")
