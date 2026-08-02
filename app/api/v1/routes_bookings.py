@@ -1,6 +1,6 @@
 import logging
 import re
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 from types import SimpleNamespace
 
@@ -14,7 +14,7 @@ from app.api.v1.routes_auth import get_current_user
 from app.db.models.booking_timeline import BookingTimeline, TimelineEventType
 from app.db.models.cab_booking import CabBooking, BookingStatus
 from app.db.models.driver import Driver
-from app.db.models.driver_magic_link import DriverMagicLinkReachEvent
+from app.db.models.driver_magic_link import DriverMagicLink, DriverMagicLinkReachEvent
 from app.db.models.user import User
 from app.db.session import get_db
 from app.db.models.vessel import Vessel
@@ -54,6 +54,35 @@ logger = logging.getLogger(__name__)
 # Stop labels that are structural, not real venue names — a "drop" stop is
 # stored as name="Drop" with the actual venue sitting in `address`.
 _GENERIC_STOP_LABELS = {"pickup", "drop", "stop", "trip end", "trip end (port)"}
+_MAGIC_LINK_TERMINAL_STATUSES = {
+    BookingStatus.COMPLETED.value,
+    BookingStatus.CANCELLED.value,
+    BookingStatus.PROVIDER_REJECTED.value,
+}
+_OTP_MAX_FAILED_ATTEMPTS = 5
+_OTP_LOCKOUT_DURATION = timedelta(minutes=15)
+_OTP_ATTEMPT_COOLDOWN = timedelta(seconds=1)
+
+
+def _require_magic_link_otp(magic_link) -> None:
+    if not magic_link.otp_verified_at:
+        raise HTTPException(status_code=403, detail="Verify OTP first")
+
+
+def _require_magic_link_active(magic_link) -> CabBooking:
+    booking = magic_link.booking
+    if not booking:
+        raise HTTPException(status_code=404, detail="Linked booking not found")
+    if _booking_status_label(booking) in _MAGIC_LINK_TERMINAL_STATUSES:
+        raise HTTPException(
+            status_code=409,
+            detail="This trip is no longer active",
+        )
+    return booking
+
+
+def _aware_utc(value: datetime) -> datetime:
+    return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
 
 
 def _booking_status_label(booking: CabBooking) -> str:
@@ -215,6 +244,7 @@ def mark_magic_link_stop_reached(
     db: Session = Depends(get_db),
 ):
     magic_link = get_magic_link_by_token(db, token)
+    _require_magic_link_active(magic_link)
 
     matched_stop: Dict[str, Any] = {}
     stop_type = "facility"
@@ -231,7 +261,10 @@ def mark_magic_link_stop_reached(
             )
             break
 
-    mark_stop_reached(
+    if stop_type != "pickup":
+        _require_magic_link_otp(magic_link)
+
+    _, event_created = mark_stop_reached(
         db,
         magic_link=magic_link,
         stop_id=stop_id,
@@ -242,7 +275,7 @@ def mark_magic_link_stop_reached(
 
     try:
         booking = magic_link.booking
-        if booking:
+        if booking and event_created:
             if stop_type == "pickup":
                 from app.services.whatsapp import notify_driver_arrival
                 crew_user = booking.crew.user if booking.crew else None
@@ -270,29 +303,78 @@ def verify_magic_link_otp(
     body: VerifyMagicOtpIn,
     db: Session = Depends(get_db),
 ):
-    magic_link = get_magic_link_by_token(db, token)
-    booking = magic_link.booking
-    if not booking:
-        raise HTTPException(status_code=404, detail="Linked booking not found")
+    # Serialize attempts for this token so parallel requests cannot bypass the
+    # failed-attempt counter or lockout threshold.
+    magic_link = (
+        db.query(DriverMagicLink)
+        .filter(DriverMagicLink.token == token)
+        .with_for_update()
+        .first()
+    )
+    if not magic_link:
+        raise HTTPException(status_code=404, detail="Magic link not found")
+    booking = _require_magic_link_active(magic_link)
+
+    if magic_link.otp_verified_at:
+        return {"verified": True}
+
+    now = datetime.now(timezone.utc)
+    locked_until = magic_link.otp_locked_until
+    if locked_until and _aware_utc(locked_until) > now:
+        retry_after = max(1, int((_aware_utc(locked_until) - now).total_seconds()))
+        raise HTTPException(
+            status_code=429,
+            detail="Too many invalid OTP attempts. Try again later.",
+            headers={"Retry-After": str(retry_after)},
+        )
+
+    if locked_until:
+        magic_link.otp_failed_attempts = 0
+        magic_link.otp_locked_until = None
+
+    last_attempt_at = magic_link.otp_last_attempt_at
+    if last_attempt_at:
+        retry_in = _OTP_ATTEMPT_COOLDOWN - (now - _aware_utc(last_attempt_at))
+        if retry_in.total_seconds() > 0:
+            raise HTTPException(
+                status_code=429,
+                detail="Please wait before trying the OTP again.",
+                headers={"Retry-After": str(max(1, int(retry_in.total_seconds()) + 1))},
+            )
+
+    magic_link.otp_last_attempt_at = now
 
     crew_otp = booking.crew.ride_otp if booking.crew else None
     booking_otp = booking.otp
     if body.otp != (crew_otp or "") and body.otp != (booking_otp or ""):
+        failed_attempts = (magic_link.otp_failed_attempts or 0) + 1
+        magic_link.otp_failed_attempts = failed_attempts
+        if failed_attempts >= _OTP_MAX_FAILED_ATTEMPTS:
+            magic_link.otp_locked_until = now + _OTP_LOCKOUT_DURATION
+            db.commit()
+            raise HTTPException(
+                status_code=429,
+                detail="Too many invalid OTP attempts. Try again later.",
+                headers={"Retry-After": str(int(_OTP_LOCKOUT_DURATION.total_seconds()))},
+            )
+        db.commit()
         raise HTTPException(status_code=400, detail="Invalid OTP")
 
-    now = datetime.utcnow()
+    magic_link.otp_verified_at = now
+    magic_link.otp_failed_attempts = 0
+    magic_link.otp_locked_until = None
     if not booking.trip_started_at:
         booking.trip_started_at = now
-    booking.status = BookingStatus.ON_TRIP
+        booking.status = BookingStatus.ON_TRIP
 
-    create_timeline_event(
-        db,
-        booking_db_id=booking.id,
-        event_type=TimelineEventType.TRIP_STARTED,
-        actor_type="driver",
-        metadata={"source": "magic_link_otp"},
-        event_time=now,
-    )
+        create_timeline_event(
+            db,
+            booking_db_id=booking.id,
+            event_type=TimelineEventType.TRIP_STARTED,
+            actor_type="driver",
+            metadata={"source": "magic_link_otp"},
+            event_time=now,
+        )
     db.commit()
     return {"verified": True}
 
@@ -304,6 +386,8 @@ def add_magic_link_stop(
     db: Session = Depends(get_db),
 ):
     magic_link = get_magic_link_by_token(db, token)
+    _require_magic_link_active(magic_link)
+    _require_magic_link_otp(magic_link)
     updated = add_stop_to_magic_link(
         db,
         magic_link,
@@ -322,7 +406,16 @@ def complete_magic_link_ride(
     body: CompleteRideIn,
     db: Session = Depends(get_db),
 ):
-    magic_link = get_magic_link_by_token(db, token)
+    # Serialize completion for a token. Without this lock, two requests can
+    # both pass the status check and race on the unique trip-end event.
+    magic_link = (
+        db.query(DriverMagicLink)
+        .filter(DriverMagicLink.token == token)
+        .with_for_update()
+        .first()
+    )
+    if not magic_link:
+        raise HTTPException(status_code=404, detail="Magic link not found")
     booking = magic_link.booking
     if not booking:
         raise HTTPException(status_code=404, detail="Linked booking not found")
@@ -336,6 +429,9 @@ def complete_magic_link_ride(
             "complete-ride ignored for booking %s — already completed", booking.booking_id
         )
         return serialize_magic_link_public_payload(get_magic_link_by_token(db, token))
+
+    _require_magic_link_active(magic_link)
+    _require_magic_link_otp(magic_link)
 
     trip_end_stop = None
     for stop in magic_link.itinerary_stops or []:
@@ -359,16 +455,24 @@ def complete_magic_link_ride(
 
     now = datetime.utcnow()
 
-    db.add(
-        DriverMagicLinkReachEvent(
+    trip_end_stop_id = str(trip_end_stop.get("id") or "trip_end")
+    existing_trip_end_event = (
+        db.query(DriverMagicLinkReachEvent)
+        .filter(
+            DriverMagicLinkReachEvent.magic_link_id == magic_link.id,
+            DriverMagicLinkReachEvent.stop_id == trip_end_stop_id,
+        )
+        .first()
+    )
+    if not existing_trip_end_event:
+        db.add(DriverMagicLinkReachEvent(
             magic_link_id=magic_link.id,
-            stop_id=str(trip_end_stop.get("id") or "trip_end"),
+            stop_id=trip_end_stop_id,
             stop_name=str(trip_end_stop.get("name") or "Trip End (Port)"),
             latitude=body.latitude,
             longitude=body.longitude,
             notes=body.notes,
-        )
-    )
+        ))
 
     db.query(CabBooking).filter(CabBooking.id == booking.id).update(
         {
