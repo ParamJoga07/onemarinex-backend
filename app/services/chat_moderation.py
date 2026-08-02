@@ -460,10 +460,10 @@ def _print_moderation_trace(trace: dict, result: ModerationResult, checkpoint: s
     ai_calls = trace.get('ai_calls', {})
     print(f"  Language AI Called: {'YES' if ai_calls.get('language_called') else 'NO'}")
     if ai_calls.get('language_verdict'):
-        print(f"    → Verdict: {ai_calls['language_verdict']}")
+        print(f"    -> Verdict: {ai_calls['language_verdict']}")
     print(f"  Moderation AI Called: {'YES' if ai_calls.get('moderation_called') else 'NO'}")
     if ai_calls.get('moderation_verdict'):
-        print(f"    → Verdict: {ai_calls['moderation_verdict']}")
+        print(f"    -> Verdict: {ai_calls['moderation_verdict']}")
 
     print("\nFINAL DECISION")
     print("-"*70)
