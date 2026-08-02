@@ -79,7 +79,7 @@ def reload_restricted_words(db: Session) -> None:
     phrases = []
 
     for w in words:
-        normalized = w.word.lower().strip()
+        normalized = normalize(w.word)
         if ' ' in normalized:
             phrases.append(re.escape(normalized))
         else:
@@ -190,12 +190,22 @@ async def moderate_message(
         return result
 
     single_words, phrase_regex = _get_cached_dictionary(db)
+
+    # DEBUG: Log dictionary state
+    logger.info(f"DEBUG DICT: Raw message: {repr(raw_text)}")
+    logger.info(f"DEBUG DICT: Normalized: {repr(normalized)}")
+    logger.info(f"DEBUG DICT: Tokens: {normalized.split()}")
+    logger.info(f"DEBUG DICT: Dictionary size: {len(single_words)}")
+    if single_words:
+        first_20 = sorted(list(single_words))[:20]
+        logger.info(f"DEBUG DICT: First 20 words in dict: {first_20}")
+
     matched_term = _check_dictionary(normalized, single_words, phrase_regex)
     trace['dictionary']['size'] = len(single_words)
     trace['dictionary']['matched_term'] = matched_term
 
     if matched_term:
-        logger.info(f"Restricted word match: '{matched_term}' in message: {raw_text}")
+        logger.info(f"DEBUG BRANCH: DICTIONARY MATCH - Restricting word: '{matched_term}'")
         result = ModerationResult(
             rejected=True,
             code="restricted_word",
@@ -206,12 +216,15 @@ async def moderate_message(
         _print_moderation_trace(trace, result, "dictionary")
         return result
 
+    logger.info(f"DEBUG BRANCH: NO DICTIONARY MATCH - Proceeding to AI checks")
     if settings.moderation_ai_enabled or settings.language_ai_enabled:
         ai_result = await _check_contextual_violations(normalized, settings, trace)
         if ai_result:
+            logger.info(f"DEBUG BRANCH: AI REJECTED - {ai_result.rejected_by}")
             _print_moderation_trace(trace, ai_result, "ai")
             return ai_result
 
+    logger.info(f"DEBUG BRANCH: ALLOWED - No violations found")
     result = ModerationResult(rejected=False, rejected_by="backend")
     _print_moderation_trace(trace, result, "allowed")
     return result
@@ -383,12 +396,12 @@ def _check_raw_spam(raw_text: str) -> bool:
 def _check_dictionary(normalized: str, single_words: Set[str], phrase_regex: Optional[re.Pattern]) -> Optional[str]:
     """Check against restricted words and phrases."""
     tokens = normalized.split()
-    logger.debug(f"DEBUG _check_dictionary: tokens={tokens}, dict_size={len(single_words)}")
+    logger.info(f"DEBUG _check_dictionary: Checking {len(tokens)} tokens against {len(single_words)} words")
 
     for token in tokens:
         clean_token = re.sub(r'[^a-z0-9]', '', token)
         in_dict = clean_token in single_words if single_words else False
-        logger.debug(f"DEBUG _check_dictionary: token='{token}' -> clean='{clean_token}' -> in_dict={in_dict}")
+        logger.info(f"DEBUG TOKEN: token='{token}' -> clean='{clean_token}' -> in_dict={in_dict}")
         if clean_token and in_dict:
             logger.info(f"DEBUG _check_dictionary: MATCH FOUND: '{clean_token}'")
             return clean_token
@@ -399,7 +412,7 @@ def _check_dictionary(normalized: str, single_words: Set[str], phrase_regex: Opt
             logger.info(f"DEBUG _check_dictionary: PHRASE MATCH: '{match.group(1)}'")
             return match.group(1)
 
-    logger.debug(f"DEBUG _check_dictionary: NO MATCH FOUND")
+    logger.info(f"DEBUG _check_dictionary: NO MATCH FOUND in {len(tokens)} tokens")
     return None
 
 
