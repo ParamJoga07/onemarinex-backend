@@ -106,6 +106,8 @@ origins = [
     "https://heyports-56we8.ondigitalocean.app",  # Production frontend
     "https://www.heyports-56we8.ondigitalocean.app",
     "https://heyports-dev-5285u.ondigitalocean.app",
+    "https://heyports.com",
+    "https://www.heyports.com",
 ]
 app.add_middleware(
     CORSMiddleware,
