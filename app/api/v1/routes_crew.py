@@ -55,6 +55,104 @@ def _minutes_from_hhmm(value: str) -> int:
     return int(match.group(1)) * 60 + int(match.group(2))
 
 
+_WEEKDAY_ABBR = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+
+def _port_rule_for(db: Session, port_value: Optional[str]) -> Optional[PortRule]:
+    """PortRule for a port referred to by code, name, or the raw stored value.
+
+    Bookings carry whichever of those the client happened to send, so match on
+    all three rather than assuming one.
+    """
+    if not port_value:
+        return None
+    port = (
+        db.query(Port)
+        .filter((Port.code == port_value) | (Port.name == port_value))
+        .first()
+    )
+    candidates = [
+        c for c in ([port.code, port.name, port_value] if port else [port_value]) if c
+    ]
+    if not candidates:
+        return None
+    return db.query(PortRule).filter(PortRule.port_name.in_(candidates)).first()
+
+
+def _normalize_working_days(raw) -> Optional[List[str]]:
+    """Working days come back as a JSON list, a JSON string, or a CSV string."""
+    if not raw:
+        return None
+    values = raw
+    if isinstance(values, str):
+        text = values.strip()
+        if not text:
+            return None
+        try:
+            parsed = json.loads(text)
+            values = parsed if isinstance(parsed, list) else text.split(",")
+        except (ValueError, TypeError):
+            values = text.split(",")
+    if not isinstance(values, list):
+        return None
+    days = {str(v).strip()[:3].title() for v in values if str(v).strip()}
+    return sorted(days) or None
+
+
+def _port_closed_reason(
+    pickup_at: datetime,
+    opening_time: Optional[str],
+    closing_time: Optional[str],
+    working_days,
+) -> Optional[str]:
+    """Why the port is shut at `pickup_at`, or None when it is open.
+
+    Mirrors the crew app's getPortStatus so the client and the API agree on
+    what "closed" means. A port with no configured hours is treated as always
+    open — never block a booking because the rules are simply unset.
+    """
+    days = _normalize_working_days(working_days)
+    if days and _WEEKDAY_ABBR[pickup_at.weekday()] not in days:
+        return "The port is closed on %s." % pickup_at.strftime("%A")
+
+    try:
+        opening = _minutes_from_hhmm(opening_time) if opening_time else None
+        closing = _minutes_from_hhmm(closing_time) if closing_time else None
+    except ValueError:
+        # A malformed configured time must never block a booking.
+        logger.warning(
+            "Port timing is not HH:MM (opening=%r closing=%r) — skipping the hours check",
+            opening_time,
+            closing_time,
+        )
+        return None
+
+    if opening is None and closing is None:
+        return None
+
+    pickup_minutes = pickup_at.hour * 60 + pickup_at.minute
+
+    if opening is not None and closing is not None:
+        # Ports that close after midnight (open 06:00, close 02:00) run past the
+        # end of the day, so shift the close and any early-morning pickup into
+        # the same continuous window.
+        if closing <= opening:
+            closing += 24 * 60
+            if pickup_minutes < opening:
+                pickup_minutes += 24 * 60
+        if pickup_minutes < opening:
+            return "The port opens at %s. Cab booking is available after that." % opening_time[:5]
+        if pickup_minutes >= closing:
+            return "The port closed at %s. Cab booking is unavailable until it reopens." % closing_time[:5]
+        return None
+
+    if opening is not None and pickup_minutes < opening:
+        return "The port opens at %s. Cab booking is available after that." % opening_time[:5]
+    if closing is not None and pickup_minutes >= closing:
+        return "The port closed at %s. Cab booking is unavailable until it reopens." % closing_time[:5]
+    return None
+
+
 def _planned_return_is_after_closing(
     pickup_at: datetime,
     planned_return: str,
@@ -1784,6 +1882,22 @@ def book_cab(
                 status_code=400,
                 detail="Scheduled pickup time is required for a coordinated transfer",
             )
+
+    # Cab booking is only available while the port is open. Checked against the
+    # pickup time rather than "now", so a ride cannot be scheduled into a window
+    # when the port has already shut. The crew app hides the entry point too,
+    # but that is a convenience — this is the gate that actually holds.
+    booking_port_rule = _port_rule_for(db, port_value)
+    if booking_port_rule:
+        pickup_at = body.scheduled_time or datetime.utcnow()
+        closed_reason = _port_closed_reason(
+            pickup_at,
+            booking_port_rule.opening_time,
+            booking_port_rule.closing_time,
+            booking_port_rule.working_days,
+        )
+        if closed_reason:
+            raise HTTPException(status_code=400, detail=closed_reason)
 
     if resolved_trip_type == "coordinated_transfer" and body.planned_return:
         try:
