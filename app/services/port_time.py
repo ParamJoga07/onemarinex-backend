@@ -159,3 +159,45 @@ def port_closed_reason(
     if closing is not None and pickup_minutes >= closing:
         return "The port closed at %s. Choose a pickup time within port hours." % closing_time[:5]
     return None
+
+
+def port_closing_buffer_reason(
+    current_port_time: datetime,
+    opening_time: Optional[str],
+    closing_time: Optional[str],
+    minimum_remaining_minutes: int,
+) -> Optional[str]:
+    """Block an immediate action during the final minutes before closing.
+
+    ``current_port_time`` must come from :func:`port_clock_snapshot`, not from
+    a client-supplied timestamp. Overnight schedules are projected onto a
+    single minute timeline so a 22:00-02:00 port has the correct cutoff on
+    both sides of midnight.
+    """
+    if not closing_time or minimum_remaining_minutes <= 0:
+        return None
+
+    try:
+        closing = minutes_from_hhmm(closing_time)
+        opening = minutes_from_hhmm(opening_time) if opening_time else None
+    except ValueError:
+        logger.error(
+            "Port timing is not HH:MM (opening=%r closing=%r); blocking timed actions",
+            opening_time,
+            closing_time,
+        )
+        return "Port timing is temporarily unavailable. Please contact port support."
+
+    current = current_port_time.hour * 60 + current_port_time.minute
+    if opening is not None and closing <= opening and current >= opening:
+        closing += 24 * 60
+
+    remaining = closing - current
+    if remaining <= minimum_remaining_minutes:
+        hours = minimum_remaining_minutes / 60
+        hours_label = str(int(hours)) if hours.is_integer() else f"{hours:g}"
+        return (
+            f"Go Explore is unavailable during the final {hours_label} hours "
+            f"before the port closes at {closing_time[:5]}."
+        )
+    return None
