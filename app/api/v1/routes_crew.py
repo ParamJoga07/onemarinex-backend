@@ -44,6 +44,7 @@ from app.services.port_time import (
     as_port_local,
     minutes_from_hhmm as _minutes_from_hhmm,
     port_clock_snapshot,
+    port_closing_buffer_reason,
     port_closed_reason as _port_closed_reason,
 )
 from pydantic import BaseModel, EmailStr, Field
@@ -51,6 +52,7 @@ from pydantic import BaseModel, EmailStr, Field
 router = APIRouter()
 logger = logging.getLogger(__name__)
 DEFAULT_TRIP_SPEED_KMPH = 28.0
+PACKAGE_CLOSING_BUFFER_MINUTES = 2 * 60
 
 
 def _port_rule_for(db: Session, port_value: Optional[str]) -> Optional[PortRule]:
@@ -1877,6 +1879,13 @@ def _pickup_availability(
             rule.closing_time,
             rule.working_days,
         )
+        if reason is None and trip_type == "package_trip":
+            reason = port_closing_buffer_reason(
+                port_now,
+                rule.opening_time,
+                rule.closing_time,
+                PACKAGE_CLOSING_BUFFER_MINUTES,
+            )
 
     return {
         "available": reason is None,

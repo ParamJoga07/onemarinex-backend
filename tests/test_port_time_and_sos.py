@@ -7,7 +7,11 @@ from zoneinfo import ZoneInfo
 from pydantic import ValidationError
 
 from app.api.v1 import routes_crew
-from app.services.port_time import port_clock_snapshot, port_closed_reason
+from app.services.port_time import (
+    port_clock_snapshot,
+    port_closed_reason,
+    port_closing_buffer_reason,
+)
 
 
 class PortTimeTests(unittest.TestCase):
@@ -72,6 +76,46 @@ class PortTimeTests(unittest.TestCase):
 
         self.assertIn("temporarily unavailable", result or "")
 
+    def test_package_cutoff_starts_exactly_two_hours_before_closing(self):
+        zone = ZoneInfo("Asia/Kolkata")
+
+        self.assertIsNone(
+            port_closing_buffer_reason(
+                datetime(2026, 8, 3, 15, 59, tzinfo=zone),
+                "08:00",
+                "18:00",
+                120,
+            )
+        )
+        result = port_closing_buffer_reason(
+            datetime(2026, 8, 3, 16, 0, tzinfo=zone),
+            "08:00",
+            "18:00",
+            120,
+        )
+
+        self.assertIn("final 2 hours", result or "")
+
+    def test_package_cutoff_supports_overnight_port_hours(self):
+        zone = ZoneInfo("Asia/Dubai")
+
+        self.assertIsNone(
+            port_closing_buffer_reason(
+                datetime(2026, 8, 3, 22, 59, tzinfo=zone),
+                "22:00",
+                "01:00",
+                120,
+            )
+        )
+        self.assertIsNotNone(
+            port_closing_buffer_reason(
+                datetime(2026, 8, 3, 23, 0, tzinfo=zone),
+                "22:00",
+                "01:00",
+                120,
+            )
+        )
+
 
 class PickupAvailabilityTests(unittest.TestCase):
     def setUp(self):
@@ -120,6 +164,23 @@ class PickupAvailabilityTests(unittest.TestCase):
         )
 
         self.assertFalse(result["available"])
+        self.assertEqual(result["pickup_at"], self.port_now)
+
+    def test_package_uses_server_port_time_for_closing_cutoff(self):
+        self.port_now = datetime(2026, 8, 3, 16, 0, tzinfo=self.zone)
+        self.clock.update(
+            server_time=self.port_now.astimezone(timezone.utc),
+            port_now=self.port_now,
+            port_time="16:00",
+        )
+
+        result = self.availability(
+            datetime(2026, 8, 3, 9, 0),
+            "package_trip",
+        )
+
+        self.assertFalse(result["available"])
+        self.assertIn("final 2 hours", result["reason"] or "")
         self.assertEqual(result["pickup_at"], self.port_now)
 
     def test_availability_uses_authenticated_profile_port(self):
