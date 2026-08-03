@@ -11,6 +11,10 @@ class CrewSos(Base):
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
     crew_profile_id = Column(Integer, ForeignKey("crew_profiles.id", ondelete="CASCADE"), nullable=False)
+    cab_booking_id = Column(Integer, ForeignKey("cab_bookings.id", ondelete="SET NULL"), nullable=True, index=True)
+    trip_id = Column(String(64), nullable=True, index=True)
+    crew_email = Column(String(255), nullable=True)
+    sos_email = Column(String(255), nullable=True)
     port_name = Column(String(128), nullable=True)
     vessel = Column(String(128), nullable=True)
     lat = Column(Float, nullable=True)
@@ -24,3 +28,4 @@ class CrewSos(Base):
 
     user = relationship("User")
     crew_profile = relationship("CrewProfile")
+    cab_booking = relationship("CabBooking")

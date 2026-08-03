@@ -754,7 +754,11 @@ def itinerary_catalog(
     if resolved_port:
         query = query.filter(Vendors.port_id == resolved_port.id)
 
-    vendors = query.order_by(Vendors.rating.desc()).all()
+    vendors = query.order_by(
+        Vendors.commission_percentage.desc(),
+        Vendors.rating.desc(),
+        Vendors.id.asc(),
+    ).all()
     stops = [vendor_to_stop(item) for item in vendors]
     
     if requested_tags:
@@ -1155,4 +1159,3 @@ def suggest_itinerary(body: ItinerarySuggestIn, db: Session = Depends(get_db)):
         itineraries=itineraries[:MAX_ITINERARIES],
         fallback_used=not found_any,
     )
-

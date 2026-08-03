@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import func, or_, cast, String
 from typing import List, Optional, Dict, Any
 from datetime import datetime
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import logging
 import re
 
@@ -29,6 +29,11 @@ from app.db.models.contact_message import ContactMessage
 from app.db.models.driver_magic_link import DriverMagicLink, DriverMagicLinkReachEvent
 from app.db.models.vendor_tag import VendorTag
 from app.api.v1.routes_auth import get_current_user
+from app.services.vendor_ranking import (
+    apply_vendor_commission_ranking,
+    categories_for_vendor_section,
+    vendor_category_text,
+)
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -117,6 +122,7 @@ class VendorCreate(VendorCreationBase):
     images: Optional[List[str]] = None
     menu_items: Optional[List[str]] = None
     other_information: Optional[Dict[str, Any]] = None
+    commission_percentage: float = Field(default=0, ge=0, le=100)
 
 
 class VendorUpdate(BaseModel):
@@ -135,6 +141,7 @@ class VendorUpdate(BaseModel):
     other_information: Optional[Dict[str, Any]] = None
     port_id: Optional[int] = None
     status: Optional[str] = None
+    commission_percentage: Optional[float] = Field(default=None, ge=0, le=100)
 
 
 
@@ -154,6 +161,7 @@ class VendorOut(BaseModel):
     images: Optional[List[str]]
     menu_items: Optional[List[str]] = None
     other_information: Optional[Dict[str, Any]]
+    commission_percentage: float
     created_at: datetime
     updated_at: datetime
 
@@ -1015,12 +1023,15 @@ def get_vendors(
         query = query.filter(Vendors.id == vendor_id)
 
     if category is not None:
-        query = query.filter(Vendors.category == category.strip().lower())
+        categories = categories_for_vendor_section(category)
+        if not categories:
+            raise HTTPException(status_code=400, detail="Invalid category")
+        query = query.filter(func.lower(vendor_category_text()).in_(categories))
 
     if search is not None:
         query = query.filter(Vendors.name.ilike(f"%{search}%"))     
 
-    return query.all()
+    return apply_vendor_commission_ranking(query).all()
 
 @router.put("/vendors/{vendor_id}", response_model=VendorOut)
 def update_place(
@@ -1045,6 +1056,11 @@ def update_place(
         patch["phone"] = ""
     if "email" in patch and patch["email"] is None:
         patch["email"] = ""
+    if "commission_percentage" in patch and patch["commission_percentage"] is None:
+        raise HTTPException(
+            status_code=400,
+            detail="commission_percentage cannot be null",
+        )
     if "port_id" in patch and patch["port_id"] is not None:
         if patch["port_id"] <= 0:
             raise HTTPException(status_code=400, detail="port_id must be a valid port")

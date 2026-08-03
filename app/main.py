@@ -140,6 +140,8 @@ def on_startup():
     ensure_expense_bill_columns()
     ensure_chat_message_columns()
     ensure_magic_link_hardening_schema()
+    ensure_port_time_and_sos_context_schema()
+    ensure_vendor_commission_schema()
     ensure_alembic_baseline()
     _log_whatsapp_config()
     _log_chat_moderation_config()
@@ -391,6 +393,112 @@ def ensure_magic_link_hardening_schema():
     except Exception:
         log.exception(
             "ensure_magic_link_hardening_schema failed — driver magic-link actions may be degraded"
+        )
+
+
+def ensure_port_time_and_sos_context_schema():
+    """Additive fallback for server-authoritative port time and trip-bound SOS.
+
+    Alembic remains canonical. This guard prevents an App Platform instance
+    that starts before the migration job from querying columns that do not yet
+    exist.
+    """
+    log = logging.getLogger("app.startup")
+    try:
+        inspector = inspect(engine)
+        tables = set(inspector.get_table_names())
+        statements = []
+
+        if "port_rules" in tables:
+            port_columns = {column["name"] for column in inspector.get_columns("port_rules")}
+            if "timezone" not in port_columns:
+                statements.append(
+                    "ALTER TABLE port_rules ADD COLUMN IF NOT EXISTS timezone VARCHAR(64)"
+                )
+            statements.append(
+                """
+                UPDATE port_rules
+                   SET timezone = CASE
+                       WHEN lower(port_name) LIKE '%dubai%' THEN 'Asia/Dubai'
+                       ELSE 'Asia/Kolkata'
+                   END
+                 WHERE timezone IS NULL OR btrim(timezone) = ''
+                """
+            )
+
+        if "crew_sos_requests" in tables:
+            sos_columns = {
+                column["name"] for column in inspector.get_columns("crew_sos_requests")
+            }
+            additions = {
+                "cab_booking_id": "INTEGER",
+                "trip_id": "VARCHAR(64)",
+                "crew_email": "VARCHAR(255)",
+                "sos_email": "VARCHAR(255)",
+            }
+            for name, ddl in additions.items():
+                if name not in sos_columns:
+                    statements.append(
+                        f"ALTER TABLE crew_sos_requests ADD COLUMN IF NOT EXISTS {name} {ddl}"
+                    )
+
+            has_booking_fk = any(
+                foreign_key.get("constrained_columns") == ["cab_booking_id"]
+                and foreign_key.get("referred_table") == "cab_bookings"
+                for foreign_key in inspector.get_foreign_keys("crew_sos_requests")
+            )
+
+            statements.extend([
+                "CREATE INDEX IF NOT EXISTS ix_crew_sos_requests_cab_booking_id ON crew_sos_requests (cab_booking_id)",
+                "CREATE INDEX IF NOT EXISTS ix_crew_sos_requests_trip_id ON crew_sos_requests (trip_id)",
+            ])
+            if not has_booking_fk and "cab_bookings" in tables:
+                statements.append("""
+                DO $$ BEGIN
+                    ALTER TABLE crew_sos_requests
+                    ADD CONSTRAINT fk_crew_sos_requests_cab_booking_id
+                    FOREIGN KEY (cab_booking_id) REFERENCES cab_bookings(id) ON DELETE SET NULL;
+                EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+                """)
+
+        if not statements:
+            return
+        with engine.begin() as connection:
+            for statement in statements:
+                connection.execute(text(statement))
+        log.info("port timezone and trip-bound SOS schema verified")
+    except Exception:
+        log.exception(
+            "ensure_port_time_and_sos_context_schema failed — time/SOS features may be degraded"
+        )
+
+
+def ensure_vendor_commission_schema():
+    """Additive safety net for deployments that start before Alembic runs."""
+    log = logging.getLogger("app.startup")
+    try:
+        inspector = inspect(engine)
+        if "vendors" not in inspector.get_table_names():
+            return
+
+        columns = {column["name"] for column in inspector.get_columns("vendors")}
+        statements = []
+        if "commission_percentage" not in columns:
+            statements.append(
+                "ALTER TABLE vendors ADD COLUMN IF NOT EXISTS commission_percentage NUMERIC(5,2) DEFAULT 0 NOT NULL"
+            )
+
+        statements.append(
+            "CREATE INDEX IF NOT EXISTS ix_vendors_port_category_commission ON vendors (port_id, category, commission_percentage)"
+        )
+
+        with engine.begin() as connection:
+            for statement in statements:
+                connection.execute(text(statement))
+        log.info("vendor commission schema verified")
+    except Exception:
+        log.exception(
+            "ensure_vendor_commission_schema failed — vendor ranking may be degraded"
         )
 
 def ensure_alembic_baseline():

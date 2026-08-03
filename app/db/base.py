@@ -45,6 +45,7 @@ from app.db.models import pricing_controls # noqa: F401
 from app.db.models import driver_magic_link # noqa: F401
 from app.db.models import pricing_controls # noqa: F401
 from app.db.models import vendor_tag # noqa: F401
+from app.db.models import vendors  # noqa: F401
 from app.db.models import booking_provider_rejection # noqa: F401
 from app.db.models import booking_review # noqa: F401
 from app.db.models import booking_invitation # noqa: F401

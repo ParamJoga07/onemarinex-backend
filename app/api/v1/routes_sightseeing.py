@@ -6,6 +6,10 @@ from fastapi.responses import Response
 from sqlalchemy.orm import Session
 from app.db.session import get_db
 from app.db.models.vendors import Vendors
+from app.services.vendor_ranking import (
+    apply_vendor_commission_ranking,
+    vendor_category_text,
+)
 from typing import List, Optional
 
 router = APIRouter()
@@ -35,7 +39,7 @@ def get_sightseeing(
     search: Optional[str] = None,
     db: Session = Depends(get_db)
 ):
-    query = db.query(Vendors).filter(Vendors.category.ilike("sightseeing"), Vendors.status == "Active")
+    query = db.query(Vendors).filter(vendor_category_text().ilike("sightseeing"), Vendors.status == "Active")
     if port_id is not None:
         query = query.filter(Vendors.port_id == port_id)
     if max_dist is not None:
@@ -43,7 +47,7 @@ def get_sightseeing(
     if search is not None:
         query = query.filter(Vendors.name.ilike(f"%{search}%"))
     
-    vendors = query.all()
+    vendors = apply_vendor_commission_ranking(query).all()
     results = []
     for v in vendors:
         other = v.other_information or {}
@@ -89,7 +93,7 @@ def get_sightseeing_by_filters(
     min_rating: Optional[float] = None,
     db: Session = Depends(get_db)
 ):
-    query = db.query(Vendors).filter(Vendors.category.ilike("sightseeing"), Vendors.status == "Active")
+    query = db.query(Vendors).filter(vendor_category_text().ilike("sightseeing"), Vendors.status == "Active")
     if port_id is not None:
         query = query.filter(Vendors.port_id == port_id)
     if max_dist is not None:
@@ -97,7 +101,7 @@ def get_sightseeing_by_filters(
     if min_rating is not None:
         query = query.filter(Vendors.rating >= min_rating)
     
-    vendors = query.all()
+    vendors = apply_vendor_commission_ranking(query).all()
     results = []
     for v in vendors:
         other = v.other_information or {}
@@ -133,7 +137,7 @@ def get_sightseeing_by_filters(
 # Get sightseeing by id
 @router.get("/{id}")
 def get_single_sightseeing(id: int, db: Session = Depends(get_db)):
-    v = db.query(Vendors).filter(Vendors.id == id, Vendors.category.ilike("sightseeing")).first()
+    v = db.query(Vendors).filter(Vendors.id == id, vendor_category_text().ilike("sightseeing")).first()
     if not v:
         raise HTTPException(status_code=404, detail="Sightseeing not found")
     other = v.other_information or {}
@@ -162,7 +166,7 @@ def get_single_sightseeing(id: int, db: Session = Depends(get_db)):
 # Generate QR code for a sightseeing location
 @router.get("/{id}/qr")
 def get_sightseeing_qr(id: int, db: Session = Depends(get_db)):
-    v = db.query(Vendors).filter(Vendors.id == id, Vendors.category.ilike("sightseeing")).first()
+    v = db.query(Vendors).filter(Vendors.id == id, vendor_category_text().ilike("sightseeing")).first()
     if not v:
         raise HTTPException(status_code=404, detail="Sightseeing not found")
 
