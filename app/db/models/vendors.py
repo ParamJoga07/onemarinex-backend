@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Float, DateTime, JSON, ForeignKey
+from sqlalchemy import Column, Integer, String, Float, DateTime, JSON, ForeignKey, Index, Numeric
 from sqlalchemy.orm import relationship
 # from sqlalchemy.dialects.postgresql import JSONB
 from datetime import datetime
@@ -25,8 +25,22 @@ class Vendors(Base):
     menu_items = Column(JSON, nullable=True)  # list of menu PDF/image URLs (e.g. S3/Spaces)
     other_information = Column(JSON, nullable=True)    # service type,price,timings
     category = Column(String(64), nullable=False)
+    # Commercial commission retained by HeyPorts. This is managed only in the
+    # Super Admin dashboard and is intentionally not returned in crew schemas.
+    commission_percentage = Column(
+        Numeric(5, 2), nullable=False, default=0, server_default="0"
+    )
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 
     # Relationship
     port = relationship("Port")
+
+    __table_args__ = (
+        Index(
+            "ix_vendors_port_category_commission",
+            "port_id",
+            "category",
+            "commission_percentage",
+        ),
+    )

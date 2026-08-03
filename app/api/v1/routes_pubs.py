@@ -11,6 +11,10 @@ from app.db.session import get_db
 from app.db.models.vendors import Vendors
 from app.api.v1.routes_auth import get_current_user
 from app.db.models.user import User
+from app.services.vendor_ranking import (
+    apply_vendor_commission_ranking,
+    vendor_category_text,
+)
 
 router = APIRouter()
 
@@ -83,10 +87,10 @@ def get_pubs(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    query = db.query(Vendors).filter(Vendors.category.ilike("pub"), Vendors.status == "Active")
+    query = db.query(Vendors).filter(vendor_category_text().ilike("pub"), Vendors.status == "Active")
     if port_id:
         query = query.filter(Vendors.port_id == port_id)
-    vendors = query.all()
+    vendors = apply_vendor_commission_ranking(query).all()
     results = []
     for v in vendors:
         other = v.other_information or {}
@@ -123,7 +127,7 @@ def get_pub_details(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    v = db.query(Vendors).filter(Vendors.id == pub_id, Vendors.category.ilike("pub")).first()
+    v = db.query(Vendors).filter(Vendors.id == pub_id, vendor_category_text().ilike("pub")).first()
     if not v:
         raise HTTPException(status_code=404, detail="Pub not found")
     other = v.other_information or {}
@@ -153,7 +157,7 @@ def get_pub_details(
 # Generate QR code for a pub
 @router.get("/{id}/qr")
 def get_pub_qr(id: int, db: Session = Depends(get_db)):
-    v = db.query(Vendors).filter(Vendors.id == id, Vendors.category.ilike("pub")).first()
+    v = db.query(Vendors).filter(Vendors.id == id, vendor_category_text().ilike("pub")).first()
     if not v:
         raise HTTPException(status_code=404, detail="Pub not found")
 

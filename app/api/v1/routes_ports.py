@@ -22,6 +22,11 @@ from app.db.models.port import Port
 from app.db.models.port_rule import PortRule
 from app.db.models.port_service_request import PortServiceRequest
 from app.api.v1.routes_auth import get_current_user
+from app.services.port_time import (
+    minutes_from_hhmm,
+    port_clock_snapshot,
+    validate_timezone_name,
+)
 
 router = APIRouter()
 
@@ -48,6 +53,7 @@ class PortRulesIn(BaseModel):
     opening_time: Optional[str] = None
     closing_time: Optional[str] = None
     working_days: Optional[List[str]] = None
+    timezone: Optional[str] = None
     advance_booking_buffer_minutes: Optional[int] = None
     contact_email: Optional[str] = None
     helpline_number: Optional[str] = None
@@ -58,6 +64,11 @@ class PortRulesOut(BaseModel):
     opening_time: Optional[str] = None
     closing_time: Optional[str] = None
     working_days: Optional[List[str]] = None
+    timezone: str
+    server_time: str
+    port_date: str
+    port_time: str
+    port_day: str
     advance_booking_buffer_minutes: Optional[int] = 30
     contact_email: Optional[str] = None
     helpline_number: Optional[str] = None
@@ -94,7 +105,23 @@ def get_port_rules(port_name: str, db: Session = Depends(get_db)):
         .first()
     )
     if not rules:
-        return {"port_name": port.code if port else port_name, "rules": [], "opening_time": None, "closing_time": None, "working_days": None, "advance_booking_buffer_minutes": 30, "contact_email": None, "helpline_number": None}
+        canonical_port = port.code if port else port_name
+        clock = port_clock_snapshot(canonical_port)
+        return {
+            "port_name": canonical_port,
+            "rules": [],
+            "opening_time": None,
+            "closing_time": None,
+            "working_days": None,
+            "timezone": clock["timezone"],
+            "server_time": clock["server_time"].isoformat(),
+            "port_date": clock["port_date"],
+            "port_time": clock["port_time"],
+            "port_day": clock["port_day"],
+            "advance_booking_buffer_minutes": 30,
+            "contact_email": None,
+            "helpline_number": None,
+        }
     working_days = rules.working_days
     if isinstance(working_days, str):
         try:
@@ -106,12 +133,18 @@ def get_port_rules(port_name: str, db: Session = Depends(get_db)):
         except Exception:
             working_days = [d.strip() for d in working_days.split(",") if d.strip()]
 
+    clock = port_clock_snapshot(rules.port_name, rules.timezone)
     return {
         "port_name": rules.port_name,
         "rules": safe_parse_json(rules.rules, []),
         "opening_time": rules.opening_time,
         "closing_time": rules.closing_time,
         "working_days": working_days,
+        "timezone": clock["timezone"],
+        "server_time": clock["server_time"].isoformat(),
+        "port_date": clock["port_date"],
+        "port_time": clock["port_time"],
+        "port_day": clock["port_day"],
         "advance_booking_buffer_minutes": rules.advance_booking_buffer_minutes if hasattr(rules, 'advance_booking_buffer_minutes') else 30,
         "contact_email": rules.contact_email if hasattr(rules, 'contact_email') else None,
         "helpline_number": rules.helpline_number if hasattr(rules, 'helpline_number') else None,
@@ -146,6 +179,21 @@ def update_port_rules(
     )
 
     update_data = body.model_dump(exclude_unset=True)
+    for field_name in ("opening_time", "closing_time"):
+        configured_time = update_data.get(field_name)
+        if configured_time:
+            try:
+                minutes_from_hhmm(configured_time)
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{field_name.replace('_', ' ').title()} must use HH:MM format",
+                ) from exc
+    if update_data.get("timezone"):
+        try:
+            update_data["timezone"] = validate_timezone_name(update_data["timezone"])
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
     
     if port_rules:
         if "rules" in update_data and update_data["rules"] is not None:
@@ -159,6 +207,8 @@ def update_port_rules(
             port_rules.closing_time = update_data["closing_time"]
         if "working_days" in update_data:
             port_rules.working_days = update_data["working_days"]
+        if "timezone" in update_data:
+            port_rules.timezone = update_data["timezone"]
         if "advance_booking_buffer_minutes" in update_data:
             port_rules.advance_booking_buffer_minutes = update_data["advance_booking_buffer_minutes"]
         if "contact_email" in update_data:
@@ -172,6 +222,7 @@ def update_port_rules(
             opening_time=body.opening_time,
             closing_time=body.closing_time,
             working_days=body.working_days,
+            timezone=update_data.get("timezone"),
             advance_booking_buffer_minutes=body.advance_booking_buffer_minutes if body.advance_booking_buffer_minutes is not None else 30,
             contact_email=body.contact_email,
             helpline_number=body.helpline_number,
@@ -196,12 +247,18 @@ def update_port_rules(
         except Exception:
             working_days = [d.strip() for d in working_days.split(",") if d.strip()]
 
+    clock = port_clock_snapshot(port_rules.port_name, port_rules.timezone)
     return {
         "port_name": port_rules.port_name,
         "rules": safe_parse_json(port_rules.rules, []),
         "opening_time": port_rules.opening_time,
         "closing_time": port_rules.closing_time,
         "working_days": working_days,
+        "timezone": clock["timezone"],
+        "server_time": clock["server_time"].isoformat(),
+        "port_date": clock["port_date"],
+        "port_time": clock["port_time"],
+        "port_day": clock["port_day"],
         "advance_booking_buffer_minutes": port_rules.advance_booking_buffer_minutes,
         "contact_email": port_rules.contact_email,
         "helpline_number": port_rules.helpline_number,

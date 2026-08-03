@@ -6,6 +6,10 @@ from pydantic import BaseModel
 from app.db.session import get_db
 from app.db.models.vendors import Vendors
 from app.api.v1.routes_auth import get_current_user
+from app.services.vendor_ranking import (
+    apply_vendor_commission_ranking,
+    vendor_category_text,
+)
 
 router = APIRouter()
 
@@ -77,11 +81,11 @@ def get_massage_wellness(
 ):
     query = db.query(Vendors).filter(
         Vendors.status == "Active",
-        Vendors.category.in_(["massage", "wellness"]),
+        vendor_category_text().in_(["massage", "wellness"]),
     )
     if port_id:
         query = query.filter(Vendors.port_id == port_id)
-    vendors = query.all()
+    vendors = apply_vendor_commission_ranking(query).all()
     return [_vendor_to_facility(v) for v in vendors]
 
 
@@ -93,11 +97,11 @@ def get_shopping_utility(
 ):
     query = db.query(Vendors).filter(
         Vendors.status == "Active",
-        Vendors.category.in_(["shopping", "utility"]),
+        vendor_category_text().in_(["shopping", "utility"]),
     )
     if port_id:
         query = query.filter(Vendors.port_id == port_id)
-    vendors = query.all()
+    vendors = apply_vendor_commission_ranking(query).all()
     return [_vendor_to_facility(v) for v in vendors]
 
 
@@ -110,7 +114,7 @@ def get_facility_by_id(
     vendor = db.query(Vendors).filter(
         Vendors.id == facility_id,
         Vendors.status == "Active",
-        Vendors.category.in_(["massage", "wellness", "shopping", "utility"]),
+        vendor_category_text().in_(["massage", "wellness", "shopping", "utility"]),
     ).first()
     if not vendor:
         raise HTTPException(status_code=404, detail="Facility not found")

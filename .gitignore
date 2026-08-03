@@ -22,6 +22,8 @@ apply_port_id_migration.py
 migrations/
 seeds/
 tests/
+!tests/
+!tests/*.py
 
 # Application logs
 logs/

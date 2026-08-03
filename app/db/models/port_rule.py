@@ -9,6 +9,7 @@ class PortRule(Base):
     rules = Column(JSON, nullable=True)
     opening_time = Column(String(8), nullable=True)
     closing_time = Column(String(8), nullable=True)
+    timezone = Column(String(64), nullable=True)
     working_days = Column(JSON, nullable=True)  # List of weekday abbreviations: ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]
     advance_booking_buffer_minutes = Column(Integer, default=30)
     contact_email = Column(String(255), nullable=True)

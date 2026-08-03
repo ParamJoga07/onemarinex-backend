@@ -40,22 +40,17 @@ from app.services.booking_service import (
     vehicle_category_matches,
     STATUS_LABELS,
 )
-from pydantic import BaseModel, Field
+from app.services.port_time import (
+    as_port_local,
+    minutes_from_hhmm as _minutes_from_hhmm,
+    port_clock_snapshot,
+    port_closed_reason as _port_closed_reason,
+)
+from pydantic import BaseModel, EmailStr, Field
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
 DEFAULT_TRIP_SPEED_KMPH = 28.0
-HHMM_PATTERN = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)(?::[0-5]\d)?$")
-
-
-def _minutes_from_hhmm(value: str) -> int:
-    match = HHMM_PATTERN.fullmatch((value or "").strip())
-    if not match:
-        raise ValueError("Time must use HH:MM format")
-    return int(match.group(1)) * 60 + int(match.group(2))
-
-
-_WEEKDAY_ABBR = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
 
 def _port_rule_for(db: Session, port_value: Optional[str]) -> Optional[PortRule]:
@@ -77,80 +72,6 @@ def _port_rule_for(db: Session, port_value: Optional[str]) -> Optional[PortRule]
     if not candidates:
         return None
     return db.query(PortRule).filter(PortRule.port_name.in_(candidates)).first()
-
-
-def _normalize_working_days(raw) -> Optional[List[str]]:
-    """Working days come back as a JSON list, a JSON string, or a CSV string."""
-    if not raw:
-        return None
-    values = raw
-    if isinstance(values, str):
-        text = values.strip()
-        if not text:
-            return None
-        try:
-            parsed = json.loads(text)
-            values = parsed if isinstance(parsed, list) else text.split(",")
-        except (ValueError, TypeError):
-            values = text.split(",")
-    if not isinstance(values, list):
-        return None
-    days = {str(v).strip()[:3].title() for v in values if str(v).strip()}
-    return sorted(days) or None
-
-
-def _port_closed_reason(
-    pickup_at: datetime,
-    opening_time: Optional[str],
-    closing_time: Optional[str],
-    working_days,
-) -> Optional[str]:
-    """Why the port is shut at `pickup_at`, or None when it is open.
-
-    Mirrors the crew app's getPortStatus so the client and the API agree on
-    what "closed" means. A port with no configured hours is treated as always
-    open — never block a booking because the rules are simply unset.
-    """
-    days = _normalize_working_days(working_days)
-    if days and _WEEKDAY_ABBR[pickup_at.weekday()] not in days:
-        return "The port is closed on %s." % pickup_at.strftime("%A")
-
-    try:
-        opening = _minutes_from_hhmm(opening_time) if opening_time else None
-        closing = _minutes_from_hhmm(closing_time) if closing_time else None
-    except ValueError:
-        # A malformed configured time must never block a booking.
-        logger.warning(
-            "Port timing is not HH:MM (opening=%r closing=%r) — skipping the hours check",
-            opening_time,
-            closing_time,
-        )
-        return None
-
-    if opening is None and closing is None:
-        return None
-
-    pickup_minutes = pickup_at.hour * 60 + pickup_at.minute
-
-    if opening is not None and closing is not None:
-        # Ports that close after midnight (open 06:00, close 02:00) run past the
-        # end of the day, so shift the close and any early-morning pickup into
-        # the same continuous window.
-        if closing <= opening:
-            closing += 24 * 60
-            if pickup_minutes < opening:
-                pickup_minutes += 24 * 60
-        if pickup_minutes < opening:
-            return "The port opens at %s. Cab booking is available after that." % opening_time[:5]
-        if pickup_minutes >= closing:
-            return "The port closed at %s. Cab booking is unavailable until it reopens." % closing_time[:5]
-        return None
-
-    if opening is not None and pickup_minutes < opening:
-        return "The port opens at %s. Cab booking is available after that." % opening_time[:5]
-    if closing is not None and pickup_minutes >= closing:
-        return "The port closed at %s. Cab booking is unavailable until it reopens." % closing_time[:5]
-    return None
 
 
 def _planned_return_is_after_closing(
@@ -833,12 +754,19 @@ def get_crew_profile(
     return profile
 
 class SOSConfigIn(BaseModel):
-    sos_email: str
+    sos_email: EmailStr
 
 class SOSTriggerIn(BaseModel):
-    port_name: str
-    lat: Optional[float] = None
-    lng: Optional[float] = None
+    trip_id: str = Field(min_length=1, max_length=64)
+    lat: float = Field(ge=-90, le=90)
+    lng: float = Field(ge=-180, le=180)
+
+
+class SosEligibilityOut(BaseModel):
+    eligible: bool
+    reason: Optional[str] = None
+    trip_id: Optional[str] = None
+    email_configured: bool
 
 class SosActiveOut(BaseModel):
     active: bool
@@ -849,6 +777,7 @@ class SosActiveOut(BaseModel):
     vessel: Optional[str] = None
     lat: Optional[float] = None
     lng: Optional[float] = None
+    trip_id: Optional[str] = None
 
 class SosCancelOut(BaseModel):
     status: str
@@ -870,7 +799,7 @@ def update_sos_config(
     if not profile:
         raise HTTPException(status_code=404, detail="Crew profile not found")
         
-    profile.sos_email = body.sos_email
+    profile.sos_email = str(body.sos_email).strip()
     try:
         db.commit()
     except Exception as e:
@@ -878,6 +807,51 @@ def update_sos_config(
         raise HTTPException(status_code=500, detail=str(e))
         
     return {"message": "SOS config updated successfully", "sos_email": profile.sos_email}
+
+
+def _active_sos_booking(db: Session, crew_profile_id: int) -> Optional[CabBooking]:
+    from app.db.models.cab_booking import BookingStatus
+
+    return (
+        db.query(CabBooking)
+        .filter(
+            CabBooking.crew_id == crew_profile_id,
+            CabBooking.status.in_([
+                BookingStatus.DRIVER_ASSIGNED,
+                BookingStatus.DRIVER_ACCEPTED,
+                BookingStatus.ON_TRIP,
+            ]),
+        )
+        .order_by(CabBooking.created_at.desc())
+        .first()
+    )
+
+
+@router.get("/sos/eligibility", response_model=SosEligibilityOut)
+def get_sos_eligibility(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if current_user.role != "crew":
+        raise HTTPException(status_code=403, detail="Only crew can check SOS eligibility")
+    profile = db.query(CrewProfile).filter(CrewProfile.user_id == current_user.id).first()
+    if not profile:
+        raise HTTPException(status_code=404, detail="Crew profile not found")
+
+    email_configured = bool((current_user.email or "").strip() and (profile.sos_email or "").strip())
+    active_booking = _active_sos_booking(db, profile.id)
+    reason = None
+    if not email_configured:
+        reason = "A crew email and ship SOS email are required."
+    elif active_booking is None:
+        reason = "SOS is available only when you have an active trip."
+
+    return {
+        "eligible": reason is None,
+        "reason": reason,
+        "trip_id": active_booking.booking_id if active_booking else None,
+        "email_configured": email_configured,
+    }
 
 @router.get("/sos/active", response_model=SosActiveOut)
 def get_active_sos(
@@ -904,6 +878,7 @@ def get_active_sos(
         "vessel": active.vessel,
         "lat": active.lat,
         "lng": active.lng,
+        "trip_id": active.trip_id,
     }
 
 @router.post("/sos/cancel", response_model=SosCancelOut)
@@ -953,15 +928,28 @@ def trigger_sos(
 
     active = db.query(CrewSos).filter(
         CrewSos.user_id == current_user.id,
-        CrewSos.status == "ACTIVE",
+        CrewSos.status.in_(["ACTIVE", "ACKNOWLEDGED"]),
     ).order_by(CrewSos.created_at.desc()).first()
     if active:
         raise HTTPException(status_code=409, detail="An active SOS request already exists")
-    
-    if not profile.sos_email:
-        raise HTTPException(status_code=400, detail="SOS Email not configured")
 
-    port_name = body.port_name or profile.current_port
+    if not (current_user.email or "").strip():
+        raise HTTPException(status_code=400, detail="Crew email is required for SOS")
+    if not (profile.sos_email or "").strip():
+        raise HTTPException(status_code=400, detail="Ship SOS email is not configured")
+
+    # Resolve the trip from the authenticated crew profile. Never trust a
+    # client-provided trip id by itself: it must belong to this crew and remain
+    # in one of the pre-existing active SOS statuses.
+    active_booking = _active_sos_booking(db, profile.id)
+    requested_trip_id = body.trip_id.strip()
+    if active_booking is None or active_booking.booking_id != requested_trip_id:
+        raise HTTPException(
+            status_code=400,
+            detail="SOS requires an existing active trip belonging to this crew member",
+        )
+
+    port_name = active_booking.port or profile.current_port
 
     # 1. Ship Email
     recipients = [profile.sos_email]
@@ -987,6 +975,10 @@ def trigger_sos(
     new_sos = CrewSos(
         user_id=current_user.id,
         crew_profile_id=profile.id,
+        cab_booking_id=active_booking.id,
+        trip_id=active_booking.booking_id,
+        crew_email=current_user.email.strip(),
+        sos_email=profile.sos_email.strip(),
         port_name=port_name,
         vessel=profile.vessel,
         lat=body.lat,
@@ -1029,6 +1021,7 @@ def trigger_sos(
         reporter_name=profile.full_name or current_user.name,
         reporter_role=profile.rank,
         reporter_id=profile.hpid or profile.passport_number,
+        trip_id=active_booking.booking_id,
     )
     db.add(new_incident)
     
@@ -1039,7 +1032,6 @@ def trigger_sos(
         raise HTTPException(status_code=500, detail=f"Failed to record SOS: {str(e)}")
 
     try:
-        from app.db.models.cab_booking import BookingStatus
         from app.services.whatsapp import (
             notify_sos_crew_in_danger,
             notify_sos_crew_and_admin,
@@ -1051,25 +1043,11 @@ def trigger_sos(
 
         location_str = _fmt_location(body.lat, body.lng)
 
-        active_booking = (
-            db.query(CabBooking)
-            .filter(
-                CabBooking.crew_id == profile.id,
-                CabBooking.status.in_([
-                    BookingStatus.DRIVER_ASSIGNED,
-                    BookingStatus.DRIVER_ACCEPTED,
-                    BookingStatus.ON_TRIP,
-                ]),
-            )
-            .order_by(CabBooking.created_at.desc())
-            .first()
-        )
-
         # 1. Crew member themselves — always fires
         notify_sos_crew_in_danger(current_user.mobile_number)
 
         # 2. Port-assigned agent + all superadmins with a phone on file (additive)
-        trip_id_for_admin = active_booking.booking_id if active_booking else "N/A"
+        trip_id_for_admin = active_booking.booking_id
         agent_profile = (
             db.query(AgentProfile)
             .filter(AgentProfile.assigned_port == port_name)
@@ -1110,18 +1088,15 @@ def trigger_sos(
                 profile.full_name, profile.vessel or "N/A", location_str,
             )
 
-        # 3. Aggregator on the active booking, if any — no active booking, no send
-        if active_booking:
-            provider_profile = active_booking.provider or active_booking.aggregator
-            if provider_profile and provider_profile.user:
-                notify_sos_aggregator(
-                    provider_profile.user.mobile_number,
-                    active_booking.booking_id, location_str,
-                    datetime.now().strftime("%I:%M:%S %p"),
-                    lat=body.lat, lng=body.lng,
-                )
-        else:
-            logger.info("SOS aggregator notify skipped — no active booking for crew_profile_id=%s", profile.id)
+        # 3. Aggregator on the verified active booking, if any.
+        provider_profile = active_booking.provider or active_booking.aggregator
+        if provider_profile and provider_profile.user:
+            notify_sos_aggregator(
+                provider_profile.user.mobile_number,
+                active_booking.booking_id, location_str,
+                datetime.now().strftime("%I:%M:%S %p"),
+                lat=body.lat, lng=body.lng,
+            )
     except Exception:
         logger.exception("WhatsApp SOS notify failed for user %s", current_user.id)
 
@@ -1130,6 +1105,7 @@ def trigger_sos(
         "message": "SOS Alert sent to all recipients",
         "recipients_count": len(set(recipients)),
         "incident_id": incident_id,
+        "trip_id": active_booking.booking_id,
     }
 
 @router.post("/feedback")
@@ -1851,6 +1827,96 @@ def get_ride_availability(
     return compute_availability(db, port_value)
 
 
+class PickupAvailabilityOut(BaseModel):
+    available: bool
+    reason: Optional[str] = None
+    timezone: str
+    server_time: datetime
+    port_date: str
+    port_time: str
+    port_day: str
+    suggested_pickup_date: str
+    suggested_pickup_time: str
+    opening_time: Optional[str] = None
+    closing_time: Optional[str] = None
+
+
+def _pickup_availability(
+    db: Session,
+    port_value: Optional[str],
+    scheduled_time: Optional[datetime],
+    trip_type: str,
+) -> dict:
+    rule = _port_rule_for(db, port_value)
+    configured_timezone = rule.timezone if rule else None
+    clock = port_clock_snapshot(port_value, configured_timezone)
+    port_now = clock["port_now"]
+
+    # Coordinated transfers default to the configured advance-booking buffer;
+    # package trips start at the current authoritative port time.
+    buffer_minutes = max(0, int(rule.advance_booking_buffer_minutes or 0)) if rule else 30
+    suggested_pickup = port_now + timedelta(
+        minutes=0 if trip_type == "package_trip" else buffer_minutes
+    )
+    # Package exploration always means "leave now". Ignore any client-supplied
+    # scheduled time so a crafted request cannot move the server clock forward
+    # past the port's opening time.
+    pickup_at = (
+        as_port_local(scheduled_time, clock["zone"])
+        if trip_type == "coordinated_transfer" and scheduled_time is not None
+        else suggested_pickup
+    )
+
+    reason = None
+    if trip_type == "coordinated_transfer" and scheduled_time is not None and pickup_at < port_now:
+        reason = "Pickup time cannot be earlier than the current port time."
+    elif rule:
+        reason = _port_closed_reason(
+            pickup_at,
+            rule.opening_time,
+            rule.closing_time,
+            rule.working_days,
+        )
+
+    return {
+        "available": reason is None,
+        "reason": reason,
+        "timezone": clock["timezone"],
+        "server_time": clock["server_time"],
+        "port_date": clock["port_date"],
+        "port_time": clock["port_time"],
+        "port_day": clock["port_day"],
+        "suggested_pickup_date": suggested_pickup.strftime("%Y-%m-%d"),
+        "suggested_pickup_time": suggested_pickup.strftime("%H:%M"),
+        "opening_time": rule.opening_time if rule else None,
+        "closing_time": rule.closing_time if rule else None,
+        "pickup_at": pickup_at,
+    }
+
+
+@router.get("/cab/pickup-availability", response_model=PickupAvailabilityOut)
+def get_pickup_availability(
+    port: Optional[str] = None,
+    scheduled_time: Optional[datetime] = None,
+    trip_type: str = "coordinated_transfer",
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if current_user.role != "crew":
+        raise HTTPException(status_code=403, detail="Only crew can check pickup availability")
+    if trip_type not in {"coordinated_transfer", "package_trip"}:
+        raise HTTPException(status_code=400, detail="Invalid trip type")
+    profile = db.query(CrewProfile).filter(CrewProfile.user_id == current_user.id).first()
+    if not profile:
+        raise HTTPException(status_code=404, detail="Crew profile not found")
+    return _pickup_availability(
+        db,
+        profile.current_port or port,
+        scheduled_time,
+        trip_type,
+    )
+
+
 @router.post("/cab/book", response_model=CabBookingCreateOut)
 def book_cab(
     body: CabBookingCreateIn,
@@ -1871,10 +1937,15 @@ def book_cab(
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid ride type")
 
-    port_value = body.port or profile.current_port
+    # Current port is maintained on the authenticated crew profile. Treat it
+    # as authoritative so changing a request/local-storage port cannot select
+    # a looser set of opening hours.
+    port_value = profile.current_port or body.port
     resolved_trip_type = body.trip_type or (
         "package_trip" if body.scheduled_time is None else "coordinated_transfer"
     )
+    if resolved_trip_type not in {"coordinated_transfer", "package_trip"}:
+        raise HTTPException(status_code=400, detail="Invalid trip type")
 
     if resolved_trip_type == "coordinated_transfer":
         if body.scheduled_time is None:
@@ -1883,21 +1954,19 @@ def book_cab(
                 detail="Scheduled pickup time is required for a coordinated transfer",
             )
 
-    # Cab booking is only available while the port is open. Checked against the
-    # pickup time rather than "now", so a ride cannot be scheduled into a window
-    # when the port has already shut. The crew app hides the entry point too,
-    # but that is a convenience — this is the gate that actually holds.
-    booking_port_rule = _port_rule_for(db, port_value)
-    if booking_port_rule:
-        pickup_at = body.scheduled_time or datetime.utcnow()
-        closed_reason = _port_closed_reason(
-            pickup_at,
-            booking_port_rule.opening_time,
-            booking_port_rule.closing_time,
-            booking_port_rule.working_days,
-        )
-        if closed_reason:
-            raise HTTPException(status_code=400, detail=closed_reason)
+    # The API is the authority for all clock decisions. Coordinated transfers
+    # validate the selected pickup in the port's timezone; package trips use
+    # the server's current port-local time. A changed phone clock cannot bypass
+    # this gate.
+    pickup_availability = _pickup_availability(
+        db,
+        port_value,
+        body.scheduled_time,
+        resolved_trip_type,
+    )
+    if not pickup_availability["available"]:
+        raise HTTPException(status_code=400, detail=pickup_availability["reason"])
+    pickup_at = pickup_availability["pickup_at"]
 
     if resolved_trip_type == "coordinated_transfer" and body.planned_return:
         try:
@@ -1928,7 +1997,7 @@ def book_cab(
         closing_time = port_rule.closing_time if port_rule else None
         try:
             return_before_pickup = _planned_return_is_before_pickup(
-                body.scheduled_time,
+                pickup_at,
                 body.planned_return,
                 closing_time,
             )
@@ -1936,7 +2005,7 @@ def book_cab(
             # A malformed configured closing time must not disable the basic
             # same-day ordering check.
             return_before_pickup = _planned_return_is_before_pickup(
-                body.scheduled_time,
+                pickup_at,
                 body.planned_return,
             )
 
@@ -1949,7 +2018,7 @@ def book_cab(
         if port_rule and port_rule.closing_time:
             try:
                 return_after_closing = _planned_return_is_after_closing(
-                    body.scheduled_time,
+                    pickup_at,
                     body.planned_return,
                     port_rule.closing_time,
                 )
