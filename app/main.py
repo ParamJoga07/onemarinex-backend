@@ -144,6 +144,7 @@ def on_startup():
     ensure_magic_link_hardening_schema()
     ensure_port_time_and_sos_context_schema()
     ensure_vendor_commission_schema()
+    ensure_placeholder_helplines_removed()
     ensure_alembic_baseline()
     _log_whatsapp_config()
     _log_chat_moderation_config()
@@ -501,6 +502,49 @@ def ensure_vendor_commission_schema():
     except Exception:
         log.exception(
             "ensure_vendor_commission_schema failed — vendor ranking may be degraded"
+        )
+
+
+def ensure_placeholder_helplines_removed():
+    """Remove retired demo helplines when no pre-deploy job is configured.
+
+    Alembic remains canonical. This idempotent startup guard mirrors the other
+    deployment fallbacks in this module because the checked-in Procfile starts
+    only the web process and does not run Alembic itself.
+    """
+    log = logging.getLogger("app.startup")
+    placeholders = {
+        "placeholder_one": "+91 1800-HEYPORTS",
+        "placeholder_two": "+91 1800 425 1234",
+    }
+    try:
+        inspector = inspect(engine)
+        tables = set(inspector.get_table_names())
+        targets = []
+        for table_name in ("cab_bookings", "port_rules"):
+            if table_name not in tables:
+                continue
+            columns = {
+                column["name"] for column in inspector.get_columns(table_name)
+            }
+            if "helpline_number" in columns:
+                targets.append(table_name)
+
+        cleared = 0
+        with engine.begin() as connection:
+            for table_name in targets:
+                result = connection.execute(
+                    text(
+                        f"UPDATE {table_name} SET helpline_number = NULL "
+                        "WHERE helpline_number IN (:placeholder_one, :placeholder_two)"
+                    ),
+                    placeholders,
+                )
+                cleared += max(result.rowcount or 0, 0)
+        log.info("retired helpline cleanup verified (cleared=%s)", cleared)
+    except Exception:
+        log.exception(
+            "ensure_placeholder_helplines_removed failed — retired demo helplines may remain visible"
         )
 
 def ensure_alembic_baseline():
