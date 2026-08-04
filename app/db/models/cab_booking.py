@@ -90,7 +90,9 @@ class CabBooking(Base):
     driver_plate = Column(String, nullable=True)
     aggregator_name = Column(String, nullable=True)
     agent_number = Column(String, default="+91 9876543251")
-    helpline_number = Column(String, default="+91 1800-HEYPORTS")
+    # Set per booking from the port's configured helpline. Readers fall back to
+    # agent_number, so there is deliberately no placeholder default here.
+    helpline_number = Column(String, nullable=True)
     otp = Column(String(10), nullable=True)
     arrived_at = Column(DateTime(timezone=True), nullable=True)
     started_at = Column(DateTime(timezone=True), nullable=True)

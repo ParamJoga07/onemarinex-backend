@@ -138,14 +138,33 @@ class PickupAvailabilityTests(unittest.TestCase):
             advance_booking_buffer_minutes=30,
         )
 
-    def availability(self, scheduled_time, trip_type):
+    def availability(
+        self,
+        scheduled_time,
+        trip_type,
+        direction="to_city",
+        port_name="Port of Visakhapatnam",
+    ):
         with (
             patch.object(routes_crew, "_port_rule_for", return_value=self.rule),
             patch.object(routes_crew, "port_clock_snapshot", return_value=self.clock),
+            patch.object(
+                routes_crew,
+                "resolve_port_for_pricing",
+                return_value=SimpleNamespace(name=port_name),
+            ),
         ):
             return routes_crew._pickup_availability(
-                object(), "port_visakhapatnam", scheduled_time, trip_type
+                object(), "port_visakhapatnam", scheduled_time, trip_type, direction
             )
+
+    def move_port_clock_to(self, hour, minute):
+        self.port_now = self.port_now.replace(hour=hour, minute=minute)
+        self.clock.update(
+            server_time=self.port_now.astimezone(timezone.utc),
+            port_now=self.port_now,
+            port_time=self.port_now.strftime("%H:%M"),
+        )
 
     def test_coordinated_pickup_uses_selected_port_wall_time(self):
         before_open = self.availability(
@@ -157,6 +176,84 @@ class PickupAvailabilityTests(unittest.TestCase):
 
         self.assertFalse(before_open["available"])
         self.assertTrue(at_open["available"])
+
+    def test_return_leg_is_allowed_after_the_port_has_closed(self):
+        self.move_port_clock_to(19, 0)
+
+        to_city = self.availability(
+            datetime(2026, 8, 3, 19, 30), "coordinated_transfer"
+        )
+        return_leg = self.availability(
+            datetime(2026, 8, 3, 19, 30), "coordinated_transfer", "return_to_port"
+        )
+
+        self.assertFalse(to_city["available"])
+        self.assertTrue(return_leg["available"])
+        self.assertIsNone(return_leg["reason"])
+
+    def test_return_leg_still_rejects_a_pickup_in_the_past(self):
+        self.move_port_clock_to(19, 0)
+
+        result = self.availability(
+            datetime(2026, 8, 3, 18, 30), "coordinated_transfer", "return_to_port"
+        )
+
+        self.assertFalse(result["available"])
+        self.assertIn("earlier than the current port time", result["reason"] or "")
+
+    def test_return_destination_is_canonicalized_from_authenticated_port(self):
+        db = object()
+        with patch.object(
+            routes_crew,
+            "resolve_port_for_pricing",
+            return_value=SimpleNamespace(name="Port of Visakhapatnam"),
+        ):
+            drop = routes_crew._canonical_return_drop_address(
+                db, "port_visakhapatnam"
+            )
+
+        self.assertEqual(drop, "Port of Visakhapatnam Main Gate")
+
+    def test_availability_publishes_the_canonical_return_drop(self):
+        result = self.availability(
+            datetime(2026, 8, 3, 9, 0),
+            "coordinated_transfer",
+            "return_to_port",
+            port_name="Port of Krishnapatnam",
+        )
+
+        # The screen renders and prices against this exact string, so it must
+        # match what book_cab stores for the same port — never a hardcoded
+        # label that is wrong for every port but one.
+        self.assertEqual(
+            result["return_drop_address"], "Port of Krishnapatnam Main Gate"
+        )
+
+        # What the screen is told and what book_cab stores must not drift apart.
+        with patch.object(
+            routes_crew,
+            "resolve_port_for_pricing",
+            return_value=SimpleNamespace(name="Port of Krishnapatnam"),
+        ):
+            stored = routes_crew._canonical_return_drop_address(
+                object(), "port_krishnapatnam"
+            )
+        self.assertEqual(result["return_drop_address"], stored)
+
+    def test_to_city_leg_has_no_return_drop(self):
+        result = self.availability(
+            datetime(2026, 8, 3, 9, 0), "coordinated_transfer"
+        )
+
+        self.assertIsNone(result["return_drop_address"])
+
+    def test_unresolvable_port_yields_no_return_drop(self):
+        with patch.object(
+            routes_crew, "resolve_port_for_pricing", return_value=None
+        ):
+            result = routes_crew._return_drop_address(object(), "")
+
+        self.assertIsNone(result)
 
     def test_package_ignores_crafted_future_client_time(self):
         result = self.availability(

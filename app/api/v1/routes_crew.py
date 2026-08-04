@@ -53,6 +53,11 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 DEFAULT_TRIP_SPEED_KMPH = 28.0
 PACKAGE_CLOSING_BUFFER_MINUTES = 2 * 60
+# Which way a coordinated transfer runs. Port opening hours gate trips that
+# leave the port; a return leg ends at the gate, so crew already ashore must
+# still be able to book one — most of all once closing time has passed.
+TRANSFER_DIRECTIONS = {"to_city", "return_to_port"}
+DEFAULT_TRANSFER_DIRECTION = "to_city"
 
 
 def _port_rule_for(db: Session, port_value: Optional[str]) -> Optional[PortRule]:
@@ -320,6 +325,7 @@ class CabBookingCreateIn(BaseModel):
     otp: Optional[str] = None
     ride_type: str  # flexible_ride | guaranteed_coordinated_ride
     trip_type: Optional[str] = None  # package_trip | coordinated_transfer
+    direction: Optional[str] = None  # to_city | return_to_port
 
 class CabBookingCreateOut(BaseModel):
     booking_id: str
@@ -442,6 +448,27 @@ def resolve_port_for_pricing(db: Session, port_value: Optional[str]) -> Optional
         .filter((Port.name.ilike(normalized)) | (Port.code.ilike(normalized)))
         .first()
     )
+
+
+def _return_drop_address(db: Session, port_value: Optional[str]) -> Optional[str]:
+    """Where a return leg ends, or None when the port cannot be resolved.
+
+    The booking screen shows this and prices against it, so it must be the
+    same string the booking is stored with — never a client-side guess.
+    """
+    resolved_port = resolve_port_for_pricing(db, port_value)
+    port_label = (resolved_port.name if resolved_port else port_value or "").strip()
+    return f"{port_label} Main Gate" if port_label else None
+
+
+def _canonical_return_drop_address(db: Session, port_value: Optional[str]) -> str:
+    drop_address = _return_drop_address(db, port_value)
+    if not drop_address:
+        raise HTTPException(
+            status_code=400,
+            detail="A current port is required for a return-to-port booking",
+        )
+    return drop_address
 
 
 def map_dynamic_vehicle_type(vehicle_type: str, vehicle_name: str, passenger_count: int) -> str:
@@ -1841,6 +1868,7 @@ class PickupAvailabilityOut(BaseModel):
     suggested_pickup_time: str
     opening_time: Optional[str] = None
     closing_time: Optional[str] = None
+    return_drop_address: Optional[str] = None
 
 
 def _pickup_availability(
@@ -1848,6 +1876,7 @@ def _pickup_availability(
     port_value: Optional[str],
     scheduled_time: Optional[datetime],
     trip_type: str,
+    direction: str = DEFAULT_TRANSFER_DIRECTION,
 ) -> dict:
     rule = _port_rule_for(db, port_value)
     configured_timezone = rule.timezone if rule else None
@@ -1869,10 +1898,17 @@ def _pickup_availability(
         else suggested_pickup
     )
 
+    # A return leg is a ride back to the gate, so opening hours, closing time
+    # and non-working days must not block it. Crew stranded ashore after the
+    # gate closes are exactly the people who need this booking.
+    is_return_leg = (
+        trip_type == "coordinated_transfer" and direction == "return_to_port"
+    )
+
     reason = None
     if trip_type == "coordinated_transfer" and scheduled_time is not None and pickup_at < port_now:
         reason = "Pickup time cannot be earlier than the current port time."
-    elif rule:
+    elif rule and not is_return_leg:
         reason = _port_closed_reason(
             pickup_at,
             rule.opening_time,
@@ -1899,6 +1935,8 @@ def _pickup_availability(
         "suggested_pickup_time": suggested_pickup.strftime("%H:%M"),
         "opening_time": rule.opening_time if rule else None,
         "closing_time": rule.closing_time if rule else None,
+        # Only the return screen needs this; skip the lookup otherwise.
+        "return_drop_address": _return_drop_address(db, port_value) if is_return_leg else None,
         "pickup_at": pickup_at,
     }
 
@@ -1908,6 +1946,7 @@ def get_pickup_availability(
     port: Optional[str] = None,
     scheduled_time: Optional[datetime] = None,
     trip_type: str = "coordinated_transfer",
+    direction: str = DEFAULT_TRANSFER_DIRECTION,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -1915,6 +1954,8 @@ def get_pickup_availability(
         raise HTTPException(status_code=403, detail="Only crew can check pickup availability")
     if trip_type not in {"coordinated_transfer", "package_trip"}:
         raise HTTPException(status_code=400, detail="Invalid trip type")
+    if direction not in TRANSFER_DIRECTIONS:
+        raise HTTPException(status_code=400, detail="Invalid transfer direction")
     profile = db.query(CrewProfile).filter(CrewProfile.user_id == current_user.id).first()
     if not profile:
         raise HTTPException(status_code=404, detail="Crew profile not found")
@@ -1923,6 +1964,7 @@ def get_pickup_availability(
         profile.current_port or port,
         scheduled_time,
         trip_type,
+        direction,
     )
 
 
@@ -1956,6 +1998,17 @@ def book_cab(
     if resolved_trip_type not in {"coordinated_transfer", "package_trip"}:
         raise HTTPException(status_code=400, detail="Invalid trip type")
 
+    resolved_direction = body.direction or DEFAULT_TRANSFER_DIRECTION
+    if resolved_direction not in TRANSFER_DIRECTIONS:
+        raise HTTPException(status_code=400, detail="Invalid transfer direction")
+
+    resolved_drop_address = body.drop_address
+    if resolved_direction == "return_to_port":
+        # The return exemption must not be usable to book an arbitrary city
+        # destination outside port hours. The authenticated profile selects
+        # the port, and the server fixes the destination to its main gate.
+        resolved_drop_address = _canonical_return_drop_address(db, port_value)
+
     if resolved_trip_type == "coordinated_transfer":
         if body.scheduled_time is None:
             raise HTTPException(
@@ -1972,6 +2025,7 @@ def book_cab(
         port_value,
         body.scheduled_time,
         resolved_trip_type,
+        resolved_direction,
     )
     if not pickup_availability["available"]:
         raise HTTPException(status_code=400, detail=pickup_availability["reason"])
@@ -2089,6 +2143,7 @@ def book_cab(
     booking_id = f"CAB-{uuid.uuid4().hex[:8].upper()}"
     otp = body.otp or (profile.ride_otp if profile else None) or "1234"
     now = datetime.utcnow()
+    booking_port_rule = _port_rule_for(db, port_value)
 
     new_booking = CabBooking(
         booking_id=booking_id,
@@ -2096,7 +2151,7 @@ def book_cab(
         pickup_address=body.pickup_address,
         pickup_lat=body.pickup_lat,
         pickup_lng=body.pickup_lng,
-        drop_address=body.drop_address,
+        drop_address=resolved_drop_address,
         drop_lat=body.drop_lat,
         drop_lng=body.drop_lng,
         vehicle_type=VehicleType(resolved_vehicle_type),
@@ -2115,7 +2170,10 @@ def book_cab(
         aggregator_id=None,
         aggregator_name=None,
         agent_number="+91 9876543251",
-        helpline_number="+91 1800-HEYPORTS",
+        # The helpline is whatever the super admin configured for this port.
+        # No placeholder fallback: readers already fall back to agent_number,
+        # and a made-up number is worse than none on a 24/7 support row.
+        helpline_number=booking_port_rule.helpline_number if booking_port_rule else None,
         status=BookingStatus.PENDING_PROVIDER_RESPONSE,
     )
 
