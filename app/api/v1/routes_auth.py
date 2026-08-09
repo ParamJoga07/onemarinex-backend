@@ -1,3 +1,4 @@
+import logging
 from datetime import timedelta
 from typing import Optional
 
@@ -119,6 +120,26 @@ def signup(body: SignupIn, db: Session = Depends(get_db)):
     return AuthOut(access_token=token, refresh_token=refresh_token, role=user.role)
 
 
+
+def record_login(db: Session, *, role: str, email: str,
+                 user_id=None, driver_id=None) -> None:
+    """Log one successful login.
+
+    Deliberately swallows its own errors: an analytics row must never be the
+    reason someone cannot sign in. A failure here is logged and the login
+    proceeds.
+    """
+    from app.db.models.login_event import LoginEvent
+
+    try:
+        db.add(LoginEvent(user_id=user_id, driver_id=driver_id,
+                          role=role, email=email))
+        db.commit()
+    except Exception:
+        db.rollback()
+        logging.getLogger("app.auth").exception("could not record login event")
+
+
 @router.post("/login", response_model=AuthOut)
 def login(body: LoginIn, db: Session = Depends(get_db)):
     email = body.email.lower().strip()
@@ -134,6 +155,7 @@ def login(body: LoginIn, db: Session = Depends(get_db)):
         subject=user.email,
         expires_delta=timedelta(minutes=settings.REFRESH_TOKEN_EXPIRE_MINUTES),
     )
+    record_login(db, role=user.role, email=user.email, user_id=user.id)
     return AuthOut(
         access_token=token,
         refresh_token=refresh_token,
@@ -159,6 +181,7 @@ def login_unified(body: LoginIn, db: Session = Depends(get_db)):
             subject=user.email,
             expires_delta=timedelta(minutes=settings.REFRESH_TOKEN_EXPIRE_MINUTES),
         )
+        record_login(db, role=user.role, email=user.email, user_id=user.id)
         return {
             "access_token": token,
             "refresh_token": refresh_token,
@@ -178,6 +201,7 @@ def login_unified(body: LoginIn, db: Session = Depends(get_db)):
             subject=driver.email,
             expires_delta=timedelta(minutes=settings.REFRESH_TOKEN_EXPIRE_MINUTES),
         )
+        record_login(db, role="driver", email=driver.email, driver_id=driver.id)
         return {
             "access_token": token,
             "refresh_token": refresh_token,

@@ -7,6 +7,7 @@ GET /api/v1/itinerary/tags
 
 from __future__ import annotations
 
+import logging
 import math
 import random
 import statistics
@@ -26,9 +27,12 @@ from app.db.session import get_db
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
-from datetime import datetime
+from datetime import datetime, timedelta
 
-DAY_ABBREV = {0: "Sun", 1: "Mon", 2: "Tue", 3: "Wed", 4: "Thu", 5: "Fri", 6: "Sat"}
+# Indexed by datetime.weekday(), where Monday is 0 and Sunday is 6. This was
+# previously shifted by one day (0 -> "Sun"), so every working-days check
+# compared against the wrong day.
+DAY_ABBREV = {0: "Mon", 1: "Tue", 2: "Wed", 3: "Thu", 4: "Fri", 5: "Sat", 6: "Sun"}
 SHORT_TO_FULL = {"m": "Mon", "mon": "Mon", "t": "Tue", "tue": "Tue", "w": "Wed", "wed": "Wed", "th": "Thu", "thu": "Thu", "f": "Fri", "fri": "Fri", "sa": "Sat", "sat": "Sat", "su": "Sun", "sun": "Sun"}
 
 
@@ -65,6 +69,55 @@ def _parse_hhmm(time_str: str | None) -> tuple[int, int] | None:
         return None
 
 
+def vendor_open_during(
+    other_information: dict | None,
+    window_start: datetime,
+    window_hours: float,
+) -> bool:
+    """True if the venue is open at any point while the crew are ashore.
+
+    A stop is only worth suggesting if the crew could actually get in. Checking
+    "is it open right now" is too strict for a shore leave that runs for hours:
+    a restaurant opening at noon is a fine stop for a package starting at 10am.
+    Conversely a venue shut for the entire window should never be offered.
+
+    This deliberately does not try to schedule stops into their opening windows
+    — that needs the planner to know each stop's arrival time. It only removes
+    the ones that are impossible.
+    """
+    if not other_information or not isinstance(other_information, dict):
+        return True
+
+    window_minutes = max(1, int(round(window_hours * 60)))
+    opening = _parse_hhmm(other_information.get("open_time"))
+    closing = _parse_hhmm(other_information.get("close_time"))
+    working_days = _normalize_days(other_information.get("working_days"))
+
+    if not opening and not closing and not working_days:
+        return True
+
+    start_min = window_start.hour * 60 + window_start.minute
+    open_min = (opening[0] * 60 + opening[1]) if opening else 0
+    close_min = (closing[0] * 60 + closing[1]) if closing else 24 * 60
+    # An overnight venue (22:00-02:00) closes on the following day.
+    if close_min <= open_min:
+        close_min += 24 * 60
+
+    # Walk the window a day at a time so a multi-day or overnight shore leave
+    # is judged against each day it actually touches.
+    for day_offset in range((window_minutes // (24 * 60)) + 2):
+        day = window_start + timedelta(days=day_offset)
+        if working_days and DAY_ABBREV.get(day.weekday(), "") not in working_days:
+            continue
+        day_open = open_min + day_offset * 24 * 60
+        day_close = close_min + day_offset * 24 * 60
+        # Overlap between [start, start+window] and [open, close] on this day.
+        if day_open < start_min + window_minutes and day_close > start_min:
+            return True
+
+    return False
+
+
 def vendor_is_currently_open(other_information: dict | None) -> bool:
     if not other_information or not isinstance(other_information, dict):
         return True
@@ -91,6 +144,7 @@ def vendor_is_currently_open(other_information: dict | None) -> bool:
     return True
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
@@ -129,6 +183,11 @@ class ItinerarySuggestIn(BaseModel):
     port: Optional[str] = None
     hours: float = Field(..., gt=0, description="Total hours the user has available")
     tags: List[str] = Field(..., min_length=1, description="Activity tags the user wants")
+    start_time: Optional[str] = Field(
+        default=None,
+        description="Planned shore-leave start as HH:MM. Defaults to now. Used to "
+                    "drop venues that are shut for the whole time ashore.",
+    )
 
 
 class ItineraryStop(BaseModel):
@@ -801,9 +860,34 @@ def suggest_itinerary(body: ItinerarySuggestIn, db: Session = Depends(get_db)):
         .all()
     )
     
-    # ── 4a. Filter out currently closed facilities ──
-    # vendors = [v for v in vendors if vendor_is_currently_open(v.other_information)]
-    
+    # ── 4a. Drop venues that are shut for the whole shore leave ──
+    # This was disabled because the old check asked "is it open right now",
+    # which wrongly excluded anywhere opening later in the day. It now checks
+    # the whole window the crew are ashore.
+    window_start = datetime.now()
+    if body.start_time:
+        parsed_start = _parse_hhmm(body.start_time)
+        if parsed_start:
+            window_start = window_start.replace(
+                hour=parsed_start[0], minute=parsed_start[1], second=0, microsecond=0
+            )
+
+    open_vendors = [
+        v for v in vendors
+        if vendor_open_during(v.other_information, window_start, body.hours)
+    ]
+    # Never return an empty plan purely because opening hours are misconfigured;
+    # fall back to the unfiltered list rather than showing the crew nothing.
+    if open_vendors:
+        vendors = open_vendors
+    else:
+        logger.warning(
+            "Every vendor at port %s looks closed for a %sh shore leave from %s; "
+            "ignoring opening hours for this suggestion.",
+            port.id, body.hours, window_start.strftime("%Y-%m-%d %H:%M"),
+        )
+
+
     if not vendors:
         return ItinerarySuggestOut(
             port_id=port.id,
