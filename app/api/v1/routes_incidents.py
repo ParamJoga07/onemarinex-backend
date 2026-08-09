@@ -524,7 +524,8 @@ def agent_safety_summary(
     from app.db.models.crew_profile import CrewProfile
 
     hpids, _ = _agent_hpids_and_vessels(db, current_user.id)
-    today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    from app.services.port_time import agent_port_day
+    today_start, today_end, _ = agent_port_day(db, current_user)
 
     active_sos = 0
     avg_response_seconds = None
@@ -562,6 +563,7 @@ def agent_safety_summary(
             Incident.status == IncidentStatus.RESOLVED,
             Incident.resolved_at.isnot(None),
             Incident.resolved_at >= today_start,
+            Incident.resolved_at < today_end,
         ).count()
 
     return {

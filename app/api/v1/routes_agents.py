@@ -298,16 +298,23 @@ def get_dashboard_data(
         ).count()
 
     # Trips (Cab Bookings) — this agent's crew only.
-    today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    # "Today" is the port's day, not UTC's: UTC midnight is 05:30 IST, so this
+    # counted from yesterday afternoon and reset mid-morning.
+    from app.services.port_time import agent_port_day
+    today_start, today_end, _ = agent_port_day(db, current_user)
     todays_trips_count = 0
     trips_in_progress_count = 0
     active_trips_count = 0
     live_trips_data = []
     if crew_profile_ids:
         agent_trips = db.query(CabBooking).filter(CabBooking.crew_id.in_(crew_profile_ids))
-        todays_trips_count = agent_trips.filter(CabBooking.created_at >= today_start).count()
+        todays_trips_count = agent_trips.filter(
+            CabBooking.created_at >= today_start,
+            CabBooking.created_at < today_end,
+        ).count()
         trips_in_progress_count = agent_trips.filter(
             CabBooking.created_at >= today_start,
+            CabBooking.created_at < today_end,
             CabBooking.status.in_(LIVE_TRIP_STATUSES),
         ).count()
         # "Active trips" is every trip underway right now, regardless of the day
@@ -868,15 +875,14 @@ def shore_leave_report(
     if not vessel:
         raise HTTPException(status_code=404, detail="Vessel not found")
 
-    if report_date:
-        try:
-            day = datetime.strptime(report_date, "%Y-%m-%d")
-        except ValueError:
-            raise HTTPException(status_code=400, detail="report_date must be YYYY-MM-DD")
-    else:
-        day = datetime.utcnow()
-    day_start = day.replace(hour=0, minute=0, second=0, microsecond=0)
-    day_end = day_start + timedelta(days=1)
+    # The reporting day is the port's calendar day. report_date arrives as the
+    # agent typed it, on their calendar — not UTC's. The window is returned as
+    # UTC instants, which is what every timestamp column is compared against.
+    from app.services.port_time import agent_port_day
+    try:
+        day_start, day_end, resolved_date = agent_port_day(db, current_user, report_date)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="report_date must be YYYY-MM-DD")
 
     manifest = db.query(VesselCrew).filter(VesselCrew.vessel_id == vessel.id).all()
     hp_ids = [c.hp_id for c in manifest if c.hp_id]
@@ -930,7 +936,7 @@ def shore_leave_report(
                    if vessel.agent and getattr(vessel.agent, "agent_profile", None) else None),
         agency_name=agent_profile.agency_name if agent_profile else vessel.agency_name,
         agency_logo_url=agent_profile.agency_logo_url if agent_profile else None,
-        report_date=day_start.strftime("%Y-%m-%d"),
+        report_date=resolved_date,
         generated_at=datetime.utcnow(),
         crew_onboard=len(manifest),
         eligible_for_shore_leave=sum(1 for c in manifest if c.shore_pass_eligible),

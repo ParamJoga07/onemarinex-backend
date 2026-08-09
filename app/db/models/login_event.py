@@ -3,6 +3,7 @@ from datetime import datetime
 from sqlalchemy import Column, DateTime, ForeignKey, Integer, String
 
 from app.db.base import Base
+from app.db.types import UTCDateTime
 
 
 class LoginEvent(Base):
@@ -29,7 +30,7 @@ class LoginEvent(Base):
     role = Column(String(32), nullable=False, index=True)
     email = Column(String(255), nullable=True)
 
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+    created_at = Column(UTCDateTime, default=datetime.utcnow, nullable=False, index=True)
 
     def __repr__(self) -> str:
         return f"<LoginEvent id={self.id} role={self.role} at={self.created_at}>"
