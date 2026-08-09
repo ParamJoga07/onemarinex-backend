@@ -144,6 +144,7 @@ def on_startup():
     ensure_magic_link_hardening_schema()
     ensure_port_time_and_sos_context_schema()
     ensure_vendor_commission_schema()
+    ensure_agent_dashboard_schema()
     ensure_placeholder_helplines_removed()
     ensure_alembic_baseline()
     _log_whatsapp_config()
@@ -502,6 +503,89 @@ def ensure_vendor_commission_schema():
     except Exception:
         log.exception(
             "ensure_vendor_commission_schema failed — vendor ranking may be degraded"
+        )
+
+
+
+def ensure_agent_dashboard_schema():
+    """Additive safety net for the agent dashboard work.
+
+    Mirrors migrations w1c2d3e4f5g6, x1c2d3e4f5g6 and y1c2d3e4f5g6, the same way
+    the guards above mirror theirs. `create_all()` covers the two new tables
+    because it creates missing tables, but it never ALTERs an existing one, so
+    these columns would otherwise be absent until a pre-deploy job runs — and
+    every incident query selects `incidents.vessel_id`.
+
+    Alembic remains canonical. This exists so a deploy that starts before the
+    migration job cannot leave the API returning UndefinedColumn.
+    """
+    log = logging.getLogger("app.startup")
+    try:
+        inspector = inspect(engine)
+        tables = set(inspector.get_table_names())
+
+        statements = []
+
+        if "incidents" in tables:
+            columns = {c["name"] for c in inspector.get_columns("incidents")}
+            for name, ddl in (
+                ("vessel_id", "INTEGER"),
+                ("category", "VARCHAR(64)"),
+                ("sub_category", "VARCHAR(64)"),
+                ("severity", "VARCHAR(16)"),
+                ("resolved_at", "TIMESTAMP"),
+                ("cancelled_at", "TIMESTAMP"),
+            ):
+                if name not in columns:
+                    statements.append(
+                        f"ALTER TABLE incidents ADD COLUMN IF NOT EXISTS {name} {ddl}"
+                    )
+            statements.append(
+                "CREATE INDEX IF NOT EXISTS ix_incidents_vessel_id ON incidents (vessel_id)"
+            )
+            # Same constraint the migration creates. Named so the two agree and
+            # whichever runs second is a no-op.
+            fks = {fk.get("name") for fk in inspector.get_foreign_keys("incidents")}
+            if "fk_incidents_vessel_id" not in fks and "vessels" in tables:
+                statements.append(
+                    "ALTER TABLE incidents ADD CONSTRAINT fk_incidents_vessel_id "
+                    "FOREIGN KEY (vessel_id) REFERENCES vessels (id) ON DELETE SET NULL"
+                )
+            statements.append(
+                "CREATE INDEX IF NOT EXISTS ix_incidents_category ON incidents (category)"
+            )
+
+        if "agent_profiles" in tables:
+            columns = {c["name"] for c in inspector.get_columns("agent_profiles")}
+            if "agency_logo_url" not in columns:
+                statements.append(
+                    "ALTER TABLE agent_profiles ADD COLUMN IF NOT EXISTS agency_logo_url VARCHAR(512)"
+                )
+
+        if "vessels" in tables:
+            columns = {c["name"] for c in inspector.get_columns("vessels")}
+            if "shore_pass_valid_upto" not in columns:
+                statements.append(
+                    "ALTER TABLE vessels ADD COLUMN IF NOT EXISTS shore_pass_valid_upto TIMESTAMP WITH TIME ZONE"
+                )
+
+        with engine.begin() as connection:
+            for statement in statements:
+                connection.execute(text(statement))
+
+        # ALTER TYPE ... ADD VALUE cannot run inside a transaction block before
+        # Postgres 12, so it goes on its own autocommit connection rather than
+        # sharing the block above.
+        with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as connection:
+            connection.execute(
+                text("ALTER TYPE incidentstatus ADD VALUE IF NOT EXISTS 'CANCELLED'")
+            )
+
+        log.info("agent dashboard schema verified (%s statement(s))", len(statements))
+    except Exception:
+        log.exception(
+            "ensure_agent_dashboard_schema failed — incident, vessel and agent "
+            "profile endpoints may return UndefinedColumn until migrations run"
         )
 
 
