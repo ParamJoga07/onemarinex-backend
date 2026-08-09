@@ -2,6 +2,7 @@ from datetime import datetime
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File
 from pydantic import BaseModel
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 from app.db.session import get_db
 from app.db.models.vessel import Vessel
@@ -89,149 +90,209 @@ class VesselIn(BaseModel):
 import csv
 import io
 
-@router.post("/{vessel_id}/crew/upload")
-def upload_crew_manifest(vessel_id: int, file: UploadFile = File(...), current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    vessel = db.query(Vessel).filter(Vessel.id == vessel_id, Vessel.agent_id == current_user.id).first()
+class ManifestCrewRowOut(BaseModel):
+    name: str
+    rank: Optional[str] = None
+    nationality: Optional[str] = None
+    passport_number: Optional[str] = None
+    shore_pass_eligible: bool = False
+    shore_pass_valid_upto: Optional[datetime] = None
+
+
+class ManifestPreviewOut(BaseModel):
+    count: int
+    source: str
+    warnings: List[str] = []
+    crew: List[ManifestCrewRowOut] = []
+
+
+class ManifestConfirmIn(BaseModel):
+    crew: List[ManifestCrewRowOut]
+
+
+def _agent_vessel_or_404(db: Session, vessel_id: int, current_user: User) -> Vessel:
+    if current_user.role == "superadmin":
+        vessel = db.query(Vessel).filter(Vessel.id == vessel_id).first()
+    else:
+        vessel = db.query(Vessel).filter(
+            Vessel.id == vessel_id, Vessel.agent_id == current_user.id
+        ).first()
     if not vessel:
         raise HTTPException(status_code=404, detail="Vessel not found")
-    
-    filename = file.filename.lower()
-    if not filename.endswith('.csv'):
-        raise HTTPException(status_code=400, detail="Only CSV manifest files are supported at this time.")
-        
-    try:
-        contents = file.file.read()
-        decoded = contents.decode('utf-8')
-    except UnicodeDecodeError:
-        try:
-            decoded = contents.decode('latin-1')
-        except Exception:
-            raise HTTPException(status_code=400, detail="Could not decode CSV file. Please ensure it is saved with UTF-8 encoding.")
-            
-    csv_file = io.StringIO(decoded)
-    reader = csv.reader(csv_file)
-    
-    try:
-        headers = next(reader)
-    except StopIteration:
-        raise HTTPException(status_code=400, detail="CSV file is empty")
-        
-    headers = [h.strip().lower() for h in headers]
-    
-    def find_col(possible_names):
-        for name in possible_names:
-            if name in headers:
-                return headers.index(name)
-        return -1
-        
-    name_idx = find_col(["name", "full name", "crew name", "member name"])
-    passport_idx = find_col(["passport number", "passport", "passport no", "passport_number", "passportno"])
-    rank_idx = find_col(["rank", "designation", "role"])
-    nat_idx = find_col(["nationality", "country", "nat"])
-    eligible_idx = find_col(["shore pass allowed or not?", "shore pass allowed", "eligible", "shore_pass_eligible", "allowed", "shore pass allowed or not", "shore pass allowed or not ?"])
-    valid_idx = find_col(["shore pass valid upto", "shore_pass_valid_upto", "valid upto", "validity", "expires", "valid until"])
-    
-    if name_idx == -1 or passport_idx == -1 or rank_idx == -1:
-        raise HTTPException(
-            status_code=400, 
-            detail=f"Required columns (Name, Passport number, Rank) not found in CSV. Found columns: {', '.join(headers)}"
-        )
-        
-    agent_profile = current_user.agent_profile
-    port = agent_profile.assigned_port if agent_profile else None
-    
-    added_count = 0
-    for row in reader:
-        if not row or len(row) <= max(name_idx, passport_idx, rank_idx):
+    return vessel
+
+
+def _save_manifest_rows(db: Session, vessel: Vessel, rows, port: Optional[str]) -> int:
+    """Upsert parsed manifest rows onto a vessel's crew list.
+
+    Kept separate from parsing so the agent can review what was read before any
+    of it is written. Matching is on passport number or generated HPID, so
+    re-uploading a corrected manifest updates crew rather than duplicating them.
+    """
+    saved = 0
+    for row in rows:
+        name = (row.name or "").strip()
+        if not name:
             continue
-            
-        name = row[name_idx].strip()
-        passport_number = row[passport_idx].strip().upper()
-        rank = row[rank_idx].strip()
-        
-        if not name or not passport_number or not rank:
-            continue
-            
-        nationality = row[nat_idx].strip() if nat_idx != -1 and len(row) > nat_idx else None
-        
-        eligible_val = row[eligible_idx].strip().lower() if eligible_idx != -1 and len(row) > eligible_idx else "false"
-        shore_pass_eligible = eligible_val in ["true", "1", "yes", "y", "checked"]
-        
-        shore_pass_valid_upto = None
-        if valid_idx != -1 and len(row) > valid_idx:
-            date_str = row[valid_idx].strip()
-            if date_str:
-                for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d", "%d/%m/%Y %H:%M", "%d/%m/%Y"):
-                    try:
-                        shore_pass_valid_upto = datetime.strptime(date_str, fmt)
-                        break
-                    except ValueError:
-                        continue
-                        
-        generated_hpid = generate_hpid(passport_number, nationality, port)
-        
-        crew = db.query(VesselCrew).filter(
-            VesselCrew.vessel_id == vessel.id,
-            (VesselCrew.passport_number == passport_number) | (VesselCrew.hp_id == generated_hpid)
-        ).first()
-        
+        passport_number = (row.passport_number or "").strip().upper() or None
+        rank = (row.rank or "").strip() or None
+        nationality = (row.nationality or "").strip() or None
+
+        generated_hpid = generate_hpid(passport_number, nationality, port) if passport_number else None
+
+        crew = None
+        if passport_number or generated_hpid:
+            conditions = []
+            if passport_number:
+                conditions.append(VesselCrew.passport_number == passport_number)
+            if generated_hpid:
+                conditions.append(VesselCrew.hp_id == generated_hpid)
+            crew = db.query(VesselCrew).filter(
+                VesselCrew.vessel_id == vessel.id, or_(*conditions)
+            ).first()
+
+        # The shore-pass expiry belongs to the vessel, so uploaded crew inherit
+        # it rather than carrying whatever the spreadsheet happened to contain.
+        valid_upto = vessel.shore_pass_valid_upto or row.shore_pass_valid_upto
+
         if not crew:
             crew = VesselCrew(
                 vessel_id=vessel.id,
                 name=name,
-                rank=rank,
+                rank=rank or "",
                 nationality=nationality,
                 hp_id=generated_hpid,
                 passport_number=passport_number,
                 status="Pending",
-                shore_pass_eligible=shore_pass_eligible,
-                shore_pass_valid_upto=shore_pass_valid_upto
+                shore_pass_eligible=row.shore_pass_eligible,
+                shore_pass_valid_upto=valid_upto,
             )
             db.add(crew)
         else:
             crew.name = name
-            crew.rank = rank
+            crew.rank = rank or crew.rank
             crew.nationality = nationality
-            crew.hp_id = generated_hpid
-            crew.passport_number = passport_number
-            crew.shore_pass_eligible = shore_pass_eligible
-            if shore_pass_valid_upto:
-                crew.shore_pass_valid_upto = shore_pass_valid_upto
-                
-        profile = db.query(CrewProfile).filter(CrewProfile.hpid == generated_hpid).first()
+            # Never overwrite an HPID that already exists. An HPID is the
+            # identity every other record points at — incidents, SOS, shore
+            # passes, bookings all store it — so regenerating one on a
+            # re-upload silently orphans that crew member's whole history while
+            # they are still aboard.
+            crew.hp_id = crew.hp_id or generated_hpid
+            crew.passport_number = passport_number or crew.passport_number
+            crew.shore_pass_eligible = row.shore_pass_eligible
+            if valid_upto:
+                crew.shore_pass_valid_upto = valid_upto
+
+        profile = (
+            db.query(CrewProfile).filter(CrewProfile.hpid == generated_hpid).first()
+            if generated_hpid else None
+        )
         if profile:
             crew.status = "Mapped"
             agency_name = vessel.agency_name
-            if not agency_name and vessel.agent and hasattr(vessel.agent, "agent_profile") and vessel.agent.agent_profile:
+            if not agency_name and vessel.agent and getattr(vessel.agent, "agent_profile", None):
                 agency_name = vessel.agent.agent_profile.agency_name
             if is_partnered_agency(agency_name):
                 existing_pass = db.query(ShorePass).filter(
                     ShorePass.crew_profile_id == profile.id,
                     ShorePass.port_name == port,
-                    ShorePass.vessel_name == vessel.name
+                    ShorePass.vessel_name == vessel.name,
                 ).first()
                 if not existing_pass:
                     port_code = (port or "GEN").replace("port_", "")[:3].upper()
                     vessel_code = vessel.name.replace(" ", "")[:3].upper()
-                    random_suffix = uuid.uuid4().hex[:4].upper()
-                    shore_pass_id = f"SP-{port_code}-{vessel_code}-{random_suffix}"
+                    shore_pass_id = f"SP-{port_code}-{vessel_code}-{uuid.uuid4().hex[:4].upper()}"
                     port_display = (port or "General").replace("port_", "").replace("_", " ").title()
-                    agent_name = f"{port_display} Port Authority"
-                    
-                    new_pass = ShorePass(
+                    db.add(ShorePass(
                         crew_profile_id=profile.id,
-                        agent_name=agent_name,
+                        agent_name=f"{port_display} Port Authority",
                         shore_pass_id=shore_pass_id,
                         port_name=port,
                         vessel_name=vessel.name,
                         is_verified=False,
-                        status="pending"
-                    )
-                    db.add(new_pass)
-        added_count += 1
-        
+                        status="pending",
+                    ))
+        saved += 1
+
     db.commit()
-    return {"message": f"Successfully parsed and loaded {added_count} crew members.", "filename": file.filename}
+    return saved
+
+
+@router.post("/{vessel_id}/crew/manifest/preview", response_model=ManifestPreviewOut)
+async def preview_crew_manifest(
+    vessel_id: int,
+    file: UploadFile = File(...),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Read a manifest and report what was found, without saving anything.
+
+    The agent confirms the list before it reaches the crew record, so a misread
+    file — especially a scanned PDF — is caught before it does any damage.
+    """
+    from app.services.crew_manifest import ManifestError, parse_manifest
+
+    vessel = _agent_vessel_or_404(db, vessel_id, current_user)
+    data = await file.read()
+    try:
+        parsed = parse_manifest(data, file.filename or "")
+    except ManifestError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    if not parsed.crew:
+        raise HTTPException(status_code=400, detail="No crew members were found in that file.")
+
+    return ManifestPreviewOut(
+        count=len(parsed.crew),
+        source=parsed.source,
+        warnings=parsed.warnings,
+        crew=[ManifestCrewRowOut(**row.model_dump()) for row in parsed.crew],
+    )
+
+
+@router.post("/{vessel_id}/crew/manifest/confirm")
+def confirm_crew_manifest(
+    vessel_id: int,
+    body: ManifestConfirmIn,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Save the crew the agent reviewed on the preview screen."""
+    vessel = _agent_vessel_or_404(db, vessel_id, current_user)
+    if not body.crew:
+        raise HTTPException(status_code=400, detail="No crew members to save.")
+
+    agent_profile = getattr(current_user, "agent_profile", None)
+    port = agent_profile.assigned_port if agent_profile else None
+    saved = _save_manifest_rows(db, vessel, body.crew, port)
+    return {"message": f"Saved {saved} crew member{'' if saved == 1 else 's'}.", "saved": saved}
+
+
+@router.post("/{vessel_id}/crew/upload")
+async def upload_crew_manifest(
+    vessel_id: int,
+    file: UploadFile = File(...),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Parse and save in one step. Kept for callers that skip the preview."""
+    from app.services.crew_manifest import ManifestError, parse_manifest
+
+    vessel = _agent_vessel_or_404(db, vessel_id, current_user)
+    data = await file.read()
+    try:
+        parsed = parse_manifest(data, file.filename or "")
+    except ManifestError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    agent_profile = getattr(current_user, "agent_profile", None)
+    port = agent_profile.assigned_port if agent_profile else None
+    saved = _save_manifest_rows(db, vessel, parsed.crew, port)
+    return {
+        "message": f"Successfully parsed and loaded {saved} crew members.",
+        "filename": file.filename,
+    }
+
 
 @router.get("/crew/{hp_id}/profile", response_model=CrewProfileOut)
 def get_crew_profile(hp_id: str, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
@@ -275,7 +336,9 @@ class VesselOut(BaseModel):
     eta: Optional[datetime] = None
     etd: Optional[datetime] = None
     status: str
-    
+    # One expiry for the whole crew of this port call; crew may override.
+    shore_pass_valid_upto: Optional[datetime] = None
+
     class Config:
         from_attributes = True
 
@@ -503,6 +566,68 @@ def update_crew_eligibility(
     db.commit()
     db.refresh(crew)
     return crew
+
+class ShorePassValidityIn(BaseModel):
+    shore_pass_valid_upto: Optional[datetime] = None
+    # False leaves crew who already have their own date untouched, so a
+    # deliberate individual override is not silently undone.
+    apply_to_all: bool = True
+
+
+class ShorePassValidityOut(BaseModel):
+    vessel_id: int
+    shore_pass_valid_upto: Optional[datetime] = None
+    crew_updated: int
+
+
+@router.patch("/{vessel_id}/shore-pass-validity", response_model=ShorePassValidityOut)
+def set_vessel_shore_pass_validity(
+    vessel_id: int,
+    body: ShorePassValidityIn,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Set one shore-pass expiry for the whole crew of this vessel.
+
+    The date belongs to the port call, not to each person, so it is stored on
+    the vessel and pushed down to the crew manifest. Individuals can still be
+    given a different date afterwards through the per-crew endpoint; that
+    override survives until the master date is applied again.
+    """
+    if current_user.role == "agent":
+        vessel = db.query(Vessel).filter(
+            Vessel.id == vessel_id, Vessel.agent_id == current_user.id
+        ).first()
+        if not vessel:
+            raise HTTPException(status_code=404, detail="Vessel not found or unauthorized")
+    elif current_user.role == "superadmin":
+        vessel = db.query(Vessel).filter(Vessel.id == vessel_id).first()
+        if not vessel:
+            raise HTTPException(status_code=404, detail="Vessel not found")
+    else:
+        raise HTTPException(
+            status_code=403,
+            detail="Only agents or superadmins can set shore pass validity",
+        )
+
+    vessel.shore_pass_valid_upto = body.shore_pass_valid_upto
+
+    crew_query = db.query(VesselCrew).filter(VesselCrew.vessel_id == vessel.id)
+    if not body.apply_to_all:
+        crew_query = crew_query.filter(VesselCrew.shore_pass_valid_upto.is_(None))
+
+    crew_updated = crew_query.update(
+        {VesselCrew.shore_pass_valid_upto: body.shore_pass_valid_upto},
+        synchronize_session=False,
+    )
+    db.commit()
+
+    return ShorePassValidityOut(
+        vessel_id=vessel.id,
+        shore_pass_valid_upto=body.shore_pass_valid_upto,
+        crew_updated=crew_updated or 0,
+    )
+
 
 class CrewMemberUpdate(BaseModel):
     name: Optional[str] = None

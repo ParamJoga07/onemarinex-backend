@@ -22,6 +22,12 @@ class AgentProfileOut(BaseModel):
     agency_name: str
     location: str
     agent_identifier: Optional[str] = None
+    # The agent portal decides which port's rules to show from this. Without it
+    # the Port Specific Rules page had no port and rendered its empty state
+    # ("Choose a single port from the header") for every agent, permanently.
+    assigned_port: Optional[str] = None
+    profile_image: Optional[str] = None
+    agency_logo_url: Optional[str] = None
 
     class Config:
         from_attributes = True

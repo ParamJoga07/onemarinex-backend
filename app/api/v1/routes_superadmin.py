@@ -1648,3 +1648,109 @@ def admin_list_expense_bills(
             created_at=b.created_at,
         ))
     return out
+
+
+# --- Registrations & logins ------------------------------------------------
+
+# Users and drivers live in separate tables, so "everyone who registered" is the
+# union of the two. Roles are listed explicitly to give a stable column order
+# and to surface a role with zero rows rather than dropping it.
+ACCOUNT_ROLES = ["crew", "agent", "aggregator", "driver", "superadmin"]
+
+
+@router.get("/user-metrics")
+def get_user_metrics(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """How many accounts were registered, and how many logins happened.
+
+    Registrations are counted from `users.created_at` / `drivers.created_at`, so
+    they cover the whole history. Logins come from `login_events`, which did not
+    exist before this feature — there is no way to reconstruct earlier logins,
+    so the response reports when tracking began and the screen says so.
+    """
+    verify_superadmin(current_user)
+
+    from app.db.models.login_event import LoginEvent
+
+    def parse(value, label):
+        if not value:
+            return None
+        try:
+            return datetime.strptime(value, "%Y-%m-%d")
+        except ValueError:
+            raise HTTPException(status_code=400, detail=f"{label} must be YYYY-MM-DD")
+
+    start = parse(start_date, "start_date")
+    end = parse(end_date, "end_date")
+    if end:
+        # Inclusive of the whole end day, which is what a date picker implies.
+        end = end.replace(hour=23, minute=59, second=59, microsecond=999999)
+    if start and end and start > end:
+        raise HTTPException(status_code=400, detail="start_date is after end_date")
+
+    def in_range(query, column):
+        if start:
+            query = query.filter(column >= start)
+        if end:
+            query = query.filter(column <= end)
+        return query
+
+    # Registrations ---------------------------------------------------------
+    registrations = {role: 0 for role in ACCOUNT_ROLES}
+    user_rows = in_range(
+        db.query(User.role, func.count(User.id)), User.created_at
+    ).group_by(User.role).all()
+    for role, count in user_rows:
+        key = (role or "").strip().lower()
+        registrations[key] = registrations.get(key, 0) + count
+
+    driver_registrations = in_range(db.query(Driver.id), Driver.created_at).count()
+    registrations["driver"] = registrations.get("driver", 0) + driver_registrations
+
+    # Logins ----------------------------------------------------------------
+    logins = {role: 0 for role in ACCOUNT_ROLES}
+    login_rows = in_range(
+        db.query(LoginEvent.role, func.count(LoginEvent.id)), LoginEvent.created_at
+    ).group_by(LoginEvent.role).all()
+    for role, count in login_rows:
+        key = (role or "").strip().lower()
+        logins[key] = logins.get(key, 0) + count
+
+    # Distinct people, not login count — one crew member signing in 40 times is
+    # one person, and the two numbers together say whether use is broad or deep.
+    distinct_users = in_range(
+        db.query(func.count(func.distinct(LoginEvent.user_id))).filter(
+            LoginEvent.user_id.isnot(None)
+        ),
+        LoginEvent.created_at,
+    ).scalar() or 0
+    distinct_drivers = in_range(
+        db.query(func.count(func.distinct(LoginEvent.driver_id))).filter(
+            LoginEvent.driver_id.isnot(None)
+        ),
+        LoginEvent.created_at,
+    ).scalar() or 0
+
+    tracking_started = db.query(func.min(LoginEvent.created_at)).scalar()
+
+    return {
+        "roles": ACCOUNT_ROLES,
+        "registrations": {
+            "total": sum(registrations.values()),
+            "by_role": registrations,
+        },
+        "logins": {
+            "total": sum(logins.values()),
+            "by_role": logins,
+            "distinct_accounts": distinct_users + distinct_drivers,
+            # Null until the first login is recorded. The screen uses this to
+            # explain a zero rather than presenting it as a real decline.
+            "tracking_started_at": tracking_started,
+        },
+        "start_date": start_date,
+        "end_date": end_date,
+    }

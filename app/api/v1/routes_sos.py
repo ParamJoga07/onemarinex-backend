@@ -44,6 +44,36 @@ class SosAdminOut(BaseModel):
         from_attributes = True
 
 
+def _agent_crew_profile_ids(db: Session, agent_user_id: int) -> List[int]:
+    """Crew sailing on this agent's vessels.
+
+    SOS was scoped by port, which meant every agency berthed at the same port
+    could see, acknowledge and close each other's emergencies. An agent is
+    responsible for their own ships' crew, so that is the boundary.
+    """
+    from app.db.models.vessel import Vessel
+    from app.db.models.vessel_crew import VesselCrew
+    from app.db.models.crew_profile import CrewProfile
+
+    vessel_ids = [v.id for v in db.query(Vessel.id).filter(Vessel.agent_id == agent_user_id).all()]
+    if not vessel_ids:
+        return []
+    hpids = [
+        c.hp_id for c in db.query(VesselCrew.hp_id).filter(
+            VesselCrew.vessel_id.in_(vessel_ids), VesselCrew.hp_id.isnot(None)
+        ).all() if c.hp_id
+    ]
+    if not hpids:
+        return []
+    return [cp.id for cp in db.query(CrewProfile.id).filter(CrewProfile.hpid.in_(hpids)).all()]
+
+
+def _agent_may_handle(db: Session, current_user, sos: CrewSos) -> bool:
+    if current_user.role == "superadmin":
+        return True
+    return sos.crew_profile_id in _agent_crew_profile_ids(db, current_user.id)
+
+
 @router.get("/admin", response_model=List[SosAdminOut])
 def list_sos_requests(
     db: Session = Depends(get_db),
@@ -53,10 +83,15 @@ def list_sos_requests(
         raise HTTPException(status_code=403, detail="Only superadmins or agents can view SOS")
 
     if current_user.role == "agent":
-        port = current_user.agent_profile.assigned_port if current_user.agent_profile else None
-        if not port:
+        crew_ids = _agent_crew_profile_ids(db, current_user.id)
+        if not crew_ids:
             return []
-        sos_list = db.query(CrewSos).filter(CrewSos.port_name == port).order_by(CrewSos.created_at.desc()).all()
+        sos_list = (
+            db.query(CrewSos)
+            .filter(CrewSos.crew_profile_id.in_(crew_ids))
+            .order_by(CrewSos.created_at.desc())
+            .all()
+        )
     else:
         sos_list = db.query(CrewSos).order_by(CrewSos.created_at.desc()).all()
 
@@ -115,10 +150,10 @@ def get_sos_timeline(
     if not sos:
         raise HTTPException(status_code=404, detail="SOS request not found")
 
-    if current_user.role == "agent":
-        port = current_user.agent_profile.assigned_port if current_user.agent_profile else None
-        if not port or sos.port_name != port:
-            raise HTTPException(status_code=403, detail="Not authorized to view SOS for this port")
+    if not _agent_may_handle(db, current_user, sos):
+        # Same response as a missing record, so an agent cannot probe for other
+        # agencies' SOS ids.
+        raise HTTPException(status_code=404, detail="SOS request not found")
 
     events: List[SosTimelineEvent] = [
         SosTimelineEvent(
@@ -179,10 +214,10 @@ def update_sos_status(
     if not sos:
         raise HTTPException(status_code=404, detail="SOS request not found")
 
-    if current_user.role == "agent":
-        port = current_user.agent_profile.assigned_port if current_user.agent_profile else None
-        if not port or sos.port_name != port:
-            raise HTTPException(status_code=403, detail="Not authorized to update SOS for this port")
+    if not _agent_may_handle(db, current_user, sos):
+        # Same response as a missing record, so an agent cannot probe for other
+        # agencies' SOS ids.
+        raise HTTPException(status_code=404, detail="SOS request not found")
 
     status_value = body.status.strip().upper()
     if status_value not in {"ACTIVE", "ACKNOWLEDGED", "CLOSED", "CANCELLED"}:

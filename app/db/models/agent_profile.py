@@ -15,7 +15,11 @@ class AgentProfile(Base):
     gst_number = Column(String(64), nullable=True)
     license_number = Column(String(64), nullable=True)
     status = Column(String(32), server_default="Active") # Active, Inactive
+    # Two distinct images, deliberately separate:
+    #   profile_image    the contact person's photo, shown on the profile page
+    #   agency_logo_url  the agency's logo, printed on the PDF reports
     profile_image = Column(String(512), nullable=True) # URL to image
+    agency_logo_url = Column(String(512), nullable=True)
     agent_identifier = Column(String(64), nullable=True)  # e.g., "12287-28792-87258"
     auth_document_url = Column(String(512), nullable=True)
 

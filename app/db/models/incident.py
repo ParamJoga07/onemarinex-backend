@@ -9,6 +9,9 @@ class IncidentStatus(str, enum.Enum):
     ACTIVE = "ACTIVE"
     INVESTIGATING = "INVESTIGATING"
     RESOLVED = "RESOLVED"
+    # False alarms and duplicates. The detail screen has a "Cancel Incident"
+    # action, which previously had no status to move to.
+    CANCELLED = "CANCELLED"
 
 class IncidentType(str, enum.Enum):
     CREW = "CREW"
@@ -34,13 +37,61 @@ class Incident(Base):
     reporter_id = Column(String(64), nullable=True)   # e.g. HPID-19383-9282
     
     trip_id = Column(String(64), nullable=True)      # e.g. TR 101
-    
+
+    # An incident belongs to a ship. Without this the only route from an
+    # incident to a vessel was the reporter's HPID, which is indirect and fails
+    # entirely for crew who have not registered an account.
+    vessel_id = Column(Integer, ForeignKey("vessels.id", ondelete="SET NULL"), nullable=True, index=True)
+
+    # See app/services/incident_taxonomy.py — six categories, each with
+    # sub-categories. Stored as values, not labels, so wording can change.
+    category = Column(String(64), nullable=True, index=True)
+    sub_category = Column(String(64), nullable=True)
+    severity = Column(String(16), nullable=True)  # high | medium | low
+
+    resolved_at = Column(DateTime, nullable=True)
+    cancelled_at = Column(DateTime, nullable=True)
+
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     # Relationships
     aggregator = relationship("AggregatorProfile", backref="incidents")
+    vessel = relationship("Vessel")
     notes = relationship("IncidentNote", back_populates="incident", cascade="all, delete-orphan")
+    timeline = relationship(
+        "IncidentTimelineEvent",
+        back_populates="incident",
+        cascade="all, delete-orphan",
+        order_by="IncidentTimelineEvent.event_time",
+    )
+
+class IncidentTimelineEvent(Base):
+    """One entry on an incident's timeline.
+
+    The design interleaves automatic events ("Incident Received", "Under
+    Investigation") with entries an agent adds by hand. `incident_notes` cannot
+    represent that — it has no event type, no ordering intent, and no way to
+    tell a system event from a human one.
+    """
+
+    __tablename__ = "incident_timeline_events"
+
+    id = Column(Integer, primary_key=True, index=True)
+    incident_id = Column(Integer, ForeignKey("incidents.id", ondelete="CASCADE"), nullable=False, index=True)
+
+    # "system" for automatic entries, "agent" for ones a person added.
+    source = Column(String(16), nullable=False, default="system")
+    event_type = Column(String(64), nullable=False)   # reported | received | investigating | resolved | cancelled | note
+    label = Column(String(255), nullable=False)
+    detail = Column(Text, nullable=True)
+
+    actor_name = Column(String(255), nullable=True)
+    event_time = Column(DateTime, default=datetime.utcnow, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    incident = relationship("Incident", back_populates="timeline")
+
 
 class IncidentNote(Base):
     __tablename__ = "incident_notes"

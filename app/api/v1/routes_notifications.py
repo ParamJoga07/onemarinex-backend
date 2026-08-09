@@ -49,6 +49,30 @@ class NotificationCrewOut(NotificationOut):
     sos_status: Optional[str] = None
 
 
+def _agent_vessel_name(db: Session, agent_user_id: int, vessel: str) -> str:
+    """Resolve a vessel the agent actually operates, or refuse.
+
+    Matched case-insensitively on name, and on IMO number too, so picking from
+    a dropdown or typing the name both work. Returns the canonical stored name
+    so the crew feed — which matches `crew_profiles.vessel` on an exact string —
+    lines up.
+    """
+    from app.db.models.vessel import Vessel
+
+    wanted = vessel.strip()
+    owned = db.query(Vessel).filter(Vessel.agent_id == agent_user_id).all()
+    for v in owned:
+        if v.name and v.name.strip().lower() == wanted.lower():
+            return v.name
+        if v.imo_number and v.imo_number.strip().lower() == wanted.lower():
+            return v.name
+
+    raise HTTPException(
+        status_code=403,
+        detail="You can only send notifications to your own vessels.",
+    )
+
+
 @router.post("/", response_model=NotificationOut, status_code=status.HTTP_201_CREATED)
 def create_notification(
     body: NotificationCreateIn,
@@ -59,17 +83,30 @@ def create_notification(
         raise HTTPException(status_code=403, detail="Only superadmins or agents can create notifications")
 
     port_to_set = body.port_name or None
+    vessel_to_set = (body.vessel or "").strip() or None
+
     if current_user.role == "agent":
         assigned_port = current_user.agent_profile.assigned_port if current_user.agent_profile else None
         if not assigned_port:
             raise HTTPException(status_code=400, detail="Agent has no assigned port configuration.")
         port_to_set = assigned_port
 
+        # An agent notifies one of their own ships, never the whole port and
+        # never somebody else's vessel. The vessel name is what the crew feed
+        # matches on, so an unchecked value here would reach another agency's
+        # crew.
+        if not vessel_to_set:
+            raise HTTPException(
+                status_code=400,
+                detail="Choose which vessel this notification is for.",
+            )
+        vessel_to_set = _agent_vessel_name(db, current_user.id, vessel_to_set)
+
     notification = Notification(
         title=body.title.strip(),
         message=body.message.strip(),
         port_name=port_to_set,
-        vessel=(body.vessel or None),
+        vessel=vessel_to_set,
         created_by=current_user.id,
     )
 
@@ -88,11 +125,11 @@ def list_notifications_admin(
         raise HTTPException(status_code=403, detail="Only superadmins or agents can view notifications")
 
     if current_user.role == "agent":
-        assigned_port = current_user.agent_profile.assigned_port if current_user.agent_profile else None
-        if not assigned_port:
-            return []
+        # History is the agent's own outbox. Matching on port as well meant he
+        # saw — and could edit — notifications raised by every other agency
+        # berthed at the same port.
         return db.query(Notification).filter(
-            (Notification.port_name == assigned_port) | (Notification.created_by == current_user.id)
+            Notification.created_by == current_user.id
         ).order_by(Notification.created_at.desc()).all()
 
     return db.query(Notification).order_by(Notification.created_at.desc()).all()
@@ -113,8 +150,9 @@ def update_notification(
         raise HTTPException(status_code=404, detail="Notification not found")
 
     if current_user.role == "agent":
-        assigned_port = current_user.agent_profile.assigned_port if current_user.agent_profile else None
-        if not assigned_port or (notification.port_name != assigned_port and notification.created_by != current_user.id):
+        # Own notifications only. Matching on port let any agent edit the
+        # notifications of every other agency berthed at the same port.
+        if notification.created_by != current_user.id:
             raise HTTPException(status_code=403, detail="Not authorized to edit this notification")
 
     if body.title is not None:
@@ -128,7 +166,15 @@ def update_notification(
         else:
             notification.port_name = body.port_name or None
     if body.vessel is not None:
-        notification.vessel = body.vessel or None
+        vessel = (body.vessel or "").strip() or None
+        if current_user.role == "agent":
+            if not vessel:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Choose which vessel this notification is for.",
+                )
+            vessel = _agent_vessel_name(db, current_user.id, vessel)
+        notification.vessel = vessel
 
     db.commit()
     db.refresh(notification)
@@ -149,8 +195,9 @@ def delete_notification(
         raise HTTPException(status_code=404, detail="Notification not found")
 
     if current_user.role == "agent":
-        assigned_port = current_user.agent_profile.assigned_port if current_user.agent_profile else None
-        if not assigned_port or (notification.port_name != assigned_port and notification.created_by != current_user.id):
+        # Own notifications only. Matching on port let any agent delete the
+        # notifications of every other agency berthed at the same port.
+        if notification.created_by != current_user.id:
             raise HTTPException(status_code=403, detail="Not authorized to delete this notification")
 
     db.delete(notification)

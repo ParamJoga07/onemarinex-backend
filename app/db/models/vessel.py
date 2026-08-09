@@ -21,6 +21,11 @@ class Vessel(Base):
     etd = Column(DateTime(timezone=True), nullable=True)
     status = Column(String(50), default="Active") # Active, Departing, Departed
 
+    # One shore-pass expiry for the whole crew of this port call. Setting it
+    # applies the date to every crew member; an individual can still be given a
+    # different date afterwards, which this field does not overwrite.
+    shore_pass_valid_upto = Column(DateTime(timezone=True), nullable=True)
+
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 

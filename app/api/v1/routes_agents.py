@@ -1,8 +1,11 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+import io
+import uuid
+
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 from sqlalchemy.orm import Session
 from sqlalchemy import func, cast, String, or_
 from typing import Optional
-from datetime import datetime, date as _date
+from datetime import datetime, timedelta, date as _date
 
 from app.db.session import get_db
 from app.db.models.agent_profile import AgentProfile
@@ -10,6 +13,7 @@ from app.db.models.vessel import Vessel
 from app.db.models.cab_booking import CabBooking, BookingStatus
 from app.db.models.incident import Incident, IncidentStatus
 from app.db.models.shore_pass import ShorePass
+from app.db.models.crew_sos import CrewSos
 from app.db.models.crew_profile import CrewProfile
 from app.db.models.vessel_crew import VesselCrew
 from app.db.models.aggregator_profile import AggregatorProfile
@@ -37,6 +41,7 @@ class AgentProfileOut(BaseModel):
     license_number: Optional[str]
     status: str
     profile_image: Optional[str]
+    agency_logo_url: Optional[str] = None
     agent_identifier: Optional[str]
     auth_document_url: Optional[str] = None
 
@@ -63,6 +68,9 @@ class DashboardStats(BaseModel):
     open_incidents: int
     investigating_incidents: int
     closed_incidents: int
+    # Unresolved SOS alerts from this agent's crew. Defaulted so an older
+    # frontend build that does not know the field still parses the response.
+    open_sos: int = 0
 
 class DashboardVessel(BaseModel):
     id: int
@@ -88,6 +96,43 @@ class DashboardData(BaseModel):
 
 class ShorePassActionIn(BaseModel):
     rejection_reason: Optional[str] = None
+
+
+# A trip that is happening right now. ON_TRIP/ARRIVED are the current statuses;
+# IN_PROGRESS is the legacy spelling kept on older rows.
+LIVE_TRIP_STATUSES = [
+    BookingStatus.DRIVER_ASSIGNED,
+    BookingStatus.DRIVER_ACCEPTED,
+    BookingStatus.ARRIVED,
+    BookingStatus.ON_TRIP,
+    BookingStatus.IN_PROGRESS,
+]
+
+
+def _agent_scope(db: Session, agent_user_id: int) -> tuple[list[int], list[int]]:
+    """Vessels this agent owns, and the crew profiles sailing on them.
+
+    Everything on the agent dashboard must be limited to the agent's own ships.
+    Crew are matched by HPID, which is the only link between a vessel's manifest
+    (``vessel_crew``) and a registered crew account (``crew_profiles``).
+    """
+    vessel_ids = [v.id for v in db.query(Vessel.id).filter(Vessel.agent_id == agent_user_id).all()]
+    if not vessel_ids:
+        return [], []
+
+    hp_ids = [
+        c.hp_id
+        for c in db.query(VesselCrew.hp_id).filter(VesselCrew.vessel_id.in_(vessel_ids)).all()
+        if c.hp_id
+    ]
+    if not hp_ids:
+        return vessel_ids, []
+
+    crew_profile_ids = [
+        cp.id for cp in db.query(CrewProfile.id).filter(CrewProfile.hpid.in_(hp_ids)).all()
+    ]
+    return vessel_ids, crew_profile_ids
+
 
 # --- Routes ---
 
@@ -116,6 +161,7 @@ def get_agent_profile(
         "license_number": agent_profile.license_number,
         "status": agent_profile.status,
         "profile_image": agent_profile.profile_image,
+        "agency_logo_url": agent_profile.agency_logo_url,
         "agent_identifier": agent_profile.agent_identifier,
         "auth_document_url": agent_profile.auth_document_url
     }
@@ -159,6 +205,65 @@ def update_agent_profile(
     
     return get_agent_profile(db, current_user)
 
+ALLOWED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
+MAX_IMAGE_BYTES = 5 * 1024 * 1024
+
+
+@router.post("/profile/image", response_model=AgentProfileOut)
+async def upload_agent_image(
+    kind: str = "profile",
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Upload the agent's profile picture, or the agency logo.
+
+    `kind=profile` sets the contact person's avatar; `kind=logo` sets the
+    agency logo used on the PDF reports. They are separate images and are
+    stored in separate columns.
+
+    There was previously no upload route at all, so the "Change Profile"
+    button on the profile page had nothing to call.
+    """
+    if current_user.role != "agent":
+        raise HTTPException(status_code=403, detail="Only agents can update this profile")
+
+    agent_profile = current_user.agent_profile
+    if not agent_profile:
+        raise HTTPException(status_code=404, detail="Agent profile not found")
+
+    if kind not in {"profile", "logo"}:
+        raise HTTPException(status_code=400, detail="kind must be 'profile' or 'logo'")
+
+    if file.content_type not in ALLOWED_IMAGE_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail="Upload a JPEG, PNG, WebP or GIF image.",
+        )
+
+    # Read once so the size can be checked before anything is stored.
+    data = await file.read()
+    if len(data) > MAX_IMAGE_BYTES:
+        raise HTTPException(status_code=400, detail="Image must be 5 MB or smaller.")
+    if not data:
+        raise HTTPException(status_code=400, detail="The uploaded file is empty.")
+
+    from app.services.storage import save_fileobj
+
+    suffix = (file.filename or "").rsplit(".", 1)[-1].lower() or "jpg"
+    key = f"agent_{kind}/{agent_profile.id}_{uuid.uuid4().hex[:8]}.{suffix}"
+    stored = save_fileobj(io.BytesIO(data), key, content_type=file.content_type)
+
+    if kind == "logo":
+        agent_profile.agency_logo_url = stored
+    else:
+        agent_profile.profile_image = stored
+
+    db.commit()
+    db.refresh(agent_profile)
+    return get_agent_profile(db, current_user)
+
+
 @router.get("/dashboard", response_model=DashboardData)
 def get_dashboard_data(
     db: Session = Depends(get_db),
@@ -179,93 +284,122 @@ def get_dashboard_data(
     # Active Vessels (Active + Departing — still in port)
     active_vessels_list = vessels_query.filter(Vessel.status.in_(["Active", "Departing"])).limit(5).all()
     
+    # Every tile below is limited to this agent's own ships. Anything unscoped
+    # reports the whole platform's activity, which is what made Crew Ashore and
+    # Active Trips show the same number for every agent.
+    vessel_ids, crew_profile_ids = _agent_scope(db, current_user.id)
+
     # Crew In Shore (active shore passes for agent's vessels)
-    vessel_ids = [v.id for v in vessels_query.all()]
     crew_in_shore = 0
-    if vessel_ids:
-        # Count active shore passes where crew is on one of agent's vessels
-        crew_in_shore = db.query(ShorePass).join(
-            CrewProfile, ShorePass.crew_profile_id == CrewProfile.id
-        ).join(
-            VesselCrew, VesselCrew.hp_id == CrewProfile.hpid
-        ).filter(
-            VesselCrew.vessel_id.in_(vessel_ids),
-            ShorePass.in_time == None
+    if crew_profile_ids:
+        crew_in_shore = db.query(ShorePass).filter(
+            ShorePass.crew_profile_id.in_(crew_profile_ids),
+            ShorePass.in_time.is_(None),
         ).count()
 
-    # Trips (Cab Bookings)
-    # Today's trips
+    # Trips (Cab Bookings) — this agent's crew only.
     today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
-    todays_trips_query = db.query(CabBooking).filter(CabBooking.created_at >= today_start)
-    todays_trips_count = todays_trips_query.count()
-    trips_in_progress_count = todays_trips_query.filter(CabBooking.status == BookingStatus.IN_PROGRESS).count()
-    
-    # Live Trips list (In Progress or Driver Assigned)
-    live_trips_data = db.query(CabBooking).filter(
-        CabBooking.status.in_([BookingStatus.IN_PROGRESS, BookingStatus.DRIVER_ASSIGNED])
-    ).limit(5).all()
-    
-    # Open and Closed Incidents for this agent's port
-    agent_profile = current_user.agent_profile
-    port_incidents_query = db.query(Incident).filter(Incident.port_name == agent_profile.assigned_port if agent_profile else None)
-    
-    open_incidents = port_incidents_query.filter(
-        Incident.status == IncidentStatus.ACTIVE
-    ).count()
+    todays_trips_count = 0
+    trips_in_progress_count = 0
+    active_trips_count = 0
+    live_trips_data = []
+    if crew_profile_ids:
+        agent_trips = db.query(CabBooking).filter(CabBooking.crew_id.in_(crew_profile_ids))
+        todays_trips_count = agent_trips.filter(CabBooking.created_at >= today_start).count()
+        trips_in_progress_count = agent_trips.filter(
+            CabBooking.created_at >= today_start,
+            CabBooking.status.in_(LIVE_TRIP_STATUSES),
+        ).count()
+        # "Active trips" is every trip underway right now, regardless of the day
+        # it was booked — an overnight trip is still active this morning.
+        active_trips_count = agent_trips.filter(CabBooking.status.in_(LIVE_TRIP_STATUSES)).count()
+        live_trips_data = agent_trips.filter(
+            CabBooking.status.in_(LIVE_TRIP_STATUSES)
+        ).order_by(CabBooking.created_at.desc()).limit(5).all()
 
-    investigating_incidents = port_incidents_query.filter(
-        Incident.status == IncidentStatus.INVESTIGATING
-    ).count()
+    # Incidents raised by this agent's crew. Filtering by port would include
+    # every other agency berthed at the same port.
+    agent_hp_ids = [
+        c.hp_id
+        for c in db.query(VesselCrew.hp_id).filter(VesselCrew.vessel_id.in_(vessel_ids)).all()
+        if c.hp_id
+    ] if vessel_ids else []
 
-    closed_incidents = port_incidents_query.filter(
-        Incident.status == IncidentStatus.RESOLVED
-    ).count()
+    open_incidents = investigating_incidents = closed_incidents = 0
+    if agent_hp_ids:
+        agent_incidents = db.query(Incident).filter(Incident.reporter_id.in_(agent_hp_ids))
+        open_incidents = agent_incidents.filter(Incident.status == IncidentStatus.ACTIVE).count()
+        investigating_incidents = agent_incidents.filter(
+            Incident.status == IncidentStatus.INVESTIGATING
+        ).count()
+        closed_incidents = agent_incidents.filter(
+            Incident.status == IncidentStatus.RESOLVED
+        ).count()
+
+    # The tile is labelled "Open SOS/Incidents", so unresolved SOS alerts from
+    # this agent's crew belong in it too. They were not counted at all before.
+    open_sos = 0
+    if crew_profile_ids:
+        open_sos = db.query(CrewSos).filter(
+            CrewSos.crew_profile_id.in_(crew_profile_ids),
+            CrewSos.closed_at.is_(None),
+            CrewSos.cancelled_at.is_(None),
+        ).count()
 
     stats = DashboardStats(
         total_vessels=total_vessels,
         vessels_this_week=vessels_this_week,
         crew_in_shore=crew_in_shore,
-        active_trips=crew_in_shore, # Using crew_in_shore as 'active trips' for now as per UI logic
+        active_trips=active_trips_count,
         todays_trips=todays_trips_count,
         trips_in_progress=trips_in_progress_count,
         open_incidents=open_incidents,
         investigating_incidents=investigating_incidents,
-        closed_incidents=closed_incidents
+        closed_incidents=closed_incidents,
+        open_sos=open_sos,
     )
 
     vessels_data = []
     for v in active_vessels_list:
         # Get crew HPIDs for this vessel
         crew_hpids = [c.hp_id for c in db.query(VesselCrew).filter(VesselCrew.vessel_id == v.id).all() if c.hp_id]
-        
+
+        vessel_crew_ids = []
+        if crew_hpids:
+            vessel_crew_ids = [
+                cp.id for cp in db.query(CrewProfile.id).filter(CrewProfile.hpid.in_(crew_hpids)).all()
+            ]
+
         # 1. Ongoing Trips
         ongoing_trips = 0
-        if crew_hpids:
-            crew_profile_ids = [cp.id for cp in db.query(CrewProfile).filter(CrewProfile.hpid.in_(crew_hpids)).all()]
-            if crew_profile_ids:
-                ongoing_trips = db.query(CabBooking).filter(
-                    CabBooking.crew_id.in_(crew_profile_ids),
-                    CabBooking.status.in_([BookingStatus.IN_PROGRESS, BookingStatus.DRIVER_ASSIGNED, BookingStatus.DRIVER_ACCEPTED])
-                ).count()
-        
+        if vessel_crew_ids:
+            ongoing_trips = db.query(CabBooking).filter(
+                CabBooking.crew_id.in_(vessel_crew_ids),
+                CabBooking.status.in_(LIVE_TRIP_STATUSES),
+            ).count()
+
         # 2. Crew Ashore
         crew_ashore = 0
-        if crew_hpids:
-            crew_profile_ids = [cp.id for cp in db.query(CrewProfile).filter(CrewProfile.hpid.in_(crew_hpids)).all()]
-            if crew_profile_ids:
-                crew_ashore = db.query(ShorePass).filter(
-                    ShorePass.crew_profile_id.in_(crew_profile_ids),
-                    ShorePass.in_time.is_(None)
-                ).count()
-                
-        # 3. SOS/Incidents of ship
+        if vessel_crew_ids:
+            crew_ashore = db.query(ShorePass).filter(
+                ShorePass.crew_profile_id.in_(vessel_crew_ids),
+                ShorePass.in_time.is_(None)
+            ).count()
+
+        # 3. SOS/Incidents of ship — the card says "SOS/Incidents", so count both.
         incidents = 0
         if crew_hpids:
             incidents = db.query(Incident).filter(
                 Incident.reporter_id.in_(crew_hpids),
                 Incident.status.in_([IncidentStatus.ACTIVE, IncidentStatus.INVESTIGATING])
             ).count()
-            
+        if vessel_crew_ids:
+            incidents += db.query(CrewSos).filter(
+                CrewSos.crew_profile_id.in_(vessel_crew_ids),
+                CrewSos.closed_at.is_(None),
+                CrewSos.cancelled_at.is_(None),
+            ).count()
+
         vessels_data.append(
             DashboardVessel(
                 id=v.id,
@@ -278,10 +412,42 @@ def get_dashboard_data(
             )
         )
 
+    # live_trips was previously computed and then discarded, so the dashboard's
+    # live trips list was always empty. Resolve crew and vessel names for it.
+    trips_data = []
+    if live_trips_data:
+        trip_crew_ids = {b.crew_id for b in live_trips_data if b.crew_id}
+        crew_rows = db.query(CrewProfile).filter(CrewProfile.id.in_(trip_crew_ids)).all() if trip_crew_ids else []
+        crew_by_id = {cp.id: cp for cp in crew_rows}
+
+        vessel_name_by_hpid = {}
+        hpids = [cp.hpid for cp in crew_rows if cp.hpid]
+        if hpids:
+            for vc, vessel_name in (
+                db.query(VesselCrew.hp_id, Vessel.name)
+                .join(Vessel, Vessel.id == VesselCrew.vessel_id)
+                .filter(VesselCrew.hp_id.in_(hpids), Vessel.agent_id == current_user.id)
+                .all()
+            ):
+                vessel_name_by_hpid[vc] = vessel_name
+
+        for b in live_trips_data:
+            crew = crew_by_id.get(b.crew_id)
+            trips_data.append(
+                DashboardTrip(
+                    id=b.id,
+                    crew_name=(crew.full_name if crew else None) or "Unknown crew",
+                    vessel_name=vessel_name_by_hpid.get(crew.hpid if crew else None) or "—",
+                    from_loc=b.pickup_address or "—",
+                    to_loc=b.drop_address or "—",
+                    status=b.status.value if hasattr(b.status, "value") else str(b.status),
+                )
+            )
+
     return DashboardData(
         stats=stats,
         active_vessels=vessels_data,
-        live_trips=[]
+        live_trips=trips_data,
     )
 
 @router.get("/shore-pass-requests", response_model=List[ShorePassOut])
@@ -292,15 +458,35 @@ def get_shore_pass_requests(
     if current_user.role != "agent":
         raise HTTPException(status_code=403, detail="Only agents can access shore pass requests")
     
-    agent_profile = current_user.agent_profile
-    if not agent_profile or not agent_profile.assigned_port:
+    # Scoped to the agent's own vessels. Filtering by port showed — and let the
+    # agent act on — shore passes belonging to every other agency berthed at
+    # the same port.
+    _, crew_profile_ids = _agent_scope(db, current_user.id)
+    if not crew_profile_ids:
         return []
 
     requests = db.query(ShorePass).filter(
-        ShorePass.port_name == agent_profile.assigned_port
+        ShorePass.crew_profile_id.in_(crew_profile_ids)
     ).order_by(ShorePass.created_at.desc()).all()
-    
+
     return requests
+
+
+def _agent_shore_pass_or_404(db: Session, request_id: int, current_user: User) -> ShorePass:
+    """A shore pass belonging to this agent's crew, or a 404.
+
+    Approve and reject previously looked the pass up by id with no ownership
+    check at all, so any agent could grant or refuse shore leave for another
+    agency's crew. 404 rather than 403 so ids cannot be probed.
+    """
+    shore_pass = db.query(ShorePass).filter(ShorePass.id == request_id).first()
+    if not shore_pass:
+        raise HTTPException(status_code=404, detail="Shore pass request not found")
+
+    _, crew_profile_ids = _agent_scope(db, current_user.id)
+    if shore_pass.crew_profile_id not in crew_profile_ids:
+        raise HTTPException(status_code=404, detail="Shore pass request not found")
+    return shore_pass
 
 @router.post("/shore-pass-requests/{request_id}/approve", response_model=ShorePassOut)
 def approve_shore_pass(
@@ -310,10 +496,8 @@ def approve_shore_pass(
 ):
     if current_user.role != "agent":
         raise HTTPException(status_code=403, detail="Only agents can approve shore passes")
-    
-    shore_pass = db.query(ShorePass).filter(ShorePass.id == request_id).first()
-    if not shore_pass:
-        raise HTTPException(status_code=404, detail="Shore pass request not found")
+
+    shore_pass = _agent_shore_pass_or_404(db, request_id, current_user)
     
     shore_pass.status = "approved"
     shore_pass.is_verified = True
@@ -337,10 +521,8 @@ def reject_shore_pass(
 ):
     if current_user.role != "agent":
         raise HTTPException(status_code=403, detail="Only agents can reject shore passes")
-    
-    shore_pass = db.query(ShorePass).filter(ShorePass.id == request_id).first()
-    if not shore_pass:
-        raise HTTPException(status_code=404, detail="Shore pass request not found")
+
+    shore_pass = _agent_shore_pass_or_404(db, request_id, current_user)
     
     shore_pass.status = "rejected"
     shore_pass.rejection_reason = body.rejection_reason
@@ -633,4 +815,142 @@ def get_agent_crew_detail(
         shore_pass_out_time=shore_pass.out_time if shore_pass else None,
         shore_pass_in_time=shore_pass.in_time if shore_pass else None,
         shore_pass_expires_at=shore_pass.expires_at if shore_pass else None,
+    )
+
+
+# --- Reports (K) -----------------------------------------------------------
+
+class ShoreLeaveReportOut(BaseModel):
+    """Everything the Shore Leave Operation Report prints.
+
+    Rendered and printed in the browser rather than generated server-side: no
+    new dependency, nothing to host, and the preview the agent checks is the
+    exact thing that prints. The stamp and signature are added by hand, so the
+    layout leaves space rather than trying to reproduce them.
+    """
+    vessel_name: str
+    imo_number: Optional[str] = None
+    berth: Optional[str] = None
+    port_name: Optional[str] = None
+    agency_name: Optional[str] = None
+    agency_logo_url: Optional[str] = None
+    report_date: str
+    generated_at: datetime
+
+    crew_onboard: int
+    eligible_for_shore_leave: int
+    crew_went_ashore: int
+    completed_trips: int
+    average_duration_minutes: Optional[int] = None
+    returned_safely: int
+    still_ashore: int
+    sos_raised: int
+    incidents_reported: int
+
+    all_returned: bool
+    incidents: List[Dict[str, Any]] = []
+
+
+@router.get("/reports/shore-leave/{vessel_id}", response_model=ShoreLeaveReportOut)
+def shore_leave_report(
+    vessel_id: int,
+    report_date: Optional[str] = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Figures for one vessel's shore leave on one day."""
+    if current_user.role != "agent":
+        raise HTTPException(status_code=403, detail="Only agents can generate reports")
+
+    vessel = db.query(Vessel).filter(
+        Vessel.id == vessel_id, Vessel.agent_id == current_user.id
+    ).first()
+    if not vessel:
+        raise HTTPException(status_code=404, detail="Vessel not found")
+
+    if report_date:
+        try:
+            day = datetime.strptime(report_date, "%Y-%m-%d")
+        except ValueError:
+            raise HTTPException(status_code=400, detail="report_date must be YYYY-MM-DD")
+    else:
+        day = datetime.utcnow()
+    day_start = day.replace(hour=0, minute=0, second=0, microsecond=0)
+    day_end = day_start + timedelta(days=1)
+
+    manifest = db.query(VesselCrew).filter(VesselCrew.vessel_id == vessel.id).all()
+    hp_ids = [c.hp_id for c in manifest if c.hp_id]
+    crew_profile_ids = [
+        cp.id for cp in db.query(CrewProfile.id).filter(CrewProfile.hpid.in_(hp_ids)).all()
+    ] if hp_ids else []
+
+    passes = db.query(ShorePass).filter(
+        ShorePass.crew_profile_id.in_(crew_profile_ids),
+        ShorePass.out_time >= day_start,
+        ShorePass.out_time < day_end,
+    ).all() if crew_profile_ids else []
+
+    returned = [p for p in passes if p.in_time]
+    # Averaged over completed shore leaves only — including people still ashore
+    # would drag the average down and misrepresent the day.
+    durations = [
+        (p.in_time - p.out_time).total_seconds() / 60
+        for p in returned if p.in_time and p.out_time
+    ]
+
+    completed_trips = db.query(CabBooking).filter(
+        CabBooking.crew_id.in_(crew_profile_ids),
+        CabBooking.status == BookingStatus.COMPLETED,
+        CabBooking.created_at >= day_start,
+        CabBooking.created_at < day_end,
+    ).count() if crew_profile_ids else 0
+
+    sos_raised = db.query(CrewSos).filter(
+        CrewSos.crew_profile_id.in_(crew_profile_ids),
+        CrewSos.created_at >= day_start,
+        CrewSos.created_at < day_end,
+    ).count() if crew_profile_ids else 0
+
+    day_incidents = db.query(Incident).filter(
+        Incident.reporter_id.in_(hp_ids),
+        Incident.created_at >= day_start,
+        Incident.created_at < day_end,
+    ).all() if hp_ids else []
+
+    from app.services import incident_taxonomy as tax
+
+    agent_profile = current_user.agent_profile
+    still_ashore = len(passes) - len(returned)
+
+    return ShoreLeaveReportOut(
+        vessel_name=vessel.name,
+        imo_number=vessel.imo_number,
+        berth=vessel.berth_assignment,
+        port_name=(vessel.agent.agent_profile.assigned_port
+                   if vessel.agent and getattr(vessel.agent, "agent_profile", None) else None),
+        agency_name=agent_profile.agency_name if agent_profile else vessel.agency_name,
+        agency_logo_url=agent_profile.agency_logo_url if agent_profile else None,
+        report_date=day_start.strftime("%Y-%m-%d"),
+        generated_at=datetime.utcnow(),
+        crew_onboard=len(manifest),
+        eligible_for_shore_leave=sum(1 for c in manifest if c.shore_pass_eligible),
+        crew_went_ashore=len(passes),
+        completed_trips=completed_trips,
+        average_duration_minutes=int(sum(durations) / len(durations)) if durations else None,
+        returned_safely=len(returned),
+        still_ashore=still_ashore,
+        sos_raised=sos_raised,
+        incidents_reported=len(day_incidents),
+        # Drives the "operation successfully completed" checklist. Anyone still
+        # ashore means the day is not closed out, whatever else looks fine.
+        all_returned=still_ashore == 0,
+        incidents=[
+            {
+                "incident_id": i.incident_id,
+                "category": tax.category_label(i.category),
+                "status": i.status.value if hasattr(i.status, "value") else str(i.status),
+                "summary": i.title,
+            }
+            for i in day_incidents
+        ],
     )
