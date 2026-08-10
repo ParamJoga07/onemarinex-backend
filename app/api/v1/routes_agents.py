@@ -915,11 +915,15 @@ def shore_leave_report(
 
     manifest = db.query(VesselCrew).filter(VesselCrew.vessel_id == vessel.id).all()
     hp_ids = [c.hp_id for c in manifest if c.hp_id]
-    manifest_profiles = db.query(CrewProfile.id, CrewProfile.hpid).filter(
-        CrewProfile.hpid.in_(hp_ids)
-    ).all() if hp_ids else []
-    crew_profile_ids = [row.id for row in manifest_profiles]
-    profile_id_by_hpid = {row.hpid: row.id for row in manifest_profiles}
+    # HPID alone under-matches: a manifest that spells the nationality
+    # differently from the crew member's own registration generates a different
+    # HPID for the same person, and everything they did drops off this report.
+    from app.services import crew_linkage
+
+    manifest_profiles = crew_linkage.vessel_crew_profiles(db, vessel)
+    crew_profile_ids = [profile.id for profile in manifest_profiles]
+    profile_id_by_hpid = crew_linkage.profile_id_by_hpid(manifest_profiles)
+    eligible_profile_ids = crew_linkage.eligible_profile_ids(db, vessel, manifest_profiles)
 
     passes = db.query(ShorePass).filter(
         ShorePass.crew_profile_id.in_(crew_profile_ids),
@@ -962,58 +966,103 @@ def shore_leave_report(
         extra = trip.crew_member_ids
         if isinstance(extra, list):
             for hpid in extra:
-                profile_id = profile_id_by_hpid.get(str(hpid).strip())
+                profile_id = crew_linkage.resolve_hpid(profile_id_by_hpid, hpid)
                 if profile_id is not None:
                     people.add(profile_id)
         return people
 
+    # Every departure ashore, as (person, left_at, came_back_at, is_back).
+    #
     # "Went ashore" is a count of people, not of paperwork. A stamped out_time
-    # proves it, and so does a trip: a shore pass that was approved but never
-    # signed out still left crew counted as aboard while their cab was running,
-    # which is how the report could read "0 went ashore" beside completed trips.
-    ashore_crew = {p.crew_profile_id for p in passes if p.out_time}
-    ashore_crew |= {person for t in day_trips for person in _trip_crew(t)}
+    # proves it, and so does a trip that actually ran: a shore pass approved but
+    # never signed out used to leave crew counted as aboard while their cab was
+    # running, which is how the report could read "0 went ashore" beside
+    # completed trips.
+    #
+    # is_back is tracked separately from came_back_at because the two answer
+    # different questions. A completed cab ride proves the crew member is back
+    # aboard even on legacy rows that never recorded the timestamps; those rows
+    # can be counted as returned while still contributing no measurable
+    # duration. Treating "no end timestamp" as "still ashore" would strand them
+    # ashore permanently.
+    #
+    # A cancelled booking put nobody ashore. Neither did one still waiting for
+    # a driver: crew sitting aboard with a pending booking have not left the
+    # ship, and counting them as ashore also left them counted as never
+    # returning, since there is no trip for them to finish.
+    departures: List[tuple] = []
+    for p in passes:
+        if p.out_time:
+            departures.append((p.crew_profile_id, p.out_time, p.in_time, p.in_time is not None))
+    for t in day_trips:
+        if t.status == BookingStatus.CANCELLED:
+            continue
+        start = t.trip_started_at or t.started_at
+        end = t.trip_completed_at or t.completed_at
+        finished = t.status == BookingStatus.COMPLETED
+        if not start and not finished:
+            continue
+        for person in _trip_crew(t):
+            departures.append((person, start, end, finished))
+
+    ashore_crew = {person for person, _, _, _ in departures if person is not None}
     crew_went_ashore = len(ashore_crew)
 
-    returned_crew = {p.crew_profile_id for p in passes if p.in_time}
-    returned = [p for p in passes if p.in_time]
+    # Still ashore means an unfinished departure — signed out with no sign-in,
+    # or a cab that started and has not completed. Reading returns off
+    # shore-pass in_time alone was asymmetric with a "went ashore" count that
+    # also honours trips: crew who took a cab ashore and back had no pass to
+    # sign, so the report showed them gone for good beside their own completed
+    # trips, which is the "0 / 1 returned" beside "1 still ashore".
+    still_ashore_crew = {
+        person for person, _, _, is_back in departures
+        if person is not None and not is_back
+    }
+    returned_crew = ashore_crew - still_ashore_crew
 
     completed_trips = sum(1 for t in day_trips if t.status == BookingStatus.COMPLETED)
 
-    # Average time ashore, measured per crew member across both sources.
+    # Average time ashore, per crew member, over crew eligible for shore leave
+    # who actually completed a period of leave that day.
     #
-    # Each person's time ashore is the envelope from their earliest departure to
-    # their latest return. Adding pass time and trip time together would
-    # double-count the ordinary case, because a cab ride happens *during* a
-    # shore pass — it is not additional time off the ship.
+    # Who counts. Only shore-leave-eligible crew, and only those who went ashore
+    # *and* came back: someone still ashore has no finished duration to measure,
+    # and someone who never left has no duration at all. Counting either as a
+    # zero would drag the figure down and stop it answering the question the
+    # tile asks — how long our crew are actually getting ashore. They are
+    # reported separately as `still_ashore` and in the utilisation percentage.
     #
-    # The previous version summed trip minutes only, then divided by a headcount
-    # that also included crew who walked out on a pass without booking a cab. On
-    # any mixed day those people were in the denominator and not the numerator,
-    # so the average always read low.
-    #
-    # Crew who are still ashore have no return time and so no measurable
-    # duration yet. They are left out of both halves rather than counted as
-    # zero, which would drag the average down for the people who did return;
-    # `still_ashore` reports them separately.
+    # How each person's time is measured. Their departures are merged, then the
+    # merged lengths summed. Merging is what stops a cab ride booked *during* a
+    # shore pass from being counted twice, since it is not extra time off the
+    # ship. Summing the merged pieces — rather than taking the envelope from
+    # first departure to last return — is what stops the hours a crew member
+    # spent back aboard between two separate trips from being billed as shore
+    # leave, which is how four short cab rides came out as "12h 21m".
     spans: Dict[int, List[tuple]] = {}
+    for person, start, end, _ in departures:
+        if person is None or not start or not end or end < start:
+            continue
+        spans.setdefault(person, []).append((start, end))
 
-    def _record(crew_profile_id, start, end):
-        if crew_profile_id is None or not start or not end or end < start:
-            return
-        spans.setdefault(crew_profile_id, []).append((start, end))
-
-    for p in passes:
-        _record(p.crew_profile_id, p.out_time, p.in_time)
-    for t in day_trips:
-        start = t.trip_started_at or t.started_at
-        end = t.trip_completed_at or t.completed_at
-        for person in _trip_crew(t):
-            _record(person, start, end)
+    def _merged_minutes(intervals) -> float:
+        total = 0.0
+        current_start, current_end = None, None
+        for start, end in sorted(intervals):
+            if current_end is not None and start <= current_end:
+                current_end = max(current_end, end)
+                continue
+            if current_end is not None:
+                total += (current_end - current_start).total_seconds()
+            current_start, current_end = start, end
+        if current_end is not None:
+            total += (current_end - current_start).total_seconds()
+        return total / 60
 
     person_minutes = [
-        (max(end for _, end in person) - min(start for start, _ in person)).total_seconds() / 60
-        for person in spans.values()
+        _merged_minutes(intervals)
+        for person, intervals in spans.items()
+        if person in eligible_profile_ids and person not in still_ashore_crew
     ]
     average_minutes = (
         int(sum(person_minutes) / len(person_minutes)) if person_minutes else None
@@ -1036,7 +1085,7 @@ def shore_leave_report(
     from app.services import incident_taxonomy as tax
 
     agent_profile = current_user.agent_profile
-    still_ashore = max(0, crew_went_ashore - len(returned_crew))
+    still_ashore = len(still_ashore_crew)
     resolved_incidents = sum(
         1 for incident in day_incidents
         if incident.status in {IncidentStatus.RESOLVED, IncidentStatus.CANCELLED}
