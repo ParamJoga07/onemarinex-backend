@@ -110,7 +110,7 @@ class ShoreLeaveAverageTests(unittest.TestCase):
         ))
         self.db.flush()
 
-    def trip_for(self, crew, started, completed, created=None):
+    def trip_for(self, crew, started, completed, created=None, passengers=None):
         self.db.add(CabBooking(
             booking_id=_uniq("CAB"), crew_id=crew.id,
             pickup_address="Gate", pickup_lat=0, pickup_lng=0,
@@ -120,6 +120,7 @@ class ShoreLeaveAverageTests(unittest.TestCase):
             status=BookingStatus.COMPLETED,
             created_at=created or started,
             trip_started_at=started, trip_completed_at=completed,
+            crew_member_ids=passengers,
         ))
         self.db.flush()
 
@@ -168,6 +169,64 @@ class ShoreLeaveAverageTests(unittest.TestCase):
         self.assertEqual(result.crew_went_ashore, 2)
         self.assertEqual(result.still_ashore, 1)
         self.assertEqual(result.average_duration_minutes, 120)
+
+
+class GroupBookingPassengerTests(ShoreLeaveAverageTests):
+    """A shared cab puts everyone in it ashore, not just whoever booked it.
+
+    crew_member_ids holds HeyPorts IDs typed in by the booking crew member. They
+    are validated nowhere, so the report resolves them through this vessel's
+    manifest and ignores anything that does not land on it.
+    """
+
+    def test_fellow_passengers_on_the_manifest_are_counted(self):
+        booker = self.crew()
+        passenger = self.crew()
+        self.trip_for(
+            booker, started=_at(10), completed=_at(12),
+            passengers=[passenger.hpid],
+        )
+
+        result = self.report()
+
+        self.assertEqual(result.crew_went_ashore, 2)
+        # Both were in the same cab, so both were ashore for the same two hours.
+        self.assertEqual(result.average_duration_minutes, 120)
+
+    def test_an_unrecognised_id_does_not_invent_a_person(self):
+        booker = self.crew()
+        self.trip_for(
+            booker, started=_at(10), completed=_at(12),
+            passengers=["HP-typo-nobody", ""],
+        )
+
+        result = self.report()
+
+        self.assertEqual(result.crew_went_ashore, 1)
+
+    def test_another_vessels_crew_cannot_be_added_to_this_report(self):
+        booker = self.crew()
+
+        other_user = User(
+            email=_uniq("other") + "@example.com", hashed_password="x", role="crew"
+        )
+        self.db.add(other_user)
+        self.db.flush()
+        stranger = CrewProfile(
+            user_id=other_user.id, full_name="Stranger", rank="able_seaman",
+            nationality="IN", hpid=_uniq("HP"),
+        )
+        self.db.add(stranger)
+        self.db.flush()
+
+        self.trip_for(
+            booker, started=_at(10), completed=_at(12),
+            passengers=[stranger.hpid],
+        )
+
+        result = self.report()
+
+        self.assertEqual(result.crew_went_ashore, 1)
 
 
 class TripReportingDayTests(ShoreLeaveAverageTests):

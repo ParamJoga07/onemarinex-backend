@@ -915,9 +915,11 @@ def shore_leave_report(
 
     manifest = db.query(VesselCrew).filter(VesselCrew.vessel_id == vessel.id).all()
     hp_ids = [c.hp_id for c in manifest if c.hp_id]
-    crew_profile_ids = [
-        cp.id for cp in db.query(CrewProfile.id).filter(CrewProfile.hpid.in_(hp_ids)).all()
-    ] if hp_ids else []
+    manifest_profiles = db.query(CrewProfile.id, CrewProfile.hpid).filter(
+        CrewProfile.hpid.in_(hp_ids)
+    ).all() if hp_ids else []
+    crew_profile_ids = [row.id for row in manifest_profiles]
+    profile_id_by_hpid = {row.hpid: row.id for row in manifest_profiles}
 
     passes = db.query(ShorePass).filter(
         ShorePass.crew_profile_id.in_(crew_profile_ids),
@@ -946,12 +948,31 @@ def shore_leave_report(
         ),
     ).all() if crew_profile_ids else []
 
+    def _trip_crew(trip):
+        """Everyone a trip put ashore, limited to this vessel's manifest.
+
+        A group booking also carries its fellow passengers in crew_member_ids,
+        as HeyPorts IDs typed in by the crew member doing the booking. They are
+        neither validated nor checked against a manifest at booking time, so a
+        typo — or another ship's ID — would otherwise become a person on this
+        report. Resolving them through the manifest drops anything that is not
+        this vessel's crew, and an unrecognised ID simply does not count.
+        """
+        people = {trip.crew_id} if trip.crew_id else set()
+        extra = trip.crew_member_ids
+        if isinstance(extra, list):
+            for hpid in extra:
+                profile_id = profile_id_by_hpid.get(str(hpid).strip())
+                if profile_id is not None:
+                    people.add(profile_id)
+        return people
+
     # "Went ashore" is a count of people, not of paperwork. A stamped out_time
     # proves it, and so does a trip: a shore pass that was approved but never
     # signed out still left crew counted as aboard while their cab was running,
     # which is how the report could read "0 went ashore" beside completed trips.
     ashore_crew = {p.crew_profile_id for p in passes if p.out_time}
-    ashore_crew |= {t.crew_id for t in day_trips if t.crew_id}
+    ashore_crew |= {person for t in day_trips for person in _trip_crew(t)}
     crew_went_ashore = len(ashore_crew)
 
     returned_crew = {p.crew_profile_id for p in passes if p.in_time}
@@ -985,11 +1006,10 @@ def shore_leave_report(
     for p in passes:
         _record(p.crew_profile_id, p.out_time, p.in_time)
     for t in day_trips:
-        _record(
-            t.crew_id,
-            t.trip_started_at or t.started_at,
-            t.trip_completed_at or t.completed_at,
-        )
+        start = t.trip_started_at or t.started_at
+        end = t.trip_completed_at or t.completed_at
+        for person in _trip_crew(t):
+            _record(person, start, end)
 
     person_minutes = [
         (max(end for _, end in person) - min(start for start, _ in person)).total_seconds() / 60
