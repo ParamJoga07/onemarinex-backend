@@ -42,6 +42,7 @@ class AgentProfileOut(BaseModel):
     status: str
     profile_image: Optional[str]
     agency_logo_url: Optional[str] = None
+    support_number: Optional[str] = None
     agent_identifier: Optional[str]
     auth_document_url: Optional[str] = None
 
@@ -162,6 +163,7 @@ def get_agent_profile(
         "status": agent_profile.status,
         "profile_image": agent_profile.profile_image,
         "agency_logo_url": agent_profile.agency_logo_url,
+        "support_number": agent_profile.support_number,
         "agent_identifier": agent_profile.agent_identifier,
         "auth_document_url": agent_profile.auth_document_url
     }

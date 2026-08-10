@@ -145,6 +145,7 @@ def on_startup():
     ensure_port_time_and_sos_context_schema()
     ensure_vendor_commission_schema()
     ensure_agent_dashboard_schema()
+    ensure_agent_support_number()
     ensure_placeholder_helplines_removed()
     ensure_port_identity_schema()
     ensure_alembic_baseline()
@@ -622,6 +623,30 @@ def ensure_agent_dashboard_schema():
             "ensure_agent_dashboard_schema failed — incident, vessel and agent "
             "profile endpoints may return UndefinedColumn until migrations run"
         )
+
+
+def ensure_agent_support_number():
+    """Additive safety net for agent_profiles.support_number.
+
+    Mirrors migration i0k1l2m3n4o5. Without it an agent saving their contact
+    number would fall back to writing the shared port helpline, which is the
+    behaviour that column exists to stop.
+    """
+    log = logging.getLogger("app.startup")
+    try:
+        inspector = inspect(engine)
+        if "agent_profiles" not in inspector.get_table_names():
+            return
+        columns = {c["name"] for c in inspector.get_columns("agent_profiles")}
+        if "support_number" in columns:
+            return
+        with engine.begin() as connection:
+            connection.execute(text(
+                "ALTER TABLE agent_profiles ADD COLUMN IF NOT EXISTS support_number VARCHAR(32)"
+            ))
+        log.info("agent support number column added")
+    except Exception:
+        log.exception("ensure_agent_support_number failed")
 
 
 def ensure_placeholder_helplines_removed():

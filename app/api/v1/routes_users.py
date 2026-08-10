@@ -28,6 +28,7 @@ class AgentProfileOut(BaseModel):
     assigned_port: Optional[str] = None
     profile_image: Optional[str] = None
     agency_logo_url: Optional[str] = None
+    support_number: Optional[str] = None
 
     class Config:
         from_attributes = True

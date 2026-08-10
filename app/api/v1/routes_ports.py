@@ -226,7 +226,9 @@ def update_port_rules(
     )
     canonical_port_name = port.code if port else port_name
 
-    if current_user.role == "agent":
+    is_agent = current_user.role == "agent"
+    agent_support_number = None
+    if is_agent:
         assigned = (
             current_user.agent_profile.assigned_port
             if current_user.agent_profile else None
@@ -251,6 +253,17 @@ def update_port_rules(
                 detail="Agents may update only the contact number and rules.",
             )
 
+        # An agent's contact number is their agency's, not the port's.
+        # port_rules.helpline_number is superadmin-owned and shared by every
+        # agency berthed there, so one agent saving their number used to
+        # replace the port helpline for all of them.
+        if "helpline_number" in body.model_fields_set:
+            profile = getattr(current_user, "agent_profile", None)
+            if profile is None:
+                raise HTTPException(status_code=403, detail="No agency profile on this account")
+            profile.support_number = _validate_support_number(body.helpline_number)
+            agent_support_number = profile.support_number
+
     port_rules = (
         db.query(PortRule)
         .filter(
@@ -262,6 +275,8 @@ def update_port_rules(
     )
 
     update_data = body.model_dump(exclude_unset=True)
+    if is_agent:
+        update_data.pop("helpline_number", None)
     if "helpline_number" in update_data:
         update_data["helpline_number"] = _validate_support_number(update_data["helpline_number"])
     for field_name in ("opening_time", "closing_time"):
