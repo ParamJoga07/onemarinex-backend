@@ -1,0 +1,228 @@
+"""Average shore leave duration, and which day a trip belongs to.
+
+Two defects motivated these tests.
+
+The average summed cab minutes only, then divided by a headcount that also
+included crew who walked out on a shore pass without booking a cab. Those people
+sat in the denominator and contributed nothing to the numerator, so any day
+mixing the two read low.
+
+Separately, trips were selected by `created_at` while shore passes were selected
+by `out_time`. The two disagreed across midnight: a cab booked at 23:50 and
+driven after midnight was reported on the day it was booked.
+
+Runs against the configured database inside a transaction that is always rolled
+back, so it leaves no rows behind.
+"""
+
+from datetime import datetime
+import unittest
+import uuid
+from types import SimpleNamespace
+from zoneinfo import ZoneInfo
+
+import app.db.base  # noqa: F401 — registers every model on Base
+from sqlalchemy.orm import Session
+
+from app.api.v1.routes_agents import shore_leave_report
+from app.db.models.cab_booking import BookingStatus, CabBooking
+from app.db.models.crew_profile import CrewProfile
+from app.db.models.shore_pass import ShorePass
+from app.db.models.user import User
+from app.db.models.vessel import Vessel
+from app.db.models.vessel_crew import VesselCrew
+from app.db.session import engine
+
+REPORT_DATE = "2026-03-05"
+
+# The reporting window is a calendar day *at the port*, and a vessel with no
+# configured port falls back to Asia/Kolkata. Times here are therefore written
+# on the port's clock: expressing them in UTC makes the midnight cases silently
+# vacuous, because 23:50 UTC on the 4th is already 05:20 on the 5th at the port.
+PORT_TZ = ZoneInfo("Asia/Kolkata")
+
+
+def _uniq(prefix):
+    return f"{prefix}-{uuid.uuid4().hex[:10]}"
+
+
+def _at(hour, minute=0, day=5):
+    """An instant on the reporting day, on the port's clock."""
+    return datetime(2026, 3, day, hour, minute, tzinfo=PORT_TZ)
+
+
+class ShoreLeaveAverageTests(unittest.TestCase):
+    def setUp(self):
+        self.connection = engine.connect()
+        self.trans = self.connection.begin()
+        self.db = Session(bind=self.connection)
+
+        self.agent_user = User(
+            email=_uniq("agent") + "@example.com", hashed_password="x", role="agent"
+        )
+        self.db.add(self.agent_user)
+        self.db.flush()
+
+        self.vessel = Vessel(
+            agent_id=self.agent_user.id, name=_uniq("MV"), imo_number=_uniq("IMO"),
+            vessel_type="Bulk Carrier", status="Active",
+        )
+        self.db.add(self.vessel)
+        self.db.flush()
+
+        self.agent = SimpleNamespace(
+            id=self.agent_user.id, role="agent",
+            agent_profile=SimpleNamespace(
+                assigned_port=None, agency_name="Test Agency", agency_logo_url=None,
+            ),
+        )
+
+    def tearDown(self):
+        self.db.close()
+        self.trans.rollback()
+        self.connection.close()
+
+    def crew(self):
+        """One crew member on this vessel's manifest."""
+        crew_user = User(
+            email=_uniq("crew") + "@example.com", hashed_password="x", role="crew"
+        )
+        self.db.add(crew_user)
+        self.db.flush()
+        hpid = _uniq("HP")
+        profile = CrewProfile(
+            user_id=crew_user.id, full_name="Crew", rank="able_seaman",
+            nationality="IN", hpid=hpid,
+        )
+        self.db.add(profile)
+        self.db.flush()
+        self.db.add(VesselCrew(
+            vessel_id=self.vessel.id, name="Crew", rank="able_seaman",
+            hp_id=hpid, shore_pass_eligible=True,
+        ))
+        self.db.flush()
+        return profile
+
+    def pass_for(self, crew, out, back):
+        self.db.add(ShorePass(
+            crew_profile_id=crew.id, shore_pass_id=_uniq("SP"),
+            out_time=out, in_time=back,
+        ))
+        self.db.flush()
+
+    def trip_for(self, crew, started, completed, created=None):
+        self.db.add(CabBooking(
+            booking_id=_uniq("CAB"), crew_id=crew.id,
+            pickup_address="Gate", pickup_lat=0, pickup_lng=0,
+            drop_address="City", drop_lat=0, drop_lng=0,
+            vehicle_type="ac", vehicle_name="Sedan",
+            estimated_price=100, distance_km=5,
+            status=BookingStatus.COMPLETED,
+            created_at=created or started,
+            trip_started_at=started, trip_completed_at=completed,
+        ))
+        self.db.flush()
+
+    def report(self):
+        return shore_leave_report(
+            vessel_id=self.vessel.id, report_date=REPORT_DATE,
+            db=self.db, current_user=self.agent,
+        )
+
+    def test_pass_only_crew_are_in_the_average_not_just_the_denominator(self):
+        """The defect: cab minutes over a headcount that included pass-only crew.
+
+        One hour in a cab and four hours on a pass average to two and a half
+        hours. Dividing the cab hour alone by both people gave 30 minutes.
+        """
+        rider = self.crew()
+        walker = self.crew()
+        self.trip_for(rider, started=_at(10), completed=_at(11))
+        self.pass_for(walker, out=_at(10), back=_at(14))
+
+        result = self.report()
+
+        self.assertEqual(result.crew_went_ashore, 2)
+        self.assertEqual(result.average_duration_minutes, 150)
+
+    def test_a_cab_taken_during_a_pass_is_not_counted_twice(self):
+        """A cab ride happens during shore leave; it is not extra time ashore."""
+        crew = self.crew()
+        self.pass_for(crew, out=_at(9), back=_at(17))
+        self.trip_for(crew, started=_at(11), completed=_at(12))
+
+        result = self.report()
+
+        self.assertEqual(result.crew_went_ashore, 1)
+        self.assertEqual(result.average_duration_minutes, 480)
+
+    def test_crew_still_ashore_do_not_drag_the_average_to_zero(self):
+        """No return time means no measurable duration, not a duration of nought."""
+        returned = self.crew()
+        still_out = self.crew()
+        self.pass_for(returned, out=_at(10), back=_at(12))
+        self.pass_for(still_out, out=_at(10), back=None)
+
+        result = self.report()
+
+        self.assertEqual(result.crew_went_ashore, 2)
+        self.assertEqual(result.still_ashore, 1)
+        self.assertEqual(result.average_duration_minutes, 120)
+
+
+class TripReportingDayTests(ShoreLeaveAverageTests):
+    """A trip belongs to the day it ran, matching a shore pass's out_time."""
+
+    def test_a_trip_booked_before_midnight_counts_on_the_day_it_ran(self):
+        """Booked at 23:30 the night before, driven at 00:30 this morning."""
+        crew = self.crew()
+        self.trip_for(
+            crew,
+            created=_at(23, 30, day=4),
+            started=_at(0, 30), completed=_at(1, 30),
+        )
+
+        result = self.report()
+
+        self.assertEqual(result.completed_trips, 1)
+        self.assertEqual(result.crew_went_ashore, 1)
+        self.assertEqual(result.average_duration_minutes, 60)
+
+    def test_a_trip_that_ran_the_next_day_is_not_on_this_report(self):
+        """Booked at 23:30 tonight, driven after midnight — that is tomorrow."""
+        crew = self.crew()
+        self.trip_for(
+            crew,
+            created=_at(23, 30),
+            started=_at(0, 30, day=6), completed=_at(1, 30, day=6),
+        )
+
+        result = self.report()
+
+        self.assertEqual(result.completed_trips, 0)
+        self.assertEqual(result.crew_went_ashore, 0)
+        self.assertIsNone(result.average_duration_minutes)
+
+    def test_a_booking_that_never_started_stays_on_the_day_it_was_booked(self):
+        crew = self.crew()
+        self.db.add(CabBooking(
+            booking_id=_uniq("CAB"), crew_id=crew.id,
+            pickup_address="Gate", pickup_lat=0, pickup_lng=0,
+            drop_address="City", drop_lat=0, drop_lng=0,
+            vehicle_type="ac", vehicle_name="Sedan",
+            estimated_price=100, distance_km=5,
+            status=BookingStatus.PENDING,
+            created_at=_at(9),
+        ))
+        self.db.flush()
+
+        result = self.report()
+
+        self.assertEqual(result.completed_trips, 0)
+        # Booked but never driven: nobody has gone ashore on it yet.
+        self.assertEqual(result.crew_went_ashore, 1)
+        self.assertIsNone(result.average_duration_minutes)
+
+
+if __name__ == "__main__":
+    unittest.main()

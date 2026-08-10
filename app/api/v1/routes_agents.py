@@ -925,10 +925,25 @@ def shore_leave_report(
         ShorePass.out_time < day_end,
     ).all() if crew_profile_ids else []
 
+    # A trip belongs to the day it ran. That is what a shore pass's out_time
+    # already means, and anchoring trips on created_at instead disagreed with
+    # it: a cab booked at 23:50 and driven after midnight landed wholly on the
+    # earlier day, while one booked the night before and driven this morning
+    # was left out of this day entirely.
+    #
+    # A trip that never started put nobody ashore and has no running time, so
+    # it stays on the day it was booked rather than disappearing from the count.
+    trip_start = func.coalesce(CabBooking.trip_started_at, CabBooking.started_at)
     day_trips = db.query(CabBooking).filter(
         CabBooking.crew_id.in_(crew_profile_ids),
-        CabBooking.created_at >= day_start,
-        CabBooking.created_at < day_end,
+        or_(
+            and_(trip_start.isnot(None), trip_start >= day_start, trip_start < day_end),
+            and_(
+                trip_start.is_(None),
+                CabBooking.created_at >= day_start,
+                CabBooking.created_at < day_end,
+            ),
+        ),
     ).all() if crew_profile_ids else []
 
     # "Went ashore" is a count of people, not of paperwork. A stamped out_time
@@ -944,28 +959,44 @@ def shore_leave_report(
 
     completed_trips = sum(1 for t in day_trips if t.status == BookingStatus.COMPLETED)
 
-    # Average time ashore per person: every trip's running time for the day,
-    # divided by the people who went. Falls back to shore-pass out/in when the
-    # driver lifecycle never stamped the trip.
-    def _span(start, end):
-        if not start or not end:
-            return None
-        seconds = (end - start).total_seconds()
-        return seconds / 60 if seconds >= 0 else None
+    # Average time ashore, measured per crew member across both sources.
+    #
+    # Each person's time ashore is the envelope from their earliest departure to
+    # their latest return. Adding pass time and trip time together would
+    # double-count the ordinary case, because a cab ride happens *during* a
+    # shore pass — it is not additional time off the ship.
+    #
+    # The previous version summed trip minutes only, then divided by a headcount
+    # that also included crew who walked out on a pass without booking a cab. On
+    # any mixed day those people were in the denominator and not the numerator,
+    # so the average always read low.
+    #
+    # Crew who are still ashore have no return time and so no measurable
+    # duration yet. They are left out of both halves rather than counted as
+    # zero, which would drag the average down for the people who did return;
+    # `still_ashore` reports them separately.
+    spans: Dict[int, List[tuple]] = {}
 
-    trip_minutes = [
-        m for m in (
-            _span(t.trip_started_at or t.started_at, t.trip_completed_at or t.completed_at)
-            for t in day_trips
-        ) if m is not None
+    def _record(crew_profile_id, start, end):
+        if crew_profile_id is None or not start or not end or end < start:
+            return
+        spans.setdefault(crew_profile_id, []).append((start, end))
+
+    for p in passes:
+        _record(p.crew_profile_id, p.out_time, p.in_time)
+    for t in day_trips:
+        _record(
+            t.crew_id,
+            t.trip_started_at or t.started_at,
+            t.trip_completed_at or t.completed_at,
+        )
+
+    person_minutes = [
+        (max(end for _, end in person) - min(start for start, _ in person)).total_seconds() / 60
+        for person in spans.values()
     ]
-    pass_minutes = [
-        m for m in (_span(p.out_time, p.in_time) for p in passes) if m is not None
-    ]
-    total_minutes = sum(trip_minutes) or sum(pass_minutes)
     average_minutes = (
-        int(total_minutes / crew_went_ashore)
-        if total_minutes and crew_went_ashore else None
+        int(sum(person_minutes) / len(person_minutes)) if person_minutes else None
     )
 
     day_sos = db.query(CrewSos).filter(
