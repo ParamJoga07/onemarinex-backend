@@ -64,9 +64,12 @@ class Vessel(Base):
             crew_profile_ids = [cp.id for cp in session.query(CrewProfile).filter(CrewProfile.hpid.in_(crew_hpids)).all()]
             if not crew_profile_ids:
                 return 0
+            # Actually ashore: signed out and not yet back. An unused pass is
+            # not a crew member on the quay.
             return session.query(ShorePass).filter(
                 ShorePass.crew_profile_id.in_(crew_profile_ids),
-                ShorePass.in_time.is_(None)
+                ShorePass.out_time.isnot(None),
+                ShorePass.in_time.is_(None),
             ).count()
         except Exception:
             return 0

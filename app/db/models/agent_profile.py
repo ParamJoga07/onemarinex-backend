@@ -20,6 +20,9 @@ class AgentProfile(Base):
     #   agency_logo_url  the agency's logo, printed on the PDF reports
     profile_image = Column(String(512), nullable=True) # URL to image
     agency_logo_url = Column(String(512), nullable=True)
+    # The agency's own crew-support number. Kept here rather than on port_rules,
+    # which the superadmin owns and every agency at the port shares.
+    support_number = Column(String(32), nullable=True)
     agent_identifier = Column(String(64), nullable=True)  # e.g., "12287-28792-87258"
     auth_document_url = Column(String(512), nullable=True)
 

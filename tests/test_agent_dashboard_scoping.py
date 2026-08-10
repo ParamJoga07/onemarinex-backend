@@ -9,6 +9,7 @@ Runs against the configured database inside a transaction that is always rolled
 back, so it leaves no rows behind.
 """
 
+from datetime import datetime, timedelta
 import unittest
 import uuid
 from types import SimpleNamespace
@@ -66,8 +67,13 @@ class AgentDashboardScopingTests(unittest.TestCase):
         self.db.add(VesselCrew(vessel_id=vessel.id, name="Test Crew", rank="AB", hp_id=hpid))
 
         for _ in range(crew_ashore):
-            # in_time NULL == still ashore
-            self.db.add(ShorePass(crew_profile_id=crew.id, shore_pass_id=_uniq("SP")))
+            # Ashore means signed out and not signed back in. A pass with no
+            # out_time was issued but never used, and must not be counted --
+            # that is what made the live tile read 112.
+            self.db.add(ShorePass(
+                crew_profile_id=crew.id, shore_pass_id=_uniq("SP"),
+                out_time=datetime.utcnow() - timedelta(hours=2),
+            ))
 
         for _ in range(live_trips):
             self.db.add(
@@ -182,3 +188,60 @@ class AgentDashboardScopingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CrewAshoreDefinitionTests(unittest.TestCase):
+    """A pass that was issued but never used is not a crew member on the quay.
+
+    The live tile read 112 because it counted every shore pass without an
+    in_time, including pending ones nobody signed out on, so the number only
+    ever grew.
+    """
+
+    def setUp(self):
+        self.connection = engine.connect()
+        self.trans = self.connection.begin()
+        self.db = Session(bind=self.connection)
+
+    def tearDown(self):
+        self.db.close()
+        self.trans.rollback()
+        self.connection.close()
+
+    def make(self, out, back):
+        agent_user = User(email=_uniq("agent") + "@example.com", hashed_password="x", role="agent")
+        crew_user = User(email=_uniq("crew") + "@example.com", hashed_password="x", role="crew")
+        self.db.add_all([agent_user, crew_user])
+        self.db.flush()
+        hpid = _uniq("HP")
+        crew = CrewProfile(user_id=crew_user.id, full_name="Crew", rank="able_seaman",
+                           nationality="IN", hpid=hpid)
+        vessel = Vessel(agent_id=agent_user.id, name=_uniq("MV"), imo_number=_uniq("IMO"),
+                        vessel_type="Bulk Carrier", status="Active")
+        self.db.add_all([crew, vessel])
+        self.db.flush()
+        self.db.add(VesselCrew(vessel_id=vessel.id, name="Crew", rank="able_seaman", hp_id=hpid))
+        self.db.add(ShorePass(crew_profile_id=crew.id, shore_pass_id=_uniq("SP"),
+                              out_time=out, in_time=back))
+        self.db.flush()
+        return SimpleNamespace(id=agent_user.id, role="agent",
+                               agent_profile=SimpleNamespace(assigned_port=None))
+
+    def ashore_for(self, agent):
+        return get_dashboard_data(db=self.db, current_user=agent).stats.crew_in_shore
+
+    def test_an_unused_pass_is_not_counted(self):
+        agent = self.make(out=None, back=None)
+
+        self.assertEqual(self.ashore_for(agent), 0)
+
+    def test_signed_out_and_not_back_is_counted(self):
+        agent = self.make(out=datetime.utcnow() - timedelta(hours=3), back=None)
+
+        self.assertEqual(self.ashore_for(agent), 1)
+
+    def test_returned_crew_is_not_counted(self):
+        agent = self.make(out=datetime.utcnow() - timedelta(hours=3),
+                          back=datetime.utcnow() - timedelta(minutes=20))
+
+        self.assertEqual(self.ashore_for(agent), 0)

@@ -42,6 +42,7 @@ class AgentProfileOut(BaseModel):
     status: str
     profile_image: Optional[str]
     agency_logo_url: Optional[str] = None
+    support_number: Optional[str] = None
     agent_identifier: Optional[str]
     auth_document_url: Optional[str] = None
 
@@ -162,6 +163,7 @@ def get_agent_profile(
         "status": agent_profile.status,
         "profile_image": agent_profile.profile_image,
         "agency_logo_url": agent_profile.agency_logo_url,
+        "support_number": agent_profile.support_number,
         "agent_identifier": agent_profile.agent_identifier,
         "auth_document_url": agent_profile.auth_document_url
     }
@@ -291,11 +293,14 @@ def get_dashboard_data(
     # Active Trips show the same number for every agent.
     vessel_ids, crew_profile_ids = _agent_scope(db, current_user.id)
 
-    # Crew In Shore (active shore passes for agent's vessels)
+    # Crew ashore: they have actually left the ship and not signed back in.
+    # Counting every pass with no in_time also counted passes that were issued
+    # and never used, so the tile grew with each port call and never fell.
     crew_in_shore = 0
     if crew_profile_ids:
         crew_in_shore = db.query(ShorePass).filter(
             ShorePass.crew_profile_id.in_(crew_profile_ids),
+            ShorePass.out_time.isnot(None),
             ShorePass.in_time.is_(None),
         ).count()
 
@@ -400,7 +405,8 @@ def get_dashboard_data(
         if vessel_crew_ids:
             crew_ashore = db.query(ShorePass).filter(
                 ShorePass.crew_profile_id.in_(vessel_crew_ids),
-                ShorePass.in_time.is_(None)
+                ShorePass.out_time.isnot(None),
+                ShorePass.in_time.is_(None),
             ).count()
 
         # 3. SOS/Incidents of ship — the card says "SOS/Incidents", so count both.
@@ -865,6 +871,9 @@ class ShoreLeaveReportOut(BaseModel):
     crew_onboard: int
     eligible_for_shore_leave: int
     crew_went_ashore: int
+    # Share of the crew who were allowed ashore and actually went. Computed
+    # server-side so the report and any other reader agree.
+    shore_leave_utilisation_pct: int = 0
     completed_trips: int
     average_duration_minutes: Optional[int] = None
     returned_safely: int
@@ -916,20 +925,48 @@ def shore_leave_report(
         ShorePass.out_time < day_end,
     ).all() if crew_profile_ids else []
 
-    returned = [p for p in passes if p.in_time]
-    # Averaged over completed shore leaves only — including people still ashore
-    # would drag the average down and misrepresent the day.
-    durations = [
-        (p.in_time - p.out_time).total_seconds() / 60
-        for p in returned if p.in_time and p.out_time
-    ]
-
-    completed_trips = db.query(CabBooking).filter(
+    day_trips = db.query(CabBooking).filter(
         CabBooking.crew_id.in_(crew_profile_ids),
-        CabBooking.status == BookingStatus.COMPLETED,
         CabBooking.created_at >= day_start,
         CabBooking.created_at < day_end,
-    ).count() if crew_profile_ids else 0
+    ).all() if crew_profile_ids else []
+
+    # "Went ashore" is a count of people, not of paperwork. A stamped out_time
+    # proves it, and so does a trip: a shore pass that was approved but never
+    # signed out still left crew counted as aboard while their cab was running,
+    # which is how the report could read "0 went ashore" beside completed trips.
+    ashore_crew = {p.crew_profile_id for p in passes if p.out_time}
+    ashore_crew |= {t.crew_id for t in day_trips if t.crew_id}
+    crew_went_ashore = len(ashore_crew)
+
+    returned_crew = {p.crew_profile_id for p in passes if p.in_time}
+    returned = [p for p in passes if p.in_time]
+
+    completed_trips = sum(1 for t in day_trips if t.status == BookingStatus.COMPLETED)
+
+    # Average time ashore per person: every trip's running time for the day,
+    # divided by the people who went. Falls back to shore-pass out/in when the
+    # driver lifecycle never stamped the trip.
+    def _span(start, end):
+        if not start or not end:
+            return None
+        seconds = (end - start).total_seconds()
+        return seconds / 60 if seconds >= 0 else None
+
+    trip_minutes = [
+        m for m in (
+            _span(t.trip_started_at or t.started_at, t.trip_completed_at or t.completed_at)
+            for t in day_trips
+        ) if m is not None
+    ]
+    pass_minutes = [
+        m for m in (_span(p.out_time, p.in_time) for p in passes) if m is not None
+    ]
+    total_minutes = sum(trip_minutes) or sum(pass_minutes)
+    average_minutes = (
+        int(total_minutes / crew_went_ashore)
+        if total_minutes and crew_went_ashore else None
+    )
 
     day_sos = db.query(CrewSos).filter(
         CrewSos.crew_profile_id.in_(crew_profile_ids),
@@ -943,10 +980,12 @@ def shore_leave_report(
         Incident.created_at < day_end,
     ).all() if hp_ids else []
 
+    eligible_count = sum(1 for c in manifest if c.shore_pass_eligible)
+
     from app.services import incident_taxonomy as tax
 
     agent_profile = current_user.agent_profile
-    still_ashore = len(passes) - len(returned)
+    still_ashore = max(0, crew_went_ashore - len(returned_crew))
     resolved_incidents = sum(
         1 for incident in day_incidents
         if incident.status in {IncidentStatus.RESOLVED, IncidentStatus.CANCELLED}
@@ -969,11 +1008,14 @@ def shore_leave_report(
         report_date=resolved_date,
         generated_at=datetime.utcnow(),
         crew_onboard=len(manifest),
-        eligible_for_shore_leave=sum(1 for c in manifest if c.shore_pass_eligible),
-        crew_went_ashore=len(passes),
+        eligible_for_shore_leave=eligible_count,
+        shore_leave_utilisation_pct=(
+            round(crew_went_ashore * 100 / eligible_count) if eligible_count else 0
+        ),
+        crew_went_ashore=crew_went_ashore,
         completed_trips=completed_trips,
-        average_duration_minutes=int(sum(durations) / len(durations)) if durations else None,
-        returned_safely=len(returned),
+        average_duration_minutes=average_minutes,
+        returned_safely=len(returned_crew),
         still_ashore=still_ashore,
         sos_raised=len(day_sos),
         incidents_reported=len(day_incidents),
