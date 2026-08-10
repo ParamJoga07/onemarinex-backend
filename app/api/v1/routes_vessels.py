@@ -13,6 +13,7 @@ from app.db.models.shore_pass import ShorePass
 from app.db.models.user import User
 from app.api.v1.routes_auth import get_current_user
 from app.services.crew_service import generate_hpid
+from app.services.crew_reference import normalize_nationality, normalize_rank
 import uuid
 
 router = APIRouter()
@@ -135,8 +136,14 @@ def _save_manifest_rows(db: Session, vessel: Vessel, rows, port: Optional[str]) 
         if not name:
             continue
         passport_number = (row.passport_number or "").strip().upper() or None
-        rank = (row.rank or "").strip() or None
-        nationality = (row.nationality or "").strip() or None
+        rank = normalize_rank(row.rank)
+        try:
+            nationality = normalize_nationality(row.nationality, strict=bool(row.nationality))
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Crew member {name}: {exc}",
+            ) from exc
 
         generated_hpid = generate_hpid(passport_number, nationality, port) if passport_number else None
 
@@ -296,7 +303,14 @@ async def upload_crew_manifest(
 
 @router.get("/crew/{hp_id}/profile", response_model=CrewProfileOut)
 def get_crew_profile(hp_id: str, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    v_crew = db.query(VesselCrew).filter(VesselCrew.hp_id == hp_id).first()
+    query = db.query(VesselCrew)
+    if current_user.role == "agent":
+        query = query.join(Vessel, Vessel.id == VesselCrew.vessel_id).filter(
+            Vessel.agent_id == current_user.id
+        )
+    elif current_user.role != "superadmin":
+        raise HTTPException(status_code=403, detail="Agent access required")
+    v_crew = query.filter(VesselCrew.hp_id == hp_id).first()
     if not v_crew:
         raise HTTPException(status_code=404, detail="Crew member not found")
     
@@ -305,9 +319,13 @@ def get_crew_profile(hp_id: str, current_user: User = Depends(get_current_user),
     bookings = []
     visits = []
     if c_profile:
-        bookings = db.query(CabBooking).filter(CabBooking.crew_id == c_profile.id).all()
+        bookings = db.query(CabBooking).filter(
+            CabBooking.crew_id == c_profile.id
+        ).order_by(CabBooking.created_at.desc(), CabBooking.id.desc()).all()
         # Filter shoreline history
-        shore_passes = db.query(ShorePass).filter(ShorePass.crew_profile_id == c_profile.id).all()
+        shore_passes = db.query(ShorePass).filter(
+            ShorePass.crew_profile_id == c_profile.id
+        ).order_by(ShorePass.created_at.desc(), ShorePass.id.desc()).all()
         visits = [sp.port_name for sp in shore_passes if sp.port_name]
 
     return {
@@ -476,7 +494,12 @@ def get_vessel_details(vessel_id: int, current_user: User = Depends(get_current_
 
 @router.get("/{vessel_id}/crew", response_model=List[CrewMemberOut])
 def get_crew_manifest(vessel_id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    vessel = db.query(Vessel).filter(Vessel.id == vessel_id, Vessel.agent_id == current_user.id).first()
+    query = db.query(Vessel).filter(Vessel.id == vessel_id)
+    if current_user.role == "agent":
+        query = query.filter(Vessel.agent_id == current_user.id)
+    elif current_user.role != "superadmin":
+        raise HTTPException(status_code=403, detail="Only agents or superadmins can view crew manifests")
+    vessel = query.first()
     if not vessel:
         raise HTTPException(status_code=404, detail="Vessel not found")
     
@@ -492,13 +515,17 @@ def add_crew_member(vessel_id: int, body: CrewMemberIn, current_user: User = Dep
     port = agent_profile.assigned_port if agent_profile else None
     
     # Generate HPID based on Passport, Nationality, and Port
-    generated_hpid = generate_hpid(body.passport_number, body.nationality, port)
+    try:
+        nationality = normalize_nationality(body.nationality, strict=bool(body.nationality))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    generated_hpid = generate_hpid(body.passport_number, nationality, port)
     
     crew = VesselCrew(
         vessel_id=vessel.id,
         name=body.name,
-        rank=body.rank,
-        nationality=body.nationality,
+        rank=normalize_rank(body.rank) or "other",
+        nationality=nationality,
         hp_id=generated_hpid,
         passport_number=body.passport_number,
         status=body.status,
@@ -578,6 +605,12 @@ class ShorePassValidityOut(BaseModel):
     vessel_id: int
     shore_pass_valid_upto: Optional[datetime] = None
     crew_updated: int
+
+
+class RosterUnlinkOut(BaseModel):
+    action: str
+    vessel_id: int
+    crew_id: Optional[int] = None
 
 
 @router.patch("/{vessel_id}/shore-pass-validity", response_model=ShorePassValidityOut)
@@ -663,9 +696,12 @@ def update_crew_member(
     if body.name is not None:
         crew.name = body.name
     if body.rank is not None:
-        crew.rank = body.rank
+        crew.rank = normalize_rank(body.rank) or crew.rank
     if body.nationality is not None:
-        crew.nationality = body.nationality
+        try:
+            crew.nationality = normalize_nationality(body.nationality, strict=True)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
     if body.passport_number is not None:
         crew.passport_number = body.passport_number.strip().upper()
     if body.shore_pass_eligible is not None:
@@ -677,3 +713,79 @@ def update_crew_member(
     db.refresh(crew)
     return crew
 
+
+@router.delete("/{vessel_id}/assignment", response_model=RosterUnlinkOut)
+def unlink_vessel_from_agent(
+    vessel_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Remove a vessel from an agent roster without deleting platform data."""
+    if current_user.role != "agent":
+        raise HTTPException(status_code=403, detail="Only agents can remove vessel assignments")
+
+    vessel = db.query(Vessel).filter(
+        Vessel.id == vessel_id,
+        Vessel.agent_id == current_user.id,
+    ).first()
+    if not vessel:
+        # Missing and somebody else's vessel are intentionally indistinguishable.
+        raise HTTPException(status_code=404, detail="Vessel not found")
+
+    from app.db.models.agent_roster_event import AgentRosterEvent
+
+    db.add(AgentRosterEvent(
+        actor_user_id=current_user.id,
+        vessel_id=vessel.id,
+        action="VESSEL_UNLINKED",
+        subject_name=vessel.name,
+    ))
+    vessel.agent_id = None
+    db.commit()
+    return RosterUnlinkOut(action="vessel_unlinked", vessel_id=vessel.id)
+
+
+@router.delete("/{vessel_id}/crew/{crew_id}", response_model=RosterUnlinkOut)
+def unlink_crew_from_vessel(
+    vessel_id: int,
+    crew_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Remove one manifest association while preserving account and history."""
+    if current_user.role == "agent":
+        vessel = db.query(Vessel).filter(
+            Vessel.id == vessel_id,
+            Vessel.agent_id == current_user.id,
+        ).first()
+    elif current_user.role == "superadmin":
+        vessel = db.query(Vessel).filter(Vessel.id == vessel_id).first()
+    else:
+        raise HTTPException(
+            status_code=403, detail="Only agents or superadmins can remove crew"
+        )
+    if not vessel:
+        raise HTTPException(status_code=404, detail="Vessel not found")
+
+    crew = db.query(VesselCrew).filter(
+        VesselCrew.id == crew_id,
+        VesselCrew.vessel_id == vessel.id,
+    ).first()
+    if not crew:
+        raise HTTPException(status_code=404, detail="Crew member not found")
+
+    from app.db.models.agent_roster_event import AgentRosterEvent
+
+    db.add(AgentRosterEvent(
+        actor_user_id=current_user.id,
+        vessel_id=vessel.id,
+        crew_manifest_id=crew.id,
+        action="CREW_UNLINKED",
+        subject_name=crew.name,
+        subject_hpid=crew.hp_id,
+    ))
+    db.delete(crew)
+    db.commit()
+    return RosterUnlinkOut(
+        action="crew_unlinked", vessel_id=vessel.id, crew_id=crew_id
+    )

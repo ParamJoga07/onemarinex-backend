@@ -302,7 +302,7 @@ def get_aggregator_dashboard(
                 ),
             )
         )
-        .order_by(CabBooking.created_at.desc())
+        .order_by(CabBooking.created_at.desc(), CabBooking.id.desc())
         .all()
     )
 

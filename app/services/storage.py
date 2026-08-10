@@ -7,6 +7,10 @@ deploys/restarts and are shared across instances. Falls back to local disk
 env vars are absent — keeps the app runnable without cloud credentials.
 
 Environment:
+    STORAGE_BACKEND                 "local", "spaces", or "auto". Defaults to
+                                    local. Production must explicitly opt in to
+                                    Spaces, so copied credentials alone can
+                                    never receive development uploads.
     SPACES_KEY, SPACES_SECRET        access keys
     SPACES_BUCKET                    bucket / space name
     SPACES_REGION                    e.g. blr1, nyc3 (default blr1)
@@ -35,10 +39,18 @@ SPACES_ENDPOINT = os.getenv("SPACES_ENDPOINT", f"https://{SPACES_REGION}.digital
 SPACES_CDN_ENDPOINT = os.getenv("SPACES_CDN_ENDPOINT", "")
 SPACES_PUBLIC = os.getenv("SPACES_PUBLIC", "true").lower() not in ("0", "false", "no")
 PRESIGN_TTL_SECONDS = int(os.getenv("SPACES_PRESIGN_TTL", "3600"))
+STORAGE_BACKEND = os.getenv("STORAGE_BACKEND", "local").strip().lower()
+if STORAGE_BACKEND not in {"local", "spaces", "auto"}:
+    raise RuntimeError("STORAGE_BACKEND must be local, spaces, or auto")
 
 
 def spaces_enabled() -> bool:
-    return bool(SPACES_KEY and SPACES_SECRET and SPACES_BUCKET)
+    configured = bool(SPACES_KEY and SPACES_SECRET and SPACES_BUCKET)
+    if STORAGE_BACKEND == "local":
+        return False
+    if STORAGE_BACKEND == "spaces" and not configured:
+        raise RuntimeError("STORAGE_BACKEND=spaces requires SPACES_KEY, SPACES_SECRET and SPACES_BUCKET")
+    return configured
 
 
 _client = None

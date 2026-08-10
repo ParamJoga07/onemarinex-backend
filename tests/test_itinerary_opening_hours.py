@@ -16,7 +16,13 @@ Two problems fixed here:
 import unittest
 from datetime import datetime
 
-from app.api.v1.routes_itinerary import DAY_ABBREV, vendor_open_during
+from app.api.v1.routes_itinerary import (
+    DAY_ABBREV,
+    ItineraryStop,
+    schedule_itinerary,
+    distance_between_stops,
+    vendor_open_during,
+)
 
 
 class DayAbbrevTests(unittest.TestCase):
@@ -95,6 +101,51 @@ class VendorOpenDuringTests(unittest.TestCase):
 
         # A 30-hour window from Monday 10am runs into Tuesday.
         self.assertTrue(vendor_open_during(tuesday_only, self.MONDAY_10AM, 30))
+
+
+class ItinerarySchedulingTests(unittest.TestCase):
+    def stop(self, **overrides):
+        values = dict(
+            vendor_id=1, name="Lunch", category="restaurant", tags=["food"],
+            avg_time_hours=1, distance_from_port=10, rating=4.5,
+            open_time="12:00", close_time="14:00", working_days=["Mon"],
+        )
+        values.update(overrides)
+        return ItineraryStop(**values)
+
+    def test_arrival_waits_for_opening_and_departure_stays_inside_hours(self):
+        result = schedule_itinerary(
+            [self.stop()], datetime(2026, 8, 3, 10, 0), 4, 60, 3,
+        )
+
+        self.assertIsNotNone(result)
+        stops, elapsed = result
+        self.assertEqual(stops[0].scheduled_arrival, "2026-08-03T12:00:00")
+        self.assertEqual(stops[0].scheduled_departure, "2026-08-03T13:00:00")
+        self.assertEqual(elapsed, 190)
+
+    def test_stop_is_rejected_when_full_visit_cannot_finish_before_close(self):
+        result = schedule_itinerary(
+            [self.stop(open_time="10:00", close_time="11:00", avg_time_hours=1)],
+            datetime(2026, 8, 3, 10, 30), 4, 60, 3,
+        )
+
+        self.assertIsNone(result)
+
+    def test_overnight_opening_window_is_supported(self):
+        result = schedule_itinerary(
+            [self.stop(open_time="22:00", close_time="02:00", working_days=["Mon"], distance_from_port=1)],
+            datetime(2026, 8, 3, 21, 30), 4, 60, 3,
+        )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result[0][0].scheduled_arrival, "2026-08-03T22:00:00")
+
+    def test_shared_placeholder_coordinates_use_distance_hints(self):
+        first = self.stop(distance_from_port=2, lat=17.7, lng=83.3)
+        second = self.stop(vendor_id=2, distance_from_port=8, lat=17.7, lng=83.3)
+
+        self.assertEqual(distance_between_stops(first, second, 3), 9)
 
 
 if __name__ == "__main__":

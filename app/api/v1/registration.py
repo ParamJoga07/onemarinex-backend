@@ -13,6 +13,7 @@ from app.db.models.email_verification import EmailVerification
 from app.services.auth import get_password_hash, verify_password, create_access_token, create_refresh_token
 from app.services.crew_service import generate_unique_hpid
 from app.services.email import send_email_verification_code
+from app.services.crew_reference import normalize_nationality, normalize_rank
 from app.api.v1.routes_auth import AuthOut
 from app.core.config import settings
 import random
@@ -184,6 +185,11 @@ def register_crew(body: CrewRegistrationIn, db: Session = Depends(get_db)):
     if body.mobile_number and db.query(User).filter(User.mobile_number == body.mobile_number).first():
         raise HTTPException(status_code=409, detail="Mobile number already registered")
 
+    try:
+        nationality = normalize_nationality(body.nationality, strict=True)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
     # 1. Create User
     user = User(
         name=body.full_name,
@@ -199,8 +205,8 @@ def register_crew(body: CrewRegistrationIn, db: Session = Depends(get_db)):
     crew_profile = CrewProfile(
         user_id=user.id,
         full_name=body.full_name,
-        rank=body.rank,
-        nationality=body.nationality,
+        rank=normalize_rank(body.rank) or "other",
+        nationality=nationality,
         passport_number=body.passport_number,
         date_of_birth=body.date_of_birth
     )
@@ -209,7 +215,7 @@ def register_crew(body: CrewRegistrationIn, db: Session = Depends(get_db)):
 
     # 3. Generate HPID using Passport Number
     crew_profile.hpid = generate_unique_hpid(
-        db, body.passport_number, body.nationality, "port_general",
+        db, body.passport_number, nationality, "port_general",
         unique_fallback=user.id, exclude_profile_id=crew_profile.id,
     )
     

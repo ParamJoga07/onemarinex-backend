@@ -13,7 +13,7 @@ from app.db.models.vessel import Vessel
 from app.db.models.vessel_crew import VesselCrew
 from app.api.v1.routes_auth import get_current_user
 from app.db.models.user import User
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -129,6 +129,7 @@ def get_trip_monitoring(
         FROM cab_bookings cb
         JOIN crew_profiles cp ON cb.crew_id = cp.id
         WHERE cb.crew_id IN ({placeholders})
+        ORDER BY cb.created_at DESC, cb.id DESC
     """)).all()
 
     ongoing = []
@@ -228,11 +229,13 @@ class TripActivityOut(BaseModel):
     driver_name: Optional[str] = None
     driver_phone: Optional[str] = None
     driver_plate: Optional[str] = None
-    stops: List[TripActivityStopOut] = []
+    stops: List[TripActivityStopOut] = Field(default_factory=list)
     stops_reached: int = 0
     stops_total: int = 0
     last_activity_at: Optional[datetime] = None
     tracking_available: bool = False
+    last_reached_point: Optional[TripActivityStopOut] = None
+    next_destination: Optional[TripActivityStopOut] = None
 
 
 @router.get("/{booking_id}/activity", response_model=TripActivityOut)
@@ -283,9 +286,29 @@ def get_trip_activity(
         )
 
     payload = serialize_magic_link_public_payload(magic_link)
-    stops = payload.get("stops") or []
+    # The driver's public payload calls the planned stop collection
+    # ``itinerary``. Reuse it directly so the agent and driver views cannot
+    # disagree about reached state or stop order.
+    stops = payload.get("itinerary") or []
     reached = [s for s in stops if s.get("reached")]
     last_at = max((s.get("reached_at") for s in reached if s.get("reached_at")), default=None)
+    reached_ordered = sorted(
+        reached,
+        key=lambda item: str(item.get("reached_at") or ""),
+    )
+    last_reached = reached_ordered[-1] if reached_ordered else None
+    next_destination = next((item for item in stops if not item.get("reached")), None)
+
+    def stop_out(item):
+        if not item:
+            return None
+        return TripActivityStopOut(
+            id=str(item.get("id")) if item.get("id") is not None else None,
+            name=item.get("name"), address=item.get("address"), type=item.get("type"),
+            reached=bool(item.get("reached")), reached_at=item.get("reached_at"),
+            lat=(item.get("reached_location") or {}).get("lat") or item.get("lat"),
+            lng=(item.get("reached_location") or {}).get("lng") or item.get("lng"),
+        )
 
     return TripActivityOut(
         booking_id=booking.booking_id,
@@ -311,4 +334,6 @@ def get_trip_activity(
         stops_total=len(stops),
         last_activity_at=last_at,
         tracking_available=True,
+        last_reached_point=stop_out(last_reached),
+        next_destination=stop_out(next_destination),
     )

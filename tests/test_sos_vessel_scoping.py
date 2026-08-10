@@ -18,13 +18,15 @@ from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
 from app.api.v1.routes_sos import (
+    SosCustomUpdateIn,
     SosStatusUpdateIn,
+    add_sos_update,
     get_sos_timeline,
     list_sos_requests,
     update_sos_status,
 )
 from app.db.models.crew_profile import CrewProfile
-from app.db.models.crew_sos import CrewSos
+from app.db.models.crew_sos import CrewSos, CrewSosTimelineEvent
 from app.db.models.user import User
 from app.db.models.vessel import Vessel
 from app.db.models.vessel_crew import VesselCrew
@@ -121,6 +123,45 @@ class SosVesselScopingTests(unittest.TestCase):
         self.assertEqual(result.status, "ACKNOWLEDGED")
         self.db.refresh(self.sos_a)
         self.assertIsNotNone(self.sos_a.acknowledged_at)
+
+    def test_status_changes_create_one_persisted_timeline_event_and_are_idempotent(self):
+        update_sos_status(
+            sos_id=self.sos_a.id,
+            body=SosStatusUpdateIn(status="ACKNOWLEDGED"),
+            db=self.db, current_user=self.agent_a,
+        )
+        update_sos_status(
+            sos_id=self.sos_a.id,
+            body=SosStatusUpdateIn(status="ACKNOWLEDGED"),
+            db=self.db, current_user=self.agent_a,
+        )
+
+        count = self.db.query(CrewSosTimelineEvent).filter(
+            CrewSosTimelineEvent.sos_id == self.sos_a.id,
+            CrewSosTimelineEvent.event_type == "ACKNOWLEDGED",
+        ).count()
+        self.assertEqual(count, 1)
+
+    def test_terminal_alert_cannot_be_reopened_or_receive_activity(self):
+        update_sos_status(
+            sos_id=self.sos_a.id,
+            body=SosStatusUpdateIn(status="CLOSED"),
+            db=self.db, current_user=self.agent_a,
+        )
+        with self.assertRaises(HTTPException) as status_error:
+            update_sos_status(
+                sos_id=self.sos_a.id,
+                body=SosStatusUpdateIn(status="ACTIVE"),
+                db=self.db, current_user=self.agent_a,
+            )
+        with self.assertRaises(HTTPException) as update_error:
+            add_sos_update(
+                sos_id=self.sos_a.id,
+                body=SosCustomUpdateIn(label="Late update"),
+                db=self.db, current_user=self.agent_a,
+            )
+        self.assertEqual(status_error.exception.status_code, 409)
+        self.assertEqual(update_error.exception.status_code, 409)
 
     def test_superadmin_still_sees_everything(self):
         superadmin = SimpleNamespace(id=0, role="superadmin", agent_profile=None)

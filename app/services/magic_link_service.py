@@ -211,6 +211,10 @@ def serialize_magic_link_public_payload(magic_link: DriverMagicLink) -> Dict[str
     if not booking:
         raise HTTPException(status_code=404, detail="Linked booking not found")
 
+    def enum_or_value(value: Any) -> Any:
+        """Serialize both current SQLAlchemy enums and legacy string rows."""
+        return getattr(value, "value", value) if value is not None else None
+
     reached_by_stop = _stop_reach_lookup(magic_link)
     itinerary = []
     for stop in (magic_link.itinerary_stops or []):
@@ -237,15 +241,15 @@ def serialize_magic_link_public_payload(magic_link: DriverMagicLink) -> Dict[str
 
     return {
         "booking_id": booking.booking_id,
-        "booking_status": booking.status.value if booking.status else None,
+        "booking_status": enum_or_value(booking.status),
         "otp_verified": magic_link.otp_verified_at is not None,
         "magic_token": magic_link.token,
         "fare": {
             "estimated_price": float(booking.estimated_price) if booking.estimated_price else None,
             "distance_km": float(booking.distance_km) if booking.distance_km else None,
-            "vehicle_type": booking.vehicle_type.value if booking.vehicle_type else None,
+            "vehicle_type": enum_or_value(booking.vehicle_type),
             "vehicle_name": booking.vehicle_name,
-            "ride_type": booking.ride_type.value if booking.ride_type else None,
+            "ride_type": enum_or_value(booking.ride_type),
             "num_passengers": booking.num_passengers,
         },
         "crew": {

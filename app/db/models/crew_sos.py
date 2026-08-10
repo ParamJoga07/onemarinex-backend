@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Float
+from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Float, Text
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 
@@ -29,3 +29,38 @@ class CrewSos(Base):
     user = relationship("User")
     crew_profile = relationship("CrewProfile")
     cab_booking = relationship("CabBooking")
+    timeline = relationship(
+        "CrewSosTimelineEvent", back_populates="sos", cascade="all, delete-orphan",
+        order_by="CrewSosTimelineEvent.event_time",
+    )
+    notes = relationship(
+        "CrewSosNote", back_populates="sos", cascade="all, delete-orphan",
+        order_by="CrewSosNote.created_at",
+    )
+
+
+class CrewSosTimelineEvent(Base):
+    __tablename__ = "crew_sos_timeline_events"
+
+    id = Column(Integer, primary_key=True, index=True)
+    sos_id = Column(Integer, ForeignKey("crew_sos_requests.id", ondelete="CASCADE"), nullable=False, index=True)
+    source = Column(String(16), nullable=False, default="system")
+    event_type = Column(String(64), nullable=False)
+    label = Column(String(255), nullable=False)
+    detail = Column(Text, nullable=True)
+    actor_name = Column(String(255), nullable=True)
+    event_time = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    sos = relationship("CrewSos", back_populates="timeline")
+
+
+class CrewSosNote(Base):
+    __tablename__ = "crew_sos_notes"
+
+    id = Column(Integer, primary_key=True, index=True)
+    sos_id = Column(Integer, ForeignKey("crew_sos_requests.id", ondelete="CASCADE"), nullable=False, index=True)
+    author_name = Column(String(255), nullable=True)
+    note = Column(Text, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    sos = relationship("CrewSos", back_populates="notes")

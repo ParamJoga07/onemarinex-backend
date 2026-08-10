@@ -34,6 +34,7 @@ from app.services.vendor_ranking import (
     categories_for_vendor_section,
     vendor_category_text,
 )
+from app.services.vendor_data import normalize_vendor_information, validate_coordinates
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -539,7 +540,7 @@ def track_cab_bookings(
     if date_to:
         query = query.filter(CabBooking.created_at <= date_to)
 
-    bookings = query.order_by(CabBooking.created_at.desc()).all()
+    bookings = query.order_by(CabBooking.created_at.desc(), CabBooking.id.desc()).all()
     response: List[Dict[str, Any]] = []
     for booking in bookings:
         status_value = (booking.status or "").lower() if booking.status else None
@@ -990,6 +991,11 @@ def create_place(payload: VendorCreate, db: Session = Depends(get_db),current_us
             raise HTTPException(status_code=400, detail=f"Port with ID {port_id} does not exist")
 
     data["category"] = raw_category
+    try:
+        validate_coordinates(data["lat"], data["lng"])
+        data["other_information"] = normalize_vendor_information(data.get("other_information"))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     data["phone"] = (data.get("phone") or "").strip()
     data["email"] = (data.get("email") or "").strip()
     if not data["phone"] or not data["email"]:
@@ -1068,6 +1074,16 @@ def update_place(
         if not port:
             raise HTTPException(status_code=400, detail=f"Port with ID {patch['port_id']} does not exist")
 
+    try:
+        if "other_information" in patch:
+            patch["other_information"] = normalize_vendor_information(patch["other_information"])
+        validate_coordinates(
+            patch.get("lat", vendor.lat),
+            patch.get("lng", vendor.lng),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
     for key, value in patch.items():
         setattr(vendor, key, value)
 
@@ -1117,12 +1133,12 @@ def list_agents_superadmin(
         prof = db.query(AgentProfile).filter(AgentProfile.user_id == u.id).first()
         out.append({
             "id": u.id,
-            "name": u.name,
+            "name": u.name or u.email,
             "email": u.email,
             "mobile_number": u.mobile_number,
-            "agency_name": prof.agency_name if prof else "",
-            "location": prof.location if prof else "",
-            "agent_identifier": prof.agent_identifier if prof else "",
+            "agency_name": (prof.agency_name or "") if prof else "",
+            "location": (prof.location or "") if prof else "",
+            "agent_identifier": (prof.agent_identifier or "") if prof else "",
             "assigned_port": prof.assigned_port if prof else None,
             "license_number": prof.license_number if prof else None,
             "auth_document_url": prof.auth_document_url if prof else None

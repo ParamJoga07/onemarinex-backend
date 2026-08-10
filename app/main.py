@@ -146,6 +146,7 @@ def on_startup():
     ensure_vendor_commission_schema()
     ensure_agent_dashboard_schema()
     ensure_placeholder_helplines_removed()
+    ensure_port_identity_schema()
     ensure_alembic_baseline()
     _log_whatsapp_config()
     _log_chat_moderation_config()
@@ -563,11 +564,45 @@ def ensure_agent_dashboard_schema():
                 )
 
         if "vessels" in tables:
-            columns = {c["name"] for c in inspector.get_columns("vessels")}
+            vessel_columns = {c["name"]: c for c in inspector.get_columns("vessels")}
+            columns = set(vessel_columns)
             if "shore_pass_valid_upto" not in columns:
                 statements.append(
                     "ALTER TABLE vessels ADD COLUMN IF NOT EXISTS shore_pass_valid_upto TIMESTAMP WITH TIME ZONE"
                 )
+            if "agent_id" in vessel_columns and not vessel_columns["agent_id"].get("nullable", True):
+                statements.append(
+                    "ALTER TABLE vessels ALTER COLUMN agent_id DROP NOT NULL"
+                )
+            agent_fk = next(
+                (fk for fk in inspector.get_foreign_keys("vessels") if fk.get("constrained_columns") == ["agent_id"]),
+                None,
+            )
+            if (
+                agent_fk
+                and agent_fk.get("name")
+                and str((agent_fk.get("options") or {}).get("ondelete", "")).upper() != "SET NULL"
+            ):
+                statements.extend([
+                    f'ALTER TABLE vessels DROP CONSTRAINT "{agent_fk["name"]}"',
+                    "ALTER TABLE vessels ADD CONSTRAINT fk_vessels_agent_id "
+                    "FOREIGN KEY (agent_id) REFERENCES users (id) ON DELETE SET NULL",
+                ])
+
+        if "notifications" in tables:
+            columns = {c["name"] for c in inspector.get_columns("notifications")}
+            if "audience_type" not in columns:
+                statements.append(
+                    "ALTER TABLE notifications ADD COLUMN IF NOT EXISTS audience_type VARCHAR(32)"
+                )
+            if "target_vessel_ids" not in columns:
+                statements.append(
+                    "ALTER TABLE notifications ADD COLUMN IF NOT EXISTS target_vessel_ids JSON"
+                )
+            statements.append(
+                "CREATE INDEX IF NOT EXISTS ix_notifications_audience_type "
+                "ON notifications (audience_type)"
+            )
 
         with engine.begin() as connection:
             for statement in statements:
@@ -600,6 +635,9 @@ def ensure_placeholder_helplines_removed():
     placeholders = {
         "placeholder_one": "+91 1800-HEYPORTS",
         "placeholder_two": "+91 1800 425 1234",
+        "agent_placeholder_one": "+91 9876543251",
+        "agent_placeholder_two": "+91 98765403251",
+        "agent_placeholder_three": "+91 9876542064",
     }
     try:
         inspector = inspect(engine)
@@ -612,15 +650,16 @@ def ensure_placeholder_helplines_removed():
                 column["name"] for column in inspector.get_columns(table_name)
             }
             if "helpline_number" in columns:
-                targets.append(table_name)
+                targets.append((table_name, "helpline_number", "helpline_number IN (:placeholder_one, :placeholder_two)"))
+            if table_name == "cab_bookings" and "agent_number" in columns:
+                targets.append((table_name, "agent_number", "agent_number IN (:agent_placeholder_one, :agent_placeholder_two, :agent_placeholder_three)"))
 
         cleared = 0
         with engine.begin() as connection:
-            for table_name in targets:
+            for table_name, column_name, predicate in targets:
                 result = connection.execute(
                     text(
-                        f"UPDATE {table_name} SET helpline_number = NULL "
-                        "WHERE helpline_number IN (:placeholder_one, :placeholder_two)"
+                        f"UPDATE {table_name} SET {column_name} = NULL WHERE {predicate}"
                     ),
                     placeholders,
                 )
@@ -629,6 +668,63 @@ def ensure_placeholder_helplines_removed():
     except Exception:
         log.exception(
             "ensure_placeholder_helplines_removed failed — retired demo helplines may remain visible"
+        )
+
+
+def ensure_port_identity_schema():
+    """Backfill and enforce one canonical identity per port.
+
+    Existing duplicate identities require an explicit reviewed merge through
+    ``scripts/consolidate_ports.py``. The startup guard adds/backfills the
+    column, but deliberately does not guess which duplicate should survive.
+    """
+    from app.services.port_identity import canonical_port_key, reconcile_port_identities
+
+    log = logging.getLogger("app.startup")
+    try:
+        inspector = inspect(engine)
+        if "ports" not in inspector.get_table_names():
+            return
+        columns = {column["name"] for column in inspector.get_columns("ports")}
+        with engine.begin() as connection:
+            if "canonical_key" not in columns:
+                connection.execute(
+                    text("ALTER TABLE ports ADD COLUMN canonical_key VARCHAR(255)")
+                )
+            repair = reconcile_port_identities(connection)
+            rows = connection.execute(text("SELECT id, name, code FROM ports")).mappings()
+            grouped = {}
+            for row in rows:
+                key = canonical_port_key(row["code"] or row["name"])
+                grouped.setdefault(key, []).append(int(row["id"]))
+                connection.execute(
+                    text("UPDATE ports SET canonical_key=:key WHERE id=:id"),
+                    {"key": key, "id": row["id"]},
+                )
+
+            duplicates = {key: ids for key, ids in grouped.items() if len(ids) > 1}
+            if duplicates:
+                log.error(
+                    "canonical port identity not enforced; review and merge duplicate "
+                    "port ids with scripts/consolidate_ports.py: %s",
+                    duplicates,
+                )
+                return
+
+            connection.execute(
+                text(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS "
+                    "ix_ports_canonical_key ON ports (canonical_key)"
+                )
+            )
+            if engine.dialect.name == "postgresql":
+                connection.execute(
+                    text("ALTER TABLE ports ALTER COLUMN canonical_key SET NOT NULL")
+                )
+        log.info("canonical port identity verified: %s", repair)
+    except Exception:
+        log.exception(
+            "ensure_port_identity_schema failed — duplicate port identities may remain"
         )
 
 def ensure_alembic_baseline():

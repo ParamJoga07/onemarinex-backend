@@ -22,10 +22,13 @@ from sqlalchemy.orm import Session
 from app.api.v1.routes_incidents import (
     IncidentResponse,
     StatusUpdate,
+    agent_safety_report_records,
+    agent_safety_report,
     agent_incident_detail,
     update_incident_status,
 )
 from app.db.models.crew_profile import CrewProfile
+from app.db.models.crew_sos import CrewSos
 from app.db.models.incident import (
     Incident,
     IncidentNote,
@@ -178,20 +181,15 @@ class IncidentDetailScopingTests(unittest.TestCase):
         self.assertEqual(result["status"], IncidentStatus.INVESTIGATING)
         self.assertIsNotNone(result["updated_at"])
 
-    def test_reopening_clears_the_closing_stamp(self):
-        """A reopened incident must not keep reporting a resolution time."""
-        asyncio.get_event_loop().run_until_complete(
-            update_incident_status(
-                id=self.incident_a.id, status_update=StatusUpdate(status=IncidentStatus.ACTIVE),
-                db=self.db, current_user=self.agent_a,
+    def test_terminal_incident_cannot_be_reopened(self):
+        with self.assertRaises(HTTPException) as error:
+            asyncio.get_event_loop().run_until_complete(
+                update_incident_status(
+                    id=self.incident_a.id, status_update=StatusUpdate(status=IncidentStatus.ACTIVE),
+                    db=self.db, current_user=self.agent_a,
+                )
             )
-        )
-
-        detail = agent_incident_detail(
-            incident_id=self.incident_a.id, db=self.db, current_user=self.agent_a,
-        )
-        self.assertIsNone(detail["incident"]["resolved_at"])
-        self.assertIsNone(detail["incident"]["resolution_seconds"])
+        self.assertEqual(error.exception.status_code, 409)
 
     def test_non_agents_are_refused(self):
         superadmin = SimpleNamespace(id=self.agent_a.id, role="superadmin")
@@ -202,6 +200,85 @@ class IncidentDetailScopingTests(unittest.TestCase):
             )
 
         self.assertEqual(ctx.exception.status_code, 403)
+
+    def test_safety_report_lists_resolved_record_for_owned_vessel(self):
+        result = agent_safety_report_records(
+            vessel_id=self.incident_a.vessel_id,
+            db=self.db,
+            current_user=self.agent_a,
+        )
+
+        self.assertEqual(result["vessel"]["id"], self.incident_a.vessel_id)
+        self.assertEqual(result["records"][0]["reference"], self.incident_a.incident_id)
+        self.assertEqual(result["records"][0]["status"], "RESOLVED")
+        self.assertIsNotNone(result["records"][0]["resolved_at"])
+
+    def test_safety_report_cannot_probe_another_agents_vessel(self):
+        with self.assertRaises(HTTPException) as denied:
+            agent_safety_report_records(
+                vessel_id=self.incident_b.vessel_id,
+                db=self.db,
+                current_user=self.agent_a,
+            )
+        with self.assertRaises(HTTPException) as missing:
+            agent_safety_report_records(
+                vessel_id=10**9,
+                db=self.db,
+                current_user=self.agent_a,
+            )
+        self.assertEqual(denied.exception.status_code, 404)
+        self.assertEqual(denied.exception.detail, missing.exception.detail)
+
+    def test_report_payload_has_server_stamp_and_enforces_record_ownership(self):
+        own = agent_safety_report(
+            record_kind="incident", record_id=self.incident_a.id,
+            db=self.db, current_user=self.agent_a,
+        )
+        self.assertEqual(own["record_kind"], "incident")
+        self.assertIsNotNone(own["generated_at"].tzinfo)
+        self.assertEqual(own["payload"]["incident"]["id"], self.incident_a.id)
+
+        with self.assertRaises(HTTPException) as denied:
+            agent_safety_report(
+                record_kind="incident", record_id=self.incident_b.id,
+                db=self.db, current_user=self.agent_a,
+            )
+        self.assertEqual(denied.exception.status_code, 404)
+
+    def test_safety_report_includes_active_sos_and_missing_trip_is_safe(self):
+        manifest_hpid = self.db.query(VesselCrew.hp_id).filter(
+            VesselCrew.vessel_id == self.incident_a.vessel_id
+        ).scalar()
+        crew = self.db.query(CrewProfile).filter(
+            CrewProfile.hpid == manifest_hpid
+        ).one()
+        sos = CrewSos(
+            user_id=crew.user_id,
+            crew_profile_id=crew.id,
+            vessel=self.incident_a.vessel.name,
+            status="ACTIVE",
+            lat=17.7019,
+            lng=83.2897,
+        )
+        self.db.add(sos)
+        self.db.flush()
+
+        report = agent_safety_report_records(
+            vessel_id=self.incident_a.vessel_id,
+            db=self.db,
+            current_user=self.agent_a,
+        )
+        self.assertTrue(any(
+            item["kind"] == "sos" and item["id"] == sos.id
+            for item in report["records"]
+        ))
+
+        detail = agent_incident_detail(
+            incident_id=self.incident_a.id,
+            db=self.db,
+            current_user=self.agent_a,
+        )
+        self.assertIsNone(detail["trip"])
 
 
 if __name__ == "__main__":

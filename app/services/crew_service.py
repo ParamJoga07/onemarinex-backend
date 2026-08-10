@@ -44,3 +44,24 @@ def generate_unique_hpid(db, passport_number, nationality, port, unique_fallback
     if query.first() is not None:
         candidate = f"{candidate}-{uuid.uuid4().hex[:4].upper()}"
     return candidate
+
+
+def ensure_stable_hpid(db, profile, *, port=None) -> str:
+    """Issue an HPID once and never derive a replacement from mutable profile data.
+
+    Passport, nationality, vessel and port can legitimately change. They may be
+    used as readable ingredients when an identifier is first issued, but cannot
+    be allowed to change an identifier that is already referenced by incidents,
+    manifests, shore passes and historical reports.
+    """
+    if profile.hpid:
+        return profile.hpid
+    profile.hpid = generate_unique_hpid(
+        db,
+        profile.passport_number,
+        profile.nationality,
+        port or profile.current_port or "port_general",
+        unique_fallback=profile.user_id,
+        exclude_profile_id=profile.id,
+    )
+    return profile.hpid

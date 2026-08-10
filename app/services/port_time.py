@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 import logging
 import re
@@ -201,3 +201,52 @@ def port_closing_buffer_reason(
             f"before the port closes at {closing_time[:5]}."
         )
     return None
+
+
+def port_day_bounds(
+    port_value: Optional[str],
+    configured_timezone: Optional[str] = None,
+    on_date: Optional[str] = None,
+) -> tuple[datetime, datetime, str]:
+    """The UTC instants bracketing one calendar day *at the port*.
+
+    "Today" was previously `datetime.utcnow().replace(hour=0, ...)`, which for
+    an Indian port runs 05:30 IST to 05:30 IST. The agent's "resolved today"
+    tile therefore counted work from yesterday afternoon and stayed empty until
+    half past five each morning.
+
+    `on_date` is a YYYY-MM-DD string as the agent typed it — a date on *their*
+    calendar, not UTC's. Returns (start_utc, end_utc, resolved_date_string).
+    """
+    _, zone = resolve_port_timezone(port_value, configured_timezone)
+
+    if on_date:
+        try:
+            local_midnight = datetime.strptime(on_date, "%Y-%m-%d").replace(tzinfo=zone)
+        except ValueError:
+            raise ValueError("Date must use YYYY-MM-DD format")
+    else:
+        local_midnight = datetime.now(zone).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+
+    start = local_midnight.astimezone(timezone.utc)
+    end = (local_midnight + timedelta(days=1)).astimezone(timezone.utc)
+    return start, end, local_midnight.strftime("%Y-%m-%d")
+
+
+def agent_port_day(db, current_user, on_date: Optional[str] = None):
+    """`port_day_bounds` for the port an agent is assigned to."""
+    from app.db.models.port_rule import PortRule
+
+    port = None
+    profile = getattr(current_user, "agent_profile", None)
+    if profile is not None:
+        port = getattr(profile, "assigned_port", None)
+
+    configured = None
+    if port:
+        row = db.query(PortRule.timezone).filter(PortRule.port_name == port).first()
+        configured = row[0] if row else None
+
+    return port_day_bounds(port, configured, on_date)
