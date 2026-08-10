@@ -103,6 +103,16 @@ class ShoreLeaveAverageTests(unittest.TestCase):
         self.db.flush()
         return profile
 
+    def manifest_only_crew(self, shore_pass_eligible=True):
+        """Someone on the crew list who has never registered an account."""
+        hpid = _uniq("HP")
+        self.db.add(VesselCrew(
+            vessel_id=self.vessel.id, name="Unregistered Crew", rank="oiler",
+            hp_id=hpid, shore_pass_eligible=shore_pass_eligible,
+        ))
+        self.db.flush()
+        return hpid
+
     def pass_for(self, crew, out, back):
         self.db.add(ShorePass(
             crew_profile_id=crew.id, shore_pass_id=_uniq("SP"),
@@ -157,8 +167,15 @@ class ShoreLeaveAverageTests(unittest.TestCase):
         self.assertEqual(result.crew_went_ashore, 1)
         self.assertEqual(result.average_duration_minutes, 480)
 
-    def test_crew_still_ashore_do_not_drag_the_average_to_zero(self):
-        """No return time means no measurable duration, not a duration of nought."""
+    def test_crew_still_ashore_contribute_no_time_but_stay_in_the_divisor(self):
+        """The figure is leave per *eligible* head, not per completed trip.
+
+        Someone still ashore has no finished duration to add, but they are
+        eligible crew and so remain in the divisor. Two hours over two eligible
+        crew is one hour per head, which is the trade-off this definition
+        accepts: the average moves with how many people got ashore, not only
+        with how long those who did were out.
+        """
         returned = self.crew()
         still_out = self.crew()
         self.pass_for(returned, out=_at(10), back=_at(12))
@@ -168,7 +185,58 @@ class ShoreLeaveAverageTests(unittest.TestCase):
 
         self.assertEqual(result.crew_went_ashore, 2)
         self.assertEqual(result.still_ashore, 1)
-        self.assertEqual(result.average_duration_minutes, 120)
+        self.assertEqual(result.average_duration_minutes, 60)
+
+    def test_one_short_ride_among_six_eligible_crew(self):
+        """The reported case: a ten-minute ride on a ship with six eligible.
+
+        Reported as 10/6 of a minute per eligible head, not as a ten-minute
+        trip and not as the two-and-a-half hours the old envelope produced.
+        """
+        rider = self.crew()
+        for _ in range(5):
+            self.crew()
+        self.trip_for(rider, started=_at(10), completed=_at(10, 10))
+
+        result = self.report()
+
+        self.assertEqual(result.eligible_for_shore_leave, 6)
+        self.assertEqual(result.crew_went_ashore, 1)
+        self.assertAlmostEqual(result.average_duration_minutes, 10 / 6, places=4)
+
+    def test_an_unregistered_passenger_still_counts_as_ashore(self):
+        """A cab booked for three puts three ashore.
+
+        Passengers used to be resolved through crew *accounts*, so anyone on the
+        manifest who had never registered was dropped and a three-person booking
+        was reported as one.
+        """
+        booker = self.crew()
+        registered = self.crew()
+        unregistered_hpid = self.manifest_only_crew()
+
+        self.trip_for(
+            booker, started=_at(10), completed=_at(12),
+            passengers=[registered.hpid, unregistered_hpid],
+        )
+
+        result = self.report()
+
+        self.assertEqual(result.crew_went_ashore, 3)
+        self.assertEqual(result.returned_safely, 3)
+
+    def test_a_passenger_id_that_is_not_on_this_manifest_is_ignored(self):
+        """Passenger IDs are typed by hand and validated nowhere."""
+        booker = self.crew()
+
+        self.trip_for(
+            booker, started=_at(10), completed=_at(12),
+            passengers=["HP-SOMEONE-ELSES-SHIP", "", None],
+        )
+
+        result = self.report()
+
+        self.assertEqual(result.crew_went_ashore, 1)
 
     def test_time_back_aboard_between_two_trips_is_not_shore_leave(self):
         """The "12h 21m" defect: gaps between separate trips billed as leave.

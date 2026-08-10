@@ -146,6 +146,8 @@ def on_startup():
     ensure_vendor_commission_schema()
     ensure_agent_dashboard_schema()
     ensure_agent_support_number()
+    ensure_cab_booking_vessel_id()
+    ensure_agent_agency_rules()
     ensure_placeholder_helplines_removed()
     ensure_port_identity_schema()
     ensure_alembic_baseline()
@@ -625,6 +627,34 @@ def ensure_agent_dashboard_schema():
         )
 
 
+def ensure_cab_booking_vessel_id():
+    """Additive safety net for cab_bookings.vessel_id.
+
+    Mirrors migration a2c3d4e5f6g7. Without it a trip has no ship of its own and
+    has to be attributed by asking who is on a manifest — which drags a crew
+    member's whole trip history onto whichever vessel they most recently joined.
+    """
+    log = logging.getLogger("app.startup")
+    try:
+        inspector = inspect(engine)
+        if "cab_bookings" not in inspector.get_table_names():
+            return
+        columns = {c["name"] for c in inspector.get_columns("cab_bookings")}
+        if "vessel_id" in columns:
+            return
+        with ddl_transaction() as connection:
+            connection.execute(text(
+                "ALTER TABLE cab_bookings ADD COLUMN IF NOT EXISTS vessel_id INTEGER"
+            ))
+            connection.execute(text(
+                "CREATE INDEX IF NOT EXISTS ix_cab_bookings_vessel_id "
+                "ON cab_bookings (vessel_id)"
+            ))
+        log.info("cab booking vessel_id column added")
+    except Exception:
+        log.exception("ensure_cab_booking_vessel_id failed")
+
+
 def ensure_agent_support_number():
     """Additive safety net for agent_profiles.support_number.
 
@@ -647,6 +677,30 @@ def ensure_agent_support_number():
         log.info("agent support number column added")
     except Exception:
         log.exception("ensure_agent_support_number failed")
+
+
+def ensure_agent_agency_rules():
+    """Additive safety net for agent_profiles.agency_rules.
+
+    Mirrors migration b3d4e5f6g7h8. Without it an agent editing their crew rules
+    falls back to writing the shared port_rules row, which is the behaviour this
+    column exists to stop.
+    """
+    log = logging.getLogger("app.startup")
+    try:
+        inspector = inspect(engine)
+        if "agent_profiles" not in inspector.get_table_names():
+            return
+        columns = {c["name"] for c in inspector.get_columns("agent_profiles")}
+        if "agency_rules" in columns:
+            return
+        with ddl_transaction() as connection:
+            connection.execute(text(
+                "ALTER TABLE agent_profiles ADD COLUMN IF NOT EXISTS agency_rules JSON"
+            ))
+        log.info("agent agency rules column added")
+    except Exception:
+        log.exception("ensure_agent_agency_rules failed")
 
 
 def ensure_placeholder_helplines_removed():

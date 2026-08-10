@@ -695,18 +695,35 @@ def _agent_sos_records(db: Session, agent_user_id: int, vessel_id: Optional[int]
     """This agent's SOS alerts, shaped like the incident rows beside them."""
     from app.db.models.crew_sos import CrewSos
     from app.db.models.vessel import Vessel
+    from app.services import crew_linkage
     from app.services.crew_linkage import vessel_crew_profile_ids
 
     vessels = db.query(Vessel).filter(Vessel.agent_id == agent_user_id)
     if vessel_id is not None:
         vessels = vessels.filter(Vessel.id == vessel_id)
 
+    from app.db.models.crew_profile import CrewProfile
+
     records: List[dict] = []
     for vessel in vessels.all():
         crew_ids = vessel_crew_profile_ids(db, vessel)
+        # The crew column reads off the person, not the SOS row: crew_email is
+        # frequently unset on older alerts and left the column blank.
+        names = {
+            row.id: row.full_name
+            for row in db.query(CrewProfile.id, CrewProfile.full_name)
+            .filter(CrewProfile.id.in_(crew_ids)).all()
+        } if crew_ids else {}
         if not crew_ids:
             continue
-        for sos in db.query(CrewSos).filter(CrewSos.crew_profile_id.in_(crew_ids)).all():
+        sos_rows = db.query(CrewSos).filter(CrewSos.crew_profile_id.in_(crew_ids)).all()
+        # A crew member who has sailed on two ships is on both manifests, so
+        # both match them above. The SOS stamps the vessel it was raised on;
+        # honouring that stamp is what stops their old ship's emergencies from
+        # following them onto the new one.
+        for sos in crew_linkage.filter_records_for_vessel(
+            vessel, sos_rows, lambda row: row.vessel,
+        ):
             status = str(sos.status or "ACTIVE").upper()
             if status_filter and status != status_filter.upper():
                 continue
@@ -724,7 +741,7 @@ def _agent_sos_records(db: Session, agent_user_id: int, vessel_id: Optional[int]
                 "severity": "critical",
                 "category_label": "SOS Alert",
                 "sub_category_label": None,
-                "reporter_name": sos.crew_email,
+                "reporter_name": names.get(sos.crew_profile_id) or sos.crew_email,
                 "reporter_role": None,
                 "reporter_id": None,
                 "trip_id": sos.trip_id,
@@ -767,6 +784,10 @@ def agent_safety_report_records(
     # to mirror, which is why the vessel page labelled it "Incident".
     crew_ids = vessel_crew_profile_ids(db, vessel)
     sos_rows = db.query(CrewSos).filter(CrewSos.crew_profile_id.in_(crew_ids)).all() if crew_ids else []
+    # Honour the vessel each SOS was raised on, so a crew member joining a new
+    # ship does not drag their previous ship's emergencies onto this report.
+    from app.services import crew_linkage as _linkage
+    sos_rows = _linkage.filter_records_for_vessel(vessel, sos_rows, lambda row: row.vessel)
 
     records = [{
         "kind": "incident", "id": item.id, "reference": item.incident_id,
