@@ -23,10 +23,13 @@ from app.api.v1.routes_notifications import (
     create_notification,
     delete_notification,
     list_notifications_admin,
+    list_notifications_for_crew,
     update_notification,
 )
 from app.db.models.user import User
+from app.db.models.crew_profile import CrewProfile
 from app.db.models.vessel import Vessel
+from app.db.models.vessel_crew import VesselCrew
 from app.db.session import engine
 
 
@@ -151,6 +154,64 @@ class NotificationVesselScopingTests(unittest.TestCase):
             )
 
         self.assertEqual(ctx.exception.status_code, 403)
+
+    def test_all_my_vessels_snapshots_only_the_creators_owned_vessels(self):
+        second = Vessel(
+            agent_id=self.agent_a.id, name=_uniq("MV"), imo_number=_uniq("IMO"),
+            vessel_type="Tanker", status="Active",
+        )
+        self.db.add(second)
+        self.db.flush()
+
+        result = create_notification(
+            body=NotificationCreateIn(
+                title="Weather", message="Heavy weather expected",
+                audience_type="all_agent_vessels",
+            ),
+            db=self.db, current_user=self.agent_a,
+        )
+
+        self.assertEqual(result.audience_type, "all_agent_vessels")
+        self.assertEqual(set(result.target_vessel_ids), {self.vessel_a.id, second.id})
+        self.assertNotIn(self.vessel_b.id, result.target_vessel_ids)
+
+    def test_all_my_vessels_reaches_own_crew_but_not_other_agency(self):
+        crew_user = User(
+            email=_uniq("crew") + "@example.com", hashed_password="x", role="crew"
+        )
+        self.db.add(crew_user)
+        self.db.flush()
+        hpid = _uniq("HP")
+        self.db.add_all([
+            CrewProfile(
+                user_id=crew_user.id, full_name="Crew", rank="able_seaman",
+                nationality="IN", hpid=hpid, current_port=self.PORT,
+                vessel=self.vessel_a.name,
+            ),
+            VesselCrew(
+                vessel_id=self.vessel_a.id, name="Crew", rank="able_seaman", hp_id=hpid,
+            ),
+        ])
+        self.db.flush()
+        create_notification(
+            body=NotificationCreateIn(
+                title="Own fleet", message="For our fleet",
+                audience_type="all_agent_vessels",
+            ),
+            db=self.db, current_user=self.agent_a,
+        )
+        create_notification(
+            body=NotificationCreateIn(
+                title="Other fleet", message="Must not leak",
+                audience_type="all_agent_vessels",
+            ),
+            db=self.db, current_user=self.agent_b,
+        )
+
+        crew = SimpleNamespace(id=crew_user.id, role="crew")
+        visible = list_notifications_for_crew(db=self.db, current_user=crew)
+
+        self.assertEqual([item.title for item in visible], ["Own fleet"])
 
 
 if __name__ == "__main__":

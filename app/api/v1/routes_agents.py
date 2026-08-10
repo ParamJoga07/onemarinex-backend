@@ -3,7 +3,7 @@ import uuid
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 from sqlalchemy.orm import Session
-from sqlalchemy import func, cast, String, or_
+from sqlalchemy import and_, func, cast, String, or_
 from typing import Optional
 from datetime import datetime, timedelta, date as _date
 
@@ -274,7 +274,9 @@ def get_dashboard_data(
     
     # 1. Stats
     vessels_query = db.query(Vessel).filter(Vessel.agent_id == current_user.id)
-    total_vessels = vessels_query.count()
+    total_vessels = vessels_query.filter(
+        Vessel.status.in_(["Active", "Departing"])
+    ).count()
     
     # Vessels this week (simple approach: created in last 7 days)
     from datetime import timedelta
@@ -298,16 +300,23 @@ def get_dashboard_data(
         ).count()
 
     # Trips (Cab Bookings) — this agent's crew only.
-    today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    # "Today" is the port's day, not UTC's: UTC midnight is 05:30 IST, so this
+    # counted from yesterday afternoon and reset mid-morning.
+    from app.services.port_time import agent_port_day
+    today_start, today_end, _ = agent_port_day(db, current_user)
     todays_trips_count = 0
     trips_in_progress_count = 0
     active_trips_count = 0
     live_trips_data = []
     if crew_profile_ids:
         agent_trips = db.query(CabBooking).filter(CabBooking.crew_id.in_(crew_profile_ids))
-        todays_trips_count = agent_trips.filter(CabBooking.created_at >= today_start).count()
+        todays_trips_count = agent_trips.filter(
+            CabBooking.created_at >= today_start,
+            CabBooking.created_at < today_end,
+        ).count()
         trips_in_progress_count = agent_trips.filter(
             CabBooking.created_at >= today_start,
+            CabBooking.created_at < today_end,
             CabBooking.status.in_(LIVE_TRIP_STATUSES),
         ).count()
         # "Active trips" is every trip underway right now, regardless of the day
@@ -315,7 +324,7 @@ def get_dashboard_data(
         active_trips_count = agent_trips.filter(CabBooking.status.in_(LIVE_TRIP_STATUSES)).count()
         live_trips_data = agent_trips.filter(
             CabBooking.status.in_(LIVE_TRIP_STATUSES)
-        ).order_by(CabBooking.created_at.desc()).limit(5).all()
+        ).order_by(CabBooking.created_at.desc(), CabBooking.id.desc()).limit(5).all()
 
     # Incidents raised by this agent's crew. Filtering by port would include
     # every other agency berthed at the same port.
@@ -326,8 +335,16 @@ def get_dashboard_data(
     ] if vessel_ids else []
 
     open_incidents = investigating_incidents = closed_incidents = 0
-    if agent_hp_ids:
-        agent_incidents = db.query(Incident).filter(Incident.reporter_id.in_(agent_hp_ids))
+    if vessel_ids or agent_hp_ids:
+        incident_scope = []
+        if vessel_ids:
+            incident_scope.append(Incident.vessel_id.in_(vessel_ids))
+        if agent_hp_ids:
+            incident_scope.append(and_(
+                Incident.vessel_id.is_(None),
+                Incident.reporter_id.in_(agent_hp_ids),
+            ))
+        agent_incidents = db.query(Incident).filter(or_(*incident_scope))
         open_incidents = agent_incidents.filter(Incident.status == IncidentStatus.ACTIVE).count()
         investigating_incidents = agent_incidents.filter(
             Incident.status == IncidentStatus.INVESTIGATING
@@ -388,11 +405,16 @@ def get_dashboard_data(
 
         # 3. SOS/Incidents of ship — the card says "SOS/Incidents", so count both.
         incidents = 0
+        incident_scope = [Incident.vessel_id == v.id]
         if crew_hpids:
-            incidents = db.query(Incident).filter(
+            incident_scope.append(and_(
+                Incident.vessel_id.is_(None),
                 Incident.reporter_id.in_(crew_hpids),
-                Incident.status.in_([IncidentStatus.ACTIVE, IncidentStatus.INVESTIGATING])
-            ).count()
+            ))
+        incidents = db.query(Incident).filter(
+            or_(*incident_scope),
+            Incident.status.in_([IncidentStatus.ACTIVE, IncidentStatus.INVESTIGATING])
+        ).count()
         if vessel_crew_ids:
             incidents += db.query(CrewSos).filter(
                 CrewSos.crew_profile_id.in_(vessel_crew_ids),
@@ -677,7 +699,7 @@ def get_agent_bookings(
     if date_to:
         query = query.filter(CabBooking.created_at <= date_to)
 
-    bookings = query.order_by(CabBooking.created_at.desc()).all()
+    bookings = query.order_by(CabBooking.created_at.desc(), CabBooking.id.desc()).all()
 
     response: List[Dict[str, Any]] = []
     for booking in bookings:
@@ -832,6 +854,9 @@ class ShoreLeaveReportOut(BaseModel):
     imo_number: Optional[str] = None
     berth: Optional[str] = None
     port_name: Optional[str] = None
+    flag: Optional[str] = None
+    eta: Optional[datetime] = None
+    etd: Optional[datetime] = None
     agency_name: Optional[str] = None
     agency_logo_url: Optional[str] = None
     report_date: str
@@ -846,6 +871,8 @@ class ShoreLeaveReportOut(BaseModel):
     still_ashore: int
     sos_raised: int
     incidents_reported: int
+    incidents_resolved: int
+    outstanding_issues: int
 
     all_returned: bool
     incidents: List[Dict[str, Any]] = []
@@ -868,15 +895,14 @@ def shore_leave_report(
     if not vessel:
         raise HTTPException(status_code=404, detail="Vessel not found")
 
-    if report_date:
-        try:
-            day = datetime.strptime(report_date, "%Y-%m-%d")
-        except ValueError:
-            raise HTTPException(status_code=400, detail="report_date must be YYYY-MM-DD")
-    else:
-        day = datetime.utcnow()
-    day_start = day.replace(hour=0, minute=0, second=0, microsecond=0)
-    day_end = day_start + timedelta(days=1)
+    # The reporting day is the port's calendar day. report_date arrives as the
+    # agent typed it, on their calendar — not UTC's. The window is returned as
+    # UTC instants, which is what every timestamp column is compared against.
+    from app.services.port_time import agent_port_day
+    try:
+        day_start, day_end, resolved_date = agent_port_day(db, current_user, report_date)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="report_date must be YYYY-MM-DD")
 
     manifest = db.query(VesselCrew).filter(VesselCrew.vessel_id == vessel.id).all()
     hp_ids = [c.hp_id for c in manifest if c.hp_id]
@@ -905,11 +931,11 @@ def shore_leave_report(
         CabBooking.created_at < day_end,
     ).count() if crew_profile_ids else 0
 
-    sos_raised = db.query(CrewSos).filter(
+    day_sos = db.query(CrewSos).filter(
         CrewSos.crew_profile_id.in_(crew_profile_ids),
         CrewSos.created_at >= day_start,
         CrewSos.created_at < day_end,
-    ).count() if crew_profile_ids else 0
+    ).all() if crew_profile_ids else []
 
     day_incidents = db.query(Incident).filter(
         Incident.reporter_id.in_(hp_ids),
@@ -921,16 +947,26 @@ def shore_leave_report(
 
     agent_profile = current_user.agent_profile
     still_ashore = len(passes) - len(returned)
+    resolved_incidents = sum(
+        1 for incident in day_incidents
+        if incident.status in {IncidentStatus.RESOLVED, IncidentStatus.CANCELLED}
+    )
+    unresolved_sos = sum(
+        1 for sos in day_sos if str(sos.status or "").upper() not in {"CLOSED", "CANCELLED"}
+    )
 
     return ShoreLeaveReportOut(
         vessel_name=vessel.name,
         imo_number=vessel.imo_number,
         berth=vessel.berth_assignment,
+        flag=vessel.flag,
+        eta=vessel.eta,
+        etd=vessel.etd,
         port_name=(vessel.agent.agent_profile.assigned_port
                    if vessel.agent and getattr(vessel.agent, "agent_profile", None) else None),
         agency_name=agent_profile.agency_name if agent_profile else vessel.agency_name,
         agency_logo_url=agent_profile.agency_logo_url if agent_profile else None,
-        report_date=day_start.strftime("%Y-%m-%d"),
+        report_date=resolved_date,
         generated_at=datetime.utcnow(),
         crew_onboard=len(manifest),
         eligible_for_shore_leave=sum(1 for c in manifest if c.shore_pass_eligible),
@@ -939,8 +975,10 @@ def shore_leave_report(
         average_duration_minutes=int(sum(durations) / len(durations)) if durations else None,
         returned_safely=len(returned),
         still_ashore=still_ashore,
-        sos_raised=sos_raised,
+        sos_raised=len(day_sos),
         incidents_reported=len(day_incidents),
+        incidents_resolved=resolved_incidents,
+        outstanding_issues=still_ashore + unresolved_sos + (len(day_incidents) - resolved_incidents),
         # Drives the "operation successfully completed" checklist. Anyone still
         # ashore means the day is not closed out, whatever else looks fine.
         all_returned=still_ashore == 0,

@@ -18,6 +18,11 @@ env/
 # Logs
 *.log
 scripts/
+!scripts/
+scripts/*
+!scripts/audit_operational_data.py
+!scripts/repair_hpid_links.py
+!scripts/consolidate_ports.py
 apply_port_id_migration.py
 migrations/
 seeds/
@@ -27,3 +32,7 @@ tests/
 
 # Application logs
 logs/
+
+# Local verification artifacts
+output/
+.playwright-cli/

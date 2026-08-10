@@ -21,6 +21,7 @@ from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
 from app.api.v1 import routes_incidents as ri
+from app.db.models.cab_booking import CabBooking, VehicleType
 from app.db.models.crew_profile import CrewProfile
 from app.db.models.incident import Incident, IncidentStatus, IncidentTimelineEvent, IncidentType
 from app.db.models.user import User
@@ -82,6 +83,19 @@ class SafetyCenterTests(unittest.TestCase):
         )
         return run(ri.create_incident(payload, db=self.db, current_user=crew_actor))
 
+    def make_trip(self, crew_actor, suffix="trip"):
+        crew = self.db.query(CrewProfile).filter(CrewProfile.user_id == crew_actor.id).one()
+        booking = CabBooking(
+            booking_id=_uniq(suffix), crew_id=crew.id, port=crew.current_port,
+            pickup_address="Port Gate", pickup_lat=17.7, pickup_lng=83.3,
+            drop_address="City Centre", drop_lat=17.72, drop_lng=83.31,
+            vehicle_type=VehicleType.AC, vehicle_name="Sedan",
+            estimated_price=500, distance_km=8, num_passengers=1,
+        )
+        self.db.add(booking)
+        self.db.flush()
+        return booking
+
     # -- category is actually stored -------------------------------------
 
     def test_category_and_sub_category_are_recorded(self):
@@ -128,6 +142,73 @@ class SafetyCenterTests(unittest.TestCase):
 
         self.assertEqual(result["vessel_id"], self.vessel_a.id)
         self.assertEqual(result["vessel_name"], self.vessel_a.name)
+
+    def test_crew_cannot_choose_an_incident_recipient(self):
+        """A crafted aggregator_id must not redirect a crew incident."""
+        result = self.raise_incident(
+            self.crew_a, category="general_support", aggregator_id=987654321
+        )
+
+        incident = self.db.query(Incident).filter(Incident.id == result["id"]).one()
+        self.assertIsNone(incident.aggregator_id)
+        self.assertEqual(incident.vessel_id, self.vessel_a.id)
+
+    def test_crew_can_explicitly_attach_own_trip(self):
+        booking = self.make_trip(self.crew_a)
+        result = self.raise_incident(
+            self.crew_a, category="general_support", trip_id=booking.booking_id
+        )
+        self.assertEqual(result["trip_id"], booking.booking_id)
+
+    def test_crew_cannot_attach_another_crews_trip(self):
+        other_trip = self.make_trip(self.crew_b)
+        with self.assertRaises(HTTPException) as ctx:
+            self.raise_incident(
+                self.crew_a, category="general_support", trip_id=other_trip.booking_id
+            )
+        self.assertEqual(ctx.exception.status_code, 404)
+
+    def test_trip_is_not_silently_inferred_when_none_is_selected(self):
+        self.make_trip(self.crew_a)
+        result = self.raise_incident(self.crew_a, category="general_support")
+        self.assertIsNone(result["trip_id"])
+
+    def test_eligible_trip_list_is_crew_scoped(self):
+        own = self.make_trip(self.crew_a, "own")
+        other = self.make_trip(self.crew_b, "other")
+        result = ri.list_eligible_incident_trips(db=self.db, current_user=self.crew_a)
+        ids = [item["trip_id"] for item in result["trips"]]
+        self.assertIn(own.booking_id, ids)
+        self.assertNotIn(other.booking_id, ids)
+
+    def test_vessel_resolution_falls_back_to_passport(self):
+        """Legacy IN/IND HPID mismatches must not leave an incident unassigned."""
+        crew = self.db.query(CrewProfile).filter(
+            CrewProfile.user_id == self.crew_a.id
+        ).one()
+        manifest = self.db.query(VesselCrew).filter(
+            VesselCrew.vessel_id == self.vessel_a.id
+        ).one()
+        passport = _uniq("PASS")
+        crew.passport_number = passport
+        manifest.passport_number = passport
+        manifest.hp_id = _uniq("DIFFERENT-HP")
+        self.db.flush()
+
+        result = self.raise_incident(self.crew_a, category="general_support")
+
+        self.assertEqual(result["vessel_id"], self.vessel_a.id)
+
+    def test_unassigned_vessel_is_retained_for_superadmin_follow_up(self):
+        self.vessel_a.agent_id = None
+        self.db.flush()
+
+        result = self.raise_incident(self.crew_a, category="general_support")
+
+        self.assertEqual(result["vessel_id"], self.vessel_a.id)
+        self.assertEqual(result["routing_status"], "superadmin_follow_up")
+        self.assertIn("retained", result["routing_message"].lower())
+        self.assertIsNotNone(self.db.get(Incident, result["id"]))
 
     # -- timeline ---------------------------------------------------------
 

@@ -18,7 +18,7 @@ from app.db.models.cab_pricing import CabPricing
 from app.db.models.driver import Driver
 from app.db.models.incident import Incident, IncidentStatus, IncidentType
 from app.db.models.notification import Notification
-from app.db.models.crew_sos import CrewSos
+from app.db.models.crew_sos import CrewSos, CrewSosTimelineEvent
 from app.db.models.port import Port
 from app.db.models.port_rule import PortRule
 from app.db.models.aggregator_profile import AggregatorProfile
@@ -34,7 +34,8 @@ from app.db.models.pricing_controls import (
     PricingVehicleVisibility,
 )
 from app.api.v1.routes_auth import get_current_user
-from app.services.crew_service import generate_hpid, generate_unique_hpid
+from app.services.crew_service import generate_hpid, ensure_stable_hpid
+from app.services.crew_reference import normalize_nationality, normalize_rank
 from app.services.booking_service import (
     get_eligible_providers_for_ride,
     vehicle_category_matches,
@@ -331,7 +332,7 @@ class CabBookingCreateOut(BaseModel):
     booking_id: str
     otp: str
     status: str
-    agent_number: str
+    agent_number: Optional[str] = None
 
 class CabBookingDetailsOut(BaseModel):
     booking_id: str
@@ -343,7 +344,7 @@ class CabBookingDetailsOut(BaseModel):
     driver_phone: Optional[str]
     assigned_driver_id: Optional[int] = None
     otp: str
-    agent_number: str
+    agent_number: Optional[str] = None
     helpline_number: Optional[str] = None
     status: str
     ride_type: Optional[str] = None
@@ -632,13 +633,9 @@ def sync_crew_manifest_helper(profile: CrewProfile, db: Session):
             if vessel_port and not profile.current_port:
                 profile.current_port = vessel_port
                 
-            # Keep HPID aligned
-            new_hpid = generate_unique_hpid(
-                db, profile.passport_number, profile.nationality, profile.current_port,
-                unique_fallback=profile.user_id, exclude_profile_id=profile.id,
-            )
-            profile.hpid = new_hpid
-            v_crew.hp_id = new_hpid
+            # The profile HPID is an immutable public identity. Align the
+            # manifest to it; never regenerate it from mutable port/profile data.
+            v_crew.hp_id = ensure_stable_hpid(db, profile)
             
             # 3. Auto-generate ShorePass if not exists (only if vessel is under a listed agency)
             agency_name = vessel.agency_name
@@ -699,15 +696,18 @@ def update_crew_profile(
     
     # Partial update: only update if field is present in request
     update_data = body.model_dump(exclude_unset=True)
+    if "nationality" in update_data:
+        try:
+            update_data["nationality"] = normalize_nationality(update_data["nationality"], strict=True)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if "rank" in update_data:
+        update_data["rank"] = normalize_rank(update_data["rank"])
     for field, value in update_data.items():
         setattr(profile, field, value)
         
-    # Regenerate hpid if port, nationality, or passport number changed
-    if "current_port" in update_data or "nationality" in update_data or "passport_number" in update_data:
-        profile.hpid = generate_unique_hpid(
-            db, profile.passport_number, profile.nationality, profile.current_port,
-            unique_fallback=profile.user_id, exclude_profile_id=profile.id,
-        )
+    # HPID is intentionally not regenerated when mutable profile fields change.
+    ensure_stable_hpid(db, profile)
 
     try:
         db.commit()
@@ -851,7 +851,7 @@ def _active_sos_booking(db: Session, crew_profile_id: int) -> Optional[CabBookin
                 BookingStatus.ON_TRIP,
             ]),
         )
-        .order_by(CabBooking.created_at.desc())
+        .order_by(CabBooking.created_at.desc(), CabBooking.id.desc())
         .first()
     )
 
@@ -1016,6 +1016,14 @@ def trigger_sos(
     )
     db.add(new_sos)
     db.flush()
+    db.add(CrewSosTimelineEvent(
+        sos_id=new_sos.id,
+        source="system",
+        event_type="TRIGGERED",
+        label="SOS triggered by crew",
+        detail="Location and active trip were verified by the server.",
+        actor_name=profile.full_name,
+    ))
 
     location_text = "this location"
     if body.lat is not None and body.lng is not None:
@@ -1040,6 +1048,7 @@ def trigger_sos(
         f"SOS triggered by {profile.full_name} (Vessel: {profile.vessel or 'N/A'}) "
         f"at {port_name}. Location: {body.lat}, {body.lng}"
     )
+    from app.api.v1.routes_incidents import _resolve_vessel_for_crew
     new_incident = Incident(
         incident_id=incident_id,
         type=IncidentType.CREW,
@@ -1051,6 +1060,7 @@ def trigger_sos(
         reporter_role=profile.rank,
         reporter_id=profile.hpid or profile.passport_number,
         trip_id=active_booking.booking_id,
+        vessel_id=_resolve_vessel_for_crew(db, profile),
     )
     db.add(new_incident)
     
@@ -1220,11 +1230,9 @@ def generate_shorepass(
     random_suffix = uuid.uuid4().hex[:4].upper()
     shore_pass_id = f"SP-{port_code}-{vessel_code}-{random_suffix}"
 
-    # Update HPID in profile based on current port and Passport Number
-    profile.hpid = generate_unique_hpid(
-        db, profile.passport_number, profile.nationality, port,
-        unique_fallback=profile.user_id, exclude_profile_id=profile.id,
-    )
+    # Issue once for legacy profiles that do not yet have an HPID. Existing
+    # identities remain stable even when this pass is for a different port.
+    ensure_stable_hpid(db, profile, port=port)
 
     # Generate shore pass
     new_pass = ShorePass(
@@ -2169,10 +2177,10 @@ def book_cab(
         provider_id=None,
         aggregator_id=None,
         aggregator_name=None,
-        agent_number="+91 9876543251",
+        agent_number=booking_port_rule.helpline_number if booking_port_rule else None,
         # The helpline is whatever the super admin configured for this port.
-        # No placeholder fallback: readers already fall back to agent_number,
-        # and a made-up number is worse than none on a 24/7 support row.
+        # No placeholder fallback: a made-up number is worse than an honest
+        # unavailable state on an emergency contact row.
         helpline_number=booking_port_rule.helpline_number if booking_port_rule else None,
         status=BookingStatus.PENDING_PROVIDER_RESPONSE,
     )
@@ -2511,7 +2519,7 @@ def get_booking_history(
             CabBooking.crew_id == profile.id,
             CabBooking.id.in_(invited_booking_ids) if invited_booking_ids else False
         )
-    ).order_by(CabBooking.created_at.desc())
+    ).order_by(CabBooking.created_at.desc(), CabBooking.id.desc())
     
     bookings = query.all()
     

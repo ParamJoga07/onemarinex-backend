@@ -2,8 +2,9 @@ from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import and_
 from sqlalchemy.orm import Session
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from datetime import datetime
+from types import SimpleNamespace
 
 from app.db.session import get_db
 from app.db.models.notification import Notification
@@ -21,6 +22,8 @@ class NotificationCreateIn(BaseModel):
     message: str
     port_name: Optional[str] = None
     vessel: Optional[str] = None
+    vessel_id: Optional[int] = None
+    audience_type: Optional[str] = None
 
 
 class NotificationOut(BaseModel):
@@ -29,6 +32,9 @@ class NotificationOut(BaseModel):
     message: str
     port_name: Optional[str] = None
     vessel: Optional[str] = None
+    audience_type: Optional[str] = None
+    target_vessel_ids: List[int] = Field(default_factory=list)
+    target_vessels: List[str] = Field(default_factory=list)
     sos_id: Optional[int] = None
     created_by: Optional[int] = None
     created_at: datetime
@@ -42,6 +48,8 @@ class NotificationUpdateIn(BaseModel):
     message: Optional[str] = None
     port_name: Optional[str] = None
     vessel: Optional[str] = None
+    vessel_id: Optional[int] = None
+    audience_type: Optional[str] = None
 
 
 class NotificationCrewOut(NotificationOut):
@@ -49,7 +57,8 @@ class NotificationCrewOut(NotificationOut):
     sos_status: Optional[str] = None
 
 
-def _agent_vessel_name(db: Session, agent_user_id: int, vessel: str) -> str:
+def _agent_vessel(db: Session, agent_user_id: int, *, vessel: Optional[str] = None,
+                  vessel_id: Optional[int] = None):
     """Resolve a vessel the agent actually operates, or refuse.
 
     Matched case-insensitively on name, and on IMO number too, so picking from
@@ -59,18 +68,72 @@ def _agent_vessel_name(db: Session, agent_user_id: int, vessel: str) -> str:
     """
     from app.db.models.vessel import Vessel
 
-    wanted = vessel.strip()
+    wanted = (vessel or "").strip()
     owned = db.query(Vessel).filter(Vessel.agent_id == agent_user_id).all()
     for v in owned:
+        if vessel_id is not None and v.id == vessel_id:
+            return v
         if v.name and v.name.strip().lower() == wanted.lower():
-            return v.name
+            return v
         if v.imo_number and v.imo_number.strip().lower() == wanted.lower():
-            return v.name
+            return v
 
     raise HTTPException(
         status_code=403,
         detail="You can only send notifications to your own vessels.",
     )
+
+
+def _resolve_agent_audience(db: Session, agent_user_id: int, audience_type: Optional[str],
+                            vessel: Optional[str], vessel_id: Optional[int]):
+    from app.db.models.vessel import Vessel
+
+    audience = (audience_type or "single_vessel").strip().lower()
+    if audience == "all_my_vessels":
+        audience = "all_agent_vessels"
+    if audience not in {"single_vessel", "all_agent_vessels"}:
+        raise HTTPException(status_code=400, detail="Choose Single vessel or All my vessels.")
+
+    if audience == "single_vessel":
+        if vessel_id is None and not (vessel or "").strip():
+            raise HTTPException(status_code=400, detail="Choose which vessel this notification is for.")
+        target = _agent_vessel(
+            db, agent_user_id, vessel=vessel, vessel_id=vessel_id,
+        )
+        return audience, [target.id], target.name
+
+    owned = db.query(Vessel).filter(Vessel.agent_id == agent_user_id).order_by(Vessel.id).all()
+    if not owned:
+        raise HTTPException(status_code=400, detail="No assigned vessels are available.")
+    return audience, [item.id for item in owned], None
+
+
+def _target_names(db: Session, notification: Notification) -> List[str]:
+    from app.db.models.vessel import Vessel
+
+    ids = [int(item) for item in (notification.target_vessel_ids or []) if str(item).isdigit()]
+    if ids:
+        rows = db.query(Vessel.id, Vessel.name).filter(Vessel.id.in_(ids)).all()
+        names = {row.id: row.name for row in rows}
+        return [names[item] for item in ids if item in names]
+    return [notification.vessel] if notification.vessel else []
+
+
+def _serialize_notification(db: Session, notification: Notification, **extra):
+    return SimpleNamespace(**{
+        "id": notification.id,
+        "title": notification.title,
+        "message": notification.message,
+        "port_name": notification.port_name,
+        "vessel": notification.vessel,
+        "audience_type": notification.audience_type,
+        "target_vessel_ids": notification.target_vessel_ids or [],
+        "target_vessels": _target_names(db, notification),
+        "sos_id": notification.sos_id,
+        "created_by": notification.created_by,
+        "created_at": notification.created_at,
+        **extra,
+    })
 
 
 @router.post("/", response_model=NotificationOut, status_code=status.HTTP_201_CREATED)
@@ -84,6 +147,8 @@ def create_notification(
 
     port_to_set = body.port_name or None
     vessel_to_set = (body.vessel or "").strip() or None
+    audience_type = body.audience_type
+    target_vessel_ids: List[int] = []
 
     if current_user.role == "agent":
         assigned_port = current_user.agent_profile.assigned_port if current_user.agent_profile else None
@@ -91,29 +156,24 @@ def create_notification(
             raise HTTPException(status_code=400, detail="Agent has no assigned port configuration.")
         port_to_set = assigned_port
 
-        # An agent notifies one of their own ships, never the whole port and
-        # never somebody else's vessel. The vessel name is what the crew feed
-        # matches on, so an unchecked value here would reach another agency's
-        # crew.
-        if not vessel_to_set:
-            raise HTTPException(
-                status_code=400,
-                detail="Choose which vessel this notification is for.",
-            )
-        vessel_to_set = _agent_vessel_name(db, current_user.id, vessel_to_set)
+        audience_type, target_vessel_ids, vessel_to_set = _resolve_agent_audience(
+            db, current_user.id, body.audience_type, vessel_to_set, body.vessel_id,
+        )
 
     notification = Notification(
         title=body.title.strip(),
         message=body.message.strip(),
         port_name=port_to_set,
         vessel=vessel_to_set,
+        audience_type=audience_type,
+        target_vessel_ids=target_vessel_ids or None,
         created_by=current_user.id,
     )
 
     db.add(notification)
     db.commit()
     db.refresh(notification)
-    return notification
+    return _serialize_notification(db, notification)
 
 
 @router.get("/admin", response_model=List[NotificationOut])
@@ -128,11 +188,13 @@ def list_notifications_admin(
         # History is the agent's own outbox. Matching on port as well meant he
         # saw — and could edit — notifications raised by every other agency
         # berthed at the same port.
-        return db.query(Notification).filter(
+        rows = db.query(Notification).filter(
             Notification.created_by == current_user.id
         ).order_by(Notification.created_at.desc()).all()
+        return [_serialize_notification(db, row) for row in rows]
 
-    return db.query(Notification).order_by(Notification.created_at.desc()).all()
+    rows = db.query(Notification).order_by(Notification.created_at.desc()).all()
+    return [_serialize_notification(db, row) for row in rows]
 
 
 @router.put("/{notification_id}", response_model=NotificationOut)
@@ -165,20 +227,29 @@ def update_notification(
             notification.port_name = assigned_port
         else:
             notification.port_name = body.port_name or None
-    if body.vessel is not None:
+    audience_changed = bool(
+        {"vessel", "vessel_id", "audience_type"} & set(body.model_fields_set)
+    )
+    if audience_changed:
         vessel = (body.vessel or "").strip() or None
         if current_user.role == "agent":
-            if not vessel:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Choose which vessel this notification is for.",
-                )
-            vessel = _agent_vessel_name(db, current_user.id, vessel)
+            audience, ids, vessel = _resolve_agent_audience(
+                db,
+                current_user.id,
+                body.audience_type or notification.audience_type,
+                vessel or notification.vessel,
+                body.vessel_id,
+            )
+            notification.audience_type = audience
+            notification.target_vessel_ids = ids
+        else:
+            notification.audience_type = body.audience_type
+            notification.target_vessel_ids = [body.vessel_id] if body.vessel_id else None
         notification.vessel = vessel
 
     db.commit()
     db.refresh(notification)
-    return notification
+    return _serialize_notification(db, notification)
 
 
 @router.delete("/{notification_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -205,28 +276,49 @@ def delete_notification(
     return None
 
 
-@router.get("/", response_model=List[NotificationCrewOut])
-def list_notifications_for_crew(
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    if current_user.role not in ["crew", "agent"]:
-        raise HTTPException(status_code=403, detail="Only crew or agents can view notifications")
-
+def _recipient_context(db: Session, current_user):
     port_name = None
     vessel_name = None
-
+    vessel_ids: set[int] = set()
     if current_user.role == "crew":
+        from app.db.models.vessel import Vessel
+        from app.db.models.vessel_crew import VesselCrew
+        from sqlalchemy import func, or_
+
         profile = db.query(CrewProfile).filter(CrewProfile.user_id == current_user.id).first()
         if profile:
             port_name = profile.current_port
             vessel_name = profile.vessel
-    elif current_user.role == "agent":
+            clauses = []
+            if profile.hpid:
+                clauses.append(
+                    func.upper(func.trim(VesselCrew.hp_id)) == profile.hpid.strip().upper()
+                )
+            if profile.passport_number:
+                clauses.append(
+                    func.upper(func.trim(VesselCrew.passport_number))
+                    == profile.passport_number.strip().upper()
+                )
+            if clauses:
+                vessel_ids.update(
+                    row[0] for row in db.query(VesselCrew.vessel_id).filter(or_(*clauses)).all()
+                )
+            if vessel_name:
+                vessel_ids.update(
+                    row[0] for row in db.query(Vessel.id).filter(
+                        func.lower(Vessel.name) == vessel_name.strip().lower()
+                    ).all()
+                )
+    else:
         from app.db.models.agent_profile import AgentProfile
         profile = db.query(AgentProfile).filter(AgentProfile.user_id == current_user.id).first()
         if profile:
             port_name = profile.assigned_port
+    return port_name, vessel_name, vessel_ids
 
+
+def _visible_notifications(db: Session, current_user) -> List[Notification]:
+    port_name, vessel_name, vessel_ids = _recipient_context(db, current_user)
     query = db.query(Notification)
     if current_user.role == "crew":
         query = query.filter(
@@ -235,24 +327,44 @@ def list_notifications_for_crew(
                 Notification.created_by == current_user.id,
             )
         )
-
-    # Match port/vessel: null acts like "all"
     if port_name:
         query = query.filter(
-            (Notification.port_name.is_(None))
-            | (Notification.port_name == port_name)
+            (Notification.port_name.is_(None)) | (Notification.port_name == port_name)
         )
     else:
         query = query.filter(Notification.port_name.is_(None))
 
-    if current_user.role == "crew" and vessel_name:
-        query = query.filter(
-            (Notification.vessel.is_(None)) | (Notification.vessel == vessel_name)
-        )
-    else:
-        query = query.filter(Notification.vessel.is_(None))
+    rows = query.order_by(Notification.created_at.desc(), Notification.id.desc()).all()
+    visible: List[Notification] = []
+    for item in rows:
+        if item.audience_type in {"single_vessel", "all_agent_vessels"}:
+            targets = {
+                int(value) for value in (item.target_vessel_ids or [])
+                if str(value).isdigit()
+            }
+            if current_user.role == "crew" and targets.intersection(vessel_ids):
+                visible.append(item)
+            continue
+        # Backward-compatible platform/port/vessel records.
+        if current_user.role == "crew":
+            if item.vessel is None or (
+                vessel_name and item.vessel.strip().lower() == vessel_name.strip().lower()
+            ):
+                visible.append(item)
+        elif item.vessel is None:
+            visible.append(item)
+    return visible
 
-    notifications = query.order_by(Notification.created_at.desc()).all()
+
+@router.get("/", response_model=List[NotificationCrewOut])
+def list_notifications_for_crew(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if current_user.role not in ["crew", "agent"]:
+        raise HTTPException(status_code=403, detail="Only crew or agents can view notifications")
+
+    notifications = _visible_notifications(db, current_user)
     ids = [n.id for n in notifications]
     sos_ids = [n.sos_id for n in notifications if n.sos_id]
 
@@ -272,18 +384,11 @@ def list_notifications_for_crew(
         sos_status_map = {row[0]: row[1] for row in rows}
 
     return [
-        {
-            "id": n.id,
-            "title": n.title,
-            "message": n.message,
-            "port_name": n.port_name,
-            "vessel": n.vessel,
-            "sos_id": n.sos_id,
-            "created_by": n.created_by,
-            "created_at": n.created_at,
-            "is_read": n.id in read_ids,
-            "sos_status": sos_status_map.get(n.sos_id),
-        }
+        _serialize_notification(
+            db, n,
+            is_read=n.id in read_ids,
+            sos_status=sos_status_map.get(n.sos_id),
+        )
         for n in notifications
     ]
 
@@ -296,44 +401,7 @@ def get_unread_count(
     if current_user.role not in ["crew", "agent"]:
         raise HTTPException(status_code=403, detail="Only crew or agents can view notifications")
 
-    port_name = None
-    vessel_name = None
-
-    if current_user.role == "crew":
-        profile = db.query(CrewProfile).filter(CrewProfile.user_id == current_user.id).first()
-        if profile:
-            port_name = profile.current_port
-            vessel_name = profile.vessel
-    elif current_user.role == "agent":
-        from app.db.models.agent_profile import AgentProfile
-        profile = db.query(AgentProfile).filter(AgentProfile.user_id == current_user.id).first()
-        if profile:
-            port_name = profile.assigned_port
-
-    query = db.query(Notification.id)
-    if current_user.role == "crew":
-        query = query.filter(
-            ~and_(
-                Notification.sos_id.isnot(None),
-                Notification.created_by == current_user.id,
-            )
-        )
-    if port_name:
-        query = query.filter(
-            (Notification.port_name.is_(None))
-            | (Notification.port_name == port_name)
-        )
-    else:
-        query = query.filter(Notification.port_name.is_(None))
-
-    if current_user.role == "crew" and vessel_name:
-        query = query.filter(
-            (Notification.vessel.is_(None)) | (Notification.vessel == vessel_name)
-        )
-    else:
-        query = query.filter(Notification.vessel.is_(None))
-
-    notification_ids = [row[0] for row in query.all()]
+    notification_ids = [item.id for item in _visible_notifications(db, current_user)]
     if not notification_ids:
         return {"count": 0}
 
@@ -353,6 +421,9 @@ def mark_notification_read(
 ):
     if current_user.role not in ["crew", "agent"]:
         raise HTTPException(status_code=403, detail="Only crew or agents can mark notifications")
+
+    if notification_id not in {item.id for item in _visible_notifications(db, current_user)}:
+        raise HTTPException(status_code=404, detail="Notification not found")
 
     existing = db.query(NotificationRead).filter(
         NotificationRead.notification_id == notification_id,

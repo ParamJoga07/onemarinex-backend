@@ -10,19 +10,25 @@ back, so it leaves no rows behind.
 
 import unittest
 import uuid
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 
 import app.db.base  # noqa: F401 — registers every model on Base
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
+from app.api.v1.routes_bookings import _require_magic_link_active
 from app.api.v1.routes_trips import get_trip_activity
 from app.db.models.cab_booking import BookingStatus, CabBooking
+from app.db.models.booking_timeline import BookingTimeline, TimelineEventType
 from app.db.models.crew_profile import CrewProfile
+from app.db.models.driver_magic_link import DriverMagicLink, DriverMagicLinkReachEvent
 from app.db.models.user import User
 from app.db.models.vessel import Vessel
 from app.db.models.vessel_crew import VesselCrew
 from app.db.session import engine
+from app.services.magic_link_service import mark_stop_reached
+from app.services.timeline_service import get_booking_timeline
 
 
 def _uniq(prefix):
@@ -109,6 +115,152 @@ class TripActivityScopingTests(unittest.TestCase):
             self.activity(crew, self.booking_a.booking_id)
 
         self.assertEqual(ctx.exception.status_code, 403)
+
+    def test_last_reached_and_next_destination_use_driver_events(self):
+        link = DriverMagicLink(
+            booking_id=self.booking_a.id,
+            token=_uniq("token"),
+            itinerary_stops=[
+                {"id": "pickup", "name": "Port gate", "type": "pickup"},
+                {"id": "museum", "name": "Museum", "type": "facility"},
+                {"id": "market", "name": "Market", "type": "facility"},
+            ],
+            otp_verified_at=datetime.utcnow(),
+        )
+        self.db.add(link)
+        self.db.flush()
+        now = datetime.utcnow()
+        # Insert in reverse chronological order to prove timestamps, not row
+        # order or planned-stop order, determine the last reached point.
+        self.db.add_all([
+            DriverMagicLinkReachEvent(
+                magic_link_id=link.id, stop_id="pickup", stop_name="Port gate",
+                latitude=17.7, longitude=83.3, reached_at=now,
+            ),
+            DriverMagicLinkReachEvent(
+                magic_link_id=link.id, stop_id="museum", stop_name="Museum",
+                latitude=17.71, longitude=83.31, reached_at=now - timedelta(minutes=10),
+            ),
+        ])
+        self.db.flush()
+
+        result = self.activity(self.agent_a, self.booking_a.booking_id)
+
+        self.assertEqual(result.last_reached_point.id, "pickup")
+        self.assertEqual(result.next_destination.id, "market")
+        self.assertEqual(result.stops_reached, 2)
+
+    def test_repeated_stop_arrival_is_idempotent(self):
+        link = DriverMagicLink(
+            booking_id=self.booking_a.id,
+            token=_uniq("token"),
+            itinerary_stops=[
+                {"id": "pickup", "name": "Port gate", "type": "pickup"},
+                {"id": "museum", "name": "Museum", "type": "facility"},
+            ],
+            otp_verified_at=datetime.utcnow(),
+        )
+        self.db.add(link)
+        self.db.flush()
+
+        first, first_created = mark_stop_reached(
+            self.db, link, "museum", 17.71, 83.31
+        )
+        second, second_created = mark_stop_reached(
+            self.db, link, "museum", 99.0, 99.0
+        )
+
+        self.assertTrue(first_created)
+        self.assertFalse(second_created)
+        self.assertEqual(first.id, second.id)
+        self.assertEqual(
+            self.db.query(DriverMagicLinkReachEvent).filter(
+                DriverMagicLinkReachEvent.magic_link_id == link.id,
+                DriverMagicLinkReachEvent.stop_id == "museum",
+            ).count(),
+            1,
+        )
+
+    def test_completed_and_cancelled_links_reject_new_activity(self):
+        link = DriverMagicLink(
+            booking_id=self.booking_a.id,
+            token=_uniq("token"),
+            itinerary_stops=[
+                {"id": "pickup", "name": "Port gate", "type": "pickup"},
+            ],
+            otp_verified_at=datetime.utcnow(),
+        )
+        self.db.add(link)
+        self.db.flush()
+
+        for terminal in (BookingStatus.COMPLETED, BookingStatus.CANCELLED):
+            with self.subTest(status=terminal.value):
+                self.booking_a.status = terminal
+                self.db.flush()
+                with self.assertRaises(HTTPException) as error:
+                    _require_magic_link_active(link)
+                self.assertEqual(error.exception.status_code, 409)
+
+    def test_lifecycle_and_reach_events_form_one_chronological_timeline(self):
+        link = DriverMagicLink(
+            booking_id=self.booking_a.id,
+            token=_uniq("token"),
+            itinerary_stops=[
+                {"id": "pickup", "name": "Port gate", "type": "pickup"},
+                {"id": "museum", "name": "Museum", "type": "facility"},
+                {"id": "market", "name": "Market", "type": "facility"},
+            ],
+            otp_verified_at=datetime.utcnow(),
+        )
+        self.db.add(link)
+        self.db.flush()
+        base = datetime.utcnow() - timedelta(hours=1)
+        lifecycle = [
+            (TimelineEventType.BOOKING_CREATED, 0),
+            (TimelineEventType.PROVIDER_NOTIFIED, 2),
+            (TimelineEventType.PROVIDER_ACCEPTED, 4),
+            (TimelineEventType.DRIVER_ASSIGNED, 6),
+            (TimelineEventType.TRIP_STARTED, 8),
+            (TimelineEventType.TRIP_COMPLETED, 14),
+        ]
+        self.db.add_all([
+            BookingTimeline(
+                booking_id=self.booking_a.id,
+                event_type=event_type.value,
+                event_time=base + timedelta(minutes=minute),
+            )
+            for event_type, minute in reversed(lifecycle)
+        ])
+        self.db.add_all([
+            DriverMagicLinkReachEvent(
+                magic_link_id=link.id,
+                stop_id="museum",
+                stop_name="Museum",
+                latitude=17.71,
+                longitude=83.31,
+                reached_at=base + timedelta(minutes=12),
+            ),
+            DriverMagicLinkReachEvent(
+                magic_link_id=link.id,
+                stop_id="pickup",
+                stop_name="Port gate",
+                latitude=17.70,
+                longitude=83.30,
+                reached_at=base + timedelta(minutes=10),
+            ),
+        ])
+        self.db.flush()
+
+        timeline = get_booking_timeline(self.db, self.booking_a.id)
+        labels = [item["event_label"] for item in timeline]
+        timestamps = [item["event_time"] for item in timeline]
+
+        self.assertEqual(labels.count("Port gate reached"), 1)
+        self.assertEqual(labels.count("Museum reached"), 1)
+        self.assertNotIn("Market reached", labels)
+        self.assertEqual(timestamps, sorted(timestamps))
+        self.assertLess(labels.index("Trip Started"), labels.index("Port gate reached"))
+        self.assertLess(labels.index("Museum reached"), labels.index("Trip Completed"))
 
 
 if __name__ == "__main__":

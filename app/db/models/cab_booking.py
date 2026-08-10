@@ -4,6 +4,7 @@ from datetime import datetime
 import enum
 
 from app.db.base import Base
+from app.db.types import UTCDateTime
 
 
 class BookingStatus(str, enum.Enum):
@@ -66,7 +67,7 @@ class CabBooking(Base):
     num_passengers = Column(Integer, nullable=False, default=1)
     crew_member_ids = Column(JSON, nullable=True)
 
-    scheduled_time = Column(DateTime, nullable=True)
+    scheduled_time = Column(UTCDateTime, nullable=True)
 
     provider_id = Column(Integer, ForeignKey("aggregator_profiles.id"), nullable=True)
     provider_response_status = Column(String(32), nullable=True)
@@ -89,9 +90,10 @@ class CabBooking(Base):
     driver_phone = Column(String, nullable=True)
     driver_plate = Column(String, nullable=True)
     aggregator_name = Column(String, nullable=True)
-    agent_number = Column(String, default="+91 9876543251")
+    agent_number = Column(String, nullable=True)
     # Set per booking from the port's configured helpline. Readers fall back to
-    # agent_number, so there is deliberately no placeholder default here.
+    # Missing verified contact data is shown honestly; never fill either field
+    # with a demo number.
     helpline_number = Column(String, nullable=True)
     otp = Column(String(10), nullable=True)
     arrived_at = Column(DateTime(timezone=True), nullable=True)
@@ -104,8 +106,8 @@ class CabBooking(Base):
         nullable=False,
     )
 
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    created_at = Column(UTCDateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(UTCDateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 
     timeline_events = relationship(
         "BookingTimeline",

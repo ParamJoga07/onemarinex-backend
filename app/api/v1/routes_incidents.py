@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 from typing import List, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 import uuid
 from app.db.session import get_db
 from app.db.models.incident import Incident, IncidentNote, IncidentStatus, IncidentType
@@ -57,7 +57,8 @@ class IncidentBase(BaseModel):
     port_name: Optional[str] = None
 
 class IncidentCreate(IncidentBase):
-    aggregator_id: Optional[int] = None
+    # Recipient/aggregator is always derived from the authenticated actor.
+    pass
 
 class IncidentResponse(IncidentBase):
     id: int
@@ -72,6 +73,8 @@ class IncidentResponse(IncidentBase):
     aggregator_id: Optional[int] = None
     created_at: datetime
     updated_at: datetime
+    routing_status: str = "assigned"
+    routing_message: Optional[str] = None
     notes: List[IncidentNoteResponse] = []
 
     class Config:
@@ -95,7 +98,7 @@ def _agent_incident_filter(db: Session, agent_user_id: int):
     a manifest — and every incident raised under the old HPID then silently
     disappeared from this list while the crew member was still aboard.
 
-    The HPID clause is kept only for older rows written before `vessel_id`
+    HPIDs are now immutable once issued. The HPID clause is kept only for older rows written before `vessel_id`
     existed, which would otherwise vanish.
     """
     from sqlalchemy import and_, or_
@@ -129,18 +132,44 @@ def _agent_hpids_and_vessels(db: Session, agent_user_id: int):
     return list(hpid_to_vessel.keys()), hpid_to_vessel
 
 
-def _resolve_vessel_for_reporter(db: Session, reporter_hpid: Optional[str]) -> Optional[int]:
-    """Which ship a reporter sails on, so an incident can be linked to it.
+def _resolve_vessel_for_crew(db: Session, crew) -> Optional[int]:
+    """Resolve the crew member's vessel from server-owned identity fields.
 
-    Set once at creation. Relying on the HPID lookup at read time meant an
-    incident became unfindable the moment a crew member left the manifest.
+    The browser must never choose who receives a crew incident. HPID is the
+    primary link, with passport and current vessel name as compatibility paths
+    for legacy rows affected by the historical IN/IND HPID mismatch.
     """
-    if not reporter_hpid:
-        return None
+    from app.db.models.vessel import Vessel
     from app.db.models.vessel_crew import VesselCrew
+    from sqlalchemy import func, or_
 
-    row = db.query(VesselCrew.vessel_id).filter(VesselCrew.hp_id == reporter_hpid).first()
-    return row[0] if row else None
+    if crew is None:
+        return None
+
+    identity_clauses = []
+    if crew.hpid:
+        identity_clauses.append(
+            func.upper(func.trim(VesselCrew.hp_id)) == crew.hpid.strip().upper()
+        )
+    if crew.passport_number:
+        identity_clauses.append(
+            func.upper(func.trim(VesselCrew.passport_number))
+            == crew.passport_number.strip().upper()
+        )
+
+    query = db.query(VesselCrew.vessel_id).join(
+        Vessel, Vessel.id == VesselCrew.vessel_id
+    )
+    if identity_clauses:
+        match = query.filter(or_(*identity_clauses)).first()
+        if match:
+            return match[0]
+
+    if crew.vessel:
+        match = query.filter(Vessel.name == crew.vessel).first()
+        if match:
+            return match[0]
+    return None
 
 
 def _record_timeline(db: Session, incident: Incident, event_type: str, label: str,
@@ -164,9 +193,19 @@ def _serialize_incident(db: Session, incident: Incident) -> dict:
     from app.db.models.vessel import Vessel
 
     vessel_name = None
+    responsible_agent_id = None
     if incident.vessel_id:
-        v = db.query(Vessel.name).filter(Vessel.id == incident.vessel_id).first()
+        v = db.query(Vessel.name, Vessel.agent_id).filter(
+            Vessel.id == incident.vessel_id
+        ).first()
         vessel_name = v[0] if v else None
+        responsible_agent_id = v[1] if v else None
+
+    routing_status = "assigned" if responsible_agent_id else "superadmin_follow_up"
+    routing_message = None if responsible_agent_id else (
+        "No responsible shipping agent is currently assigned. The incident "
+        "was retained for superadmin follow-up."
+    )
 
     return {
         "id": incident.id,
@@ -195,6 +234,8 @@ def _serialize_incident(db: Session, incident: Incident) -> dict:
         # response validation with a 500, so the client saw an error for a
         # change that had actually been saved.
         "updated_at": incident.updated_at,
+        "routing_status": routing_status,
+        "routing_message": routing_message,
     }
 
 
@@ -208,6 +249,42 @@ def list_incident_categories():
     from app.services import incident_taxonomy as tax
 
     return {"categories": tax.INCIDENT_CATEGORIES, "severities": tax.SEVERITIES}
+
+
+@router.get("/eligible-trips")
+def list_eligible_incident_trips(
+    db: Session = Depends(get_db),
+    current_user = Depends(get_current_user),
+):
+    """Trips the signed-in crew member may explicitly attach to an incident."""
+    if current_user.role != "crew":
+        raise HTTPException(status_code=403, detail="Only crew can select an incident trip")
+
+    from app.db.models.cab_booking import CabBooking
+    from app.db.models.crew_profile import CrewProfile
+
+    crew = db.query(CrewProfile).filter(CrewProfile.user_id == current_user.id).first()
+    if not crew:
+        return {"trips": []}
+    rows = (
+        db.query(CabBooking)
+        .filter(CabBooking.crew_id == crew.id)
+        .order_by(CabBooking.created_at.desc(), CabBooking.id.desc())
+        .limit(50)
+        .all()
+    )
+    return {
+        "trips": [
+            {
+                "trip_id": row.booking_id,
+                "status": row.status.value if hasattr(row.status, "value") else row.status,
+                "pickup_address": row.pickup_address,
+                "drop_address": row.drop_address,
+                "created_at": row.created_at,
+            }
+            for row in rows
+        ]
+    }
 
 
 @router.get("/monitoring")
@@ -333,11 +410,36 @@ async def create_incident(
         from app.db.models.crew_profile import CrewProfile
         crew = db.query(CrewProfile).filter(CrewProfile.user_id == current_user.id).first()
         
+        requested_trip_id = (incident_data.get("trip_id") or "").strip() or None
+
         # Remove fields that we will set explicitly to avoid "multiple values for keyword argument"
-        for field in ["reporter_name", "reporter_role", "reporter_id", "type", "port_name"]:
+        for field in [
+            "aggregator_id",
+            "reporter_name",
+            "reporter_role",
+            "reporter_id",
+            "type",
+            "port_name",
+            "trip_id",
+        ]:
             incident_data.pop(field, None)
 
         reporter_hpid = crew.hpid if crew else None
+        trip_id = None
+        if requested_trip_id:
+            from app.db.models.cab_booking import CabBooking
+            selected_booking = (
+                db.query(CabBooking)
+                .filter(
+                    CabBooking.booking_id == requested_trip_id,
+                    CabBooking.crew_id == crew.id if crew else False,
+                )
+                .first()
+            )
+            if not selected_booking:
+                # Do not reveal whether another crew member owns the supplied id.
+                raise HTTPException(status_code=404, detail="Trip not found")
+            trip_id = selected_booking.booking_id
         incident = Incident(
             **incident_data,
             incident_id=incident_id,
@@ -347,7 +449,8 @@ async def create_incident(
             port_name=crew.current_port if crew else None,
             # Resolved now rather than at read time, so the incident stays
             # findable even if the crew member later leaves the manifest.
-            vessel_id=_resolve_vessel_for_reporter(db, reporter_hpid),
+            vessel_id=_resolve_vessel_for_crew(db, crew),
+            trip_id=trip_id,
             type=IncidentType.CREW
         )
     else:
@@ -363,45 +466,7 @@ async def create_incident(
     db.refresh(incident)
     return _serialize_incident(db, incident)
 
-@router.get("/crew/recipients", response_model=List[dict])
-async def get_incident_recipients(
-    db: Session = Depends(get_db),
-    current_user = Depends(get_current_user)
-):
-    if current_user.role != "crew":
-        raise HTTPException(status_code=403, detail="Only crew can fetch recipients")
-    
-    from app.db.models.crew_profile import CrewProfile
-    from app.db.models.aggregator_profile import AggregatorProfile
-    from app.db.models.port import Port
-    from sqlalchemy import or_
-    
-    crew = db.query(CrewProfile).filter(CrewProfile.user_id == current_user.id).first()
-    if not crew or not crew.current_port:
-        return [{"id": 0, "name": "General Support"}]
-    
-    aggregators = (
-        db.query(AggregatorProfile)
-        .join(Port, AggregatorProfile.operating_port_id == Port.id)
-        .filter(
-            or_(
-                Port.code == crew.current_port,
-                Port.name == crew.current_port,
-            )
-        )
-        .all()
-    )
-    
-    recipients = [{"id": 0, "name": "General Support"}]
-    for agg in aggregators:
-        recipients.append({
-            "id": agg.id,
-            "name": agg.company_name
-        })
-    
-    return recipients
-
-@router.get("/{id}", response_model=IncidentResponse)
+@router.get("/{id:int}", response_model=IncidentResponse)
 async def get_incident(
     id: int,
     db: Session = Depends(get_db),
@@ -439,7 +504,7 @@ async def get_incident(
 class StatusUpdate(BaseModel):
     status: IncidentStatus
 
-@router.patch("/{id}/status", response_model=IncidentResponse)
+@router.patch("/{id:int}/status", response_model=IncidentResponse)
 async def update_incident_status(
     id: int,
     status_update: StatusUpdate,
@@ -447,7 +512,12 @@ async def update_incident_status(
     current_user = Depends(get_current_user)
 ):
     incident = await get_incident(id, db, current_user)
+    incident = db.query(Incident).filter(Incident.id == incident.id).with_for_update().first()
     previous = incident.status
+    if previous == status_update.status:
+        return _serialize_incident(db, incident)
+    if previous in {IncidentStatus.RESOLVED, IncidentStatus.CANCELLED}:
+        raise HTTPException(status_code=409, detail="This incident is already in a terminal state")
     incident.status = status_update.status
 
     now = datetime.utcnow()
@@ -457,9 +527,7 @@ async def update_incident_status(
         incident.resolved_at = now
     if status_update.status == IncidentStatus.CANCELLED and not incident.cancelled_at:
         incident.cancelled_at = now
-    # Reopening clears the closing stamps. Leaving them behind meant an open
-    # incident still carried a resolved-at time, so it would report a
-    # resolution duration for something that is not resolved.
+    # Non-terminal transitions never carry closing stamps.
     if status_update.status in (IncidentStatus.ACTIVE, IncidentStatus.INVESTIGATING):
         incident.resolved_at = None
         incident.cancelled_at = None
@@ -483,7 +551,7 @@ async def update_incident_status(
     db.refresh(incident)
     return _serialize_incident(db, incident)
 
-@router.post("/{id}/notes", response_model=IncidentNoteResponse)
+@router.post("/{id:int}/notes", response_model=IncidentNoteResponse)
 async def add_incident_note(
     id: int,
     note_in: IncidentNoteBase,
@@ -524,7 +592,8 @@ def agent_safety_summary(
     from app.db.models.crew_profile import CrewProfile
 
     hpids, _ = _agent_hpids_and_vessels(db, current_user.id)
-    today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    from app.services.port_time import agent_port_day
+    today_start, today_end, _ = agent_port_day(db, current_user)
 
     active_sos = 0
     avg_response_seconds = None
@@ -562,6 +631,7 @@ def agent_safety_summary(
             Incident.status == IncidentStatus.RESOLVED,
             Incident.resolved_at.isnot(None),
             Incident.resolved_at >= today_start,
+            Incident.resolved_at < today_end,
         ).count()
 
     return {
@@ -601,6 +671,78 @@ def agent_incident_list(
     return {"incidents": [_serialize_incident(db, i) for i in rows]}
 
 
+@router.get("/agent/reports")
+def agent_safety_report_records(
+    vessel_id: int,
+    db: Session = Depends(get_db),
+    current_user = Depends(get_current_user),
+):
+    """Newest-first Incident/SOS report index for one owned vessel."""
+    if current_user.role != "agent":
+        raise HTTPException(status_code=403, detail="Only agents can view reports")
+    from app.db.models.crew_profile import CrewProfile
+    from app.db.models.crew_sos import CrewSos
+    from app.db.models.vessel import Vessel
+    from app.db.models.vessel_crew import VesselCrew
+
+    vessel = db.query(Vessel).filter(
+        Vessel.id == vessel_id, Vessel.agent_id == current_user.id,
+    ).first()
+    if not vessel:
+        raise HTTPException(status_code=404, detail="Vessel not found")
+
+    incidents = db.query(Incident).filter(Incident.vessel_id == vessel.id).all()
+    hpids = [row[0] for row in db.query(VesselCrew.hp_id).filter(
+        VesselCrew.vessel_id == vessel.id, VesselCrew.hp_id.isnot(None),
+    ).all()]
+    crew_ids = []
+    if hpids:
+        crew_ids = [row[0] for row in db.query(CrewProfile.id).filter(
+            CrewProfile.hpid.in_(hpids)
+        ).all()]
+    sos_rows = db.query(CrewSos).filter(CrewSos.crew_profile_id.in_(crew_ids)).all() if crew_ids else []
+
+    records = [{
+        "kind": "incident", "id": item.id, "reference": item.incident_id,
+        "title": item.title, "status": item.status.value,
+        "severity": item.severity, "created_at": item.created_at,
+        "resolved_at": item.resolved_at or item.cancelled_at,
+    } for item in incidents]
+    records.extend({
+        "kind": "sos", "id": item.id, "reference": f"SOS-{item.id}",
+        "title": "SOS Alert", "status": item.status,
+        "severity": "high", "created_at": item.created_at,
+        "resolved_at": item.closed_at or item.cancelled_at,
+    } for item in sos_rows)
+    def report_sort_key(item):
+        created = item.get("created_at")
+        if created is None:
+            timestamp = float("-inf")
+        else:
+            # Legacy Incident timestamps are naive UTC while SOS columns are
+            # timezone-aware. Comparing those datetime objects directly raises
+            # TypeError as soon as a report contains both record types.
+            timestamp = (
+                created.replace(tzinfo=timezone.utc)
+                if created.tzinfo is None
+                else created.astimezone(timezone.utc)
+            ).timestamp()
+        return timestamp, int(item["id"])
+
+    records.sort(key=report_sort_key, reverse=True)
+    return {
+        # Report generation time must be server-authoritative; a changed device
+        # clock must not produce a misleading operational record.
+        "generated_at": datetime.utcnow(),
+        "vessel": {
+            "id": vessel.id, "name": vessel.name, "imo_number": vessel.imo_number,
+            "flag": vessel.flag, "eta": vessel.eta, "etd": vessel.etd,
+            "berth": vessel.berth_assignment,
+        },
+        "records": records,
+    }
+
+
 def _agent_incident_or_404(db: Session, agent_user_id: int, incident_id: int) -> Incident:
     """One incident, only if it belongs to this agent's crew.
 
@@ -638,6 +780,8 @@ def agent_incident_detail(
     from app.db.models.crew_profile import CrewProfile
     from app.db.models.incident import IncidentTimelineEvent
     from app.db.models.user import User
+    from app.db.models.vessel import Vessel
+    from app.services.operations_context import booking_context, find_booking, vessel_context
 
     incident = _agent_incident_or_404(db, current_user.id, incident_id)
 
@@ -683,9 +827,14 @@ def agent_incident_detail(
         resolution_seconds = elapsed if elapsed >= 0 else None
     detail["resolution_seconds"] = resolution_seconds
 
+    vessel = db.query(Vessel).filter(Vessel.id == incident.vessel_id).first() if incident.vessel_id else None
+    booking = find_booking(db, incident.trip_id)
+
     return {
         "incident": detail,
         "reporter": reporter,
+        "vessel": vessel_context(vessel, port_name=incident.port_name),
+        "trip": booking_context(db, booking),
         "timeline": [
             {
                 "id": e.id,
@@ -710,7 +859,34 @@ def agent_incident_detail(
     }
 
 
-@router.get("/{id}/timeline")
+@router.get("/agent/report/{record_kind}/{record_id}")
+def agent_safety_report(
+    record_kind: str,
+    record_id: int,
+    db: Session = Depends(get_db),
+    current_user = Depends(get_current_user),
+):
+    """Canonical, server-stamped payload for Incident and SOS PDF reports."""
+    if current_user.role != "agent":
+        raise HTTPException(status_code=403, detail="Only agents can generate safety reports")
+    kind = record_kind.strip().lower()
+    if kind == "incident":
+        payload = agent_incident_detail(record_id, db=db, current_user=current_user)
+    elif kind == "sos":
+        from app.api.v1.routes_sos import get_sos_timeline
+
+        sos_payload = get_sos_timeline(record_id, db=db, current_user=current_user)
+        payload = sos_payload.model_dump()
+    else:
+        raise HTTPException(status_code=404, detail="Safety record not found")
+    return {
+        "record_kind": kind,
+        "generated_at": datetime.now(timezone.utc),
+        "payload": payload,
+    }
+
+
+@router.get("/{id:int}/timeline")
 async def get_incident_timeline(
     id: int,
     db: Session = Depends(get_db),
@@ -741,3 +917,142 @@ async def get_incident_timeline(
             for e in events
         ],
     }
+
+
+# --- Manual timeline entries ("custom timings") ----------------------------
+
+class TimelineEntryIn(BaseModel):
+    label: str
+    detail: Optional[str] = None
+    event_time: Optional[datetime] = None
+    event_type: Optional[str] = None
+
+
+MANUAL_EVENT_TYPES = {"update", "investigation", "resolved", "note"}
+
+
+def _manual_event_or_404(db: Session, agent_user_id: int, event_id: int):
+    """A manual timeline row on an incident this agent owns.
+
+    System rows are the incident's own audit trail — they are never editable,
+    or the timeline stops being evidence. Ownership is checked through the
+    parent incident, and a system row is reported as not found rather than as
+    forbidden so the two cases stay indistinguishable.
+    """
+    from app.db.models.incident import IncidentTimelineEvent
+
+    event = db.query(IncidentTimelineEvent).filter(
+        IncidentTimelineEvent.id == event_id
+    ).first()
+    if not event:
+        raise HTTPException(status_code=404, detail="Timeline entry not found")
+
+    # The ownership check raises its own "Incident not found". Re-raise with the
+    # timeline wording so a row belonging to another agency is indistinguishable
+    # from one that does not exist — otherwise the message itself confirms the id.
+    try:
+        _agent_incident_or_404(db, agent_user_id, event.incident_id)
+    except HTTPException:
+        raise HTTPException(status_code=404, detail="Timeline entry not found")
+
+    if (event.source or "system") != "agent":
+        raise HTTPException(status_code=404, detail="Timeline entry not found")
+    return event
+
+
+def _timeline_out(event) -> dict:
+    return {
+        "id": event.id,
+        "source": event.source,
+        "event_type": event.event_type,
+        "label": event.label,
+        "detail": event.detail,
+        "actor_name": event.actor_name,
+        "event_time": event.event_time,
+        "editable": (event.source or "system") == "agent",
+    }
+
+
+@router.post("/agent/{incident_id}/timeline")
+def add_incident_timeline_entry(
+    incident_id: int,
+    body: TimelineEntryIn,
+    db: Session = Depends(get_db),
+    current_user = Depends(get_current_user),
+):
+    """Add an agent's own update to an incident timeline."""
+    if current_user.role != "agent":
+        raise HTTPException(status_code=403, detail="Only agents can add timeline updates")
+
+    from app.db.models.incident import IncidentTimelineEvent
+
+    incident = _agent_incident_or_404(db, current_user.id, incident_id)
+    if incident.status in (IncidentStatus.RESOLVED, IncidentStatus.CANCELLED):
+        raise HTTPException(status_code=409,
+                            detail="Timeline updates are locked for a closed incident")
+    label = (body.label or "").strip()
+    if not label:
+        raise HTTPException(status_code=400, detail="An update needs a label")
+
+    event_type = (body.event_type or "update").strip().lower()
+    if event_type not in MANUAL_EVENT_TYPES:
+        raise HTTPException(status_code=400, detail=f"Unknown update type: {event_type}")
+
+    event = IncidentTimelineEvent(
+        incident_id=incident.id,
+        source="agent",
+        event_type=event_type,
+        label=label,
+        detail=(body.detail or "").strip() or None,
+        actor_name=getattr(current_user, "name", None) or "Agent",
+        event_time=body.event_time or datetime.utcnow(),
+    )
+    db.add(event)
+    db.commit()
+    db.refresh(event)
+    return _timeline_out(event)
+
+
+@router.patch("/agent/timeline/{event_id}")
+def edit_incident_timeline_entry(
+    event_id: int,
+    body: TimelineEntryIn,
+    db: Session = Depends(get_db),
+    current_user = Depends(get_current_user),
+):
+    if current_user.role != "agent":
+        raise HTTPException(status_code=403, detail="Only agents can edit timeline updates")
+
+    event = _manual_event_or_404(db, current_user.id, event_id)
+    label = (body.label or "").strip()
+    if not label:
+        raise HTTPException(status_code=400, detail="An update needs a label")
+
+    event.label = label
+    event.detail = (body.detail or "").strip() or None
+    if body.event_time is not None:
+        event.event_time = body.event_time
+    if body.event_type:
+        event_type = body.event_type.strip().lower()
+        if event_type not in MANUAL_EVENT_TYPES:
+            raise HTTPException(status_code=400, detail=f"Unknown update type: {event_type}")
+        event.event_type = event_type
+
+    db.commit()
+    db.refresh(event)
+    return _timeline_out(event)
+
+
+@router.delete("/agent/timeline/{event_id}")
+def delete_incident_timeline_entry(
+    event_id: int,
+    db: Session = Depends(get_db),
+    current_user = Depends(get_current_user),
+):
+    if current_user.role != "agent":
+        raise HTTPException(status_code=403, detail="Only agents can delete timeline updates")
+
+    event = _manual_event_or_404(db, current_user.id, event_id)
+    db.delete(event)
+    db.commit()
+    return {"deleted": True, "id": event_id}

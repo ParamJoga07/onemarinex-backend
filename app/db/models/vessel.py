@@ -7,7 +7,9 @@ class Vessel(Base):
     __tablename__ = "vessels"
 
     id = Column(Integer, primary_key=True, index=True)
-    agent_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    # A vessel remains canonical platform data when an agent removes it from
+    # their roster. Unlinking sets this to NULL; it never deletes the vessel.
+    agent_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     
     name = Column(String(255), nullable=False)
     imo_number = Column(String(100), nullable=False, unique=True)

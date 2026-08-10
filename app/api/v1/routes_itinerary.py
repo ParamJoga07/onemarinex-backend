@@ -11,7 +11,7 @@ import logging
 import math
 import random
 import statistics
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
 from itertools import permutations
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -210,7 +210,9 @@ class ItineraryStop(BaseModel):
     travel_minutes_to_port: Optional[float] = None
     open_time: Optional[str] = None
     close_time: Optional[str] = None
-    working_days: Optional[str] = None
+    working_days: Optional[Union[List[str], str]] = None
+    scheduled_arrival: Optional[str] = None
+    scheduled_departure: Optional[str] = None
 
 
 class ItineraryOption(BaseModel):
@@ -458,9 +460,90 @@ def haversine_km(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
 def distance_between_stops(stop1: ItineraryStop, stop2: ItineraryStop, fallback_km: float) -> float:
     """Calculate distance between two stops."""
     if stop1.lat is not None and stop1.lng is not None and stop2.lat is not None and stop2.lng is not None:
-        return haversine_km(stop1.lat, stop1.lng, stop2.lat, stop2.lng)
+        direct = haversine_km(stop1.lat, stop1.lng, stop2.lat, stop2.lng)
+        radial_gap = abs(float(stop1.distance_from_port or 0) - float(stop2.distance_from_port or 0))
+        # Seed/legacy rows can share one rounded coordinate. Treat that as
+        # unknown when their recorded radial distances prove they are apart.
+        if direct >= 0.1 or radial_gap < 0.1:
+            return direct
     # Fallback: use distance from port as approximation
     return abs(float(stop1.distance_from_port or 0) - float(stop2.distance_from_port or 0)) + fallback_km
+
+
+def _schedule_inside_opening_window(
+    stop: ItineraryStop,
+    earliest: datetime,
+) -> tuple[datetime, datetime] | None:
+    """Return the first arrival/departure that fits wholly inside venue hours."""
+    opening = _parse_hhmm(stop.open_time)
+    closing = _parse_hhmm(stop.close_time)
+    days = _normalize_days(stop.working_days)
+    dwell = timedelta(minutes=max(1, round(stop.avg_time_hours * 60)))
+    if not opening and not closing and not days:
+        return earliest, earliest + dwell
+    open_pair = opening or (0, 0)
+    close_pair = closing or (23, 59)
+    # Include yesterday because an overnight Friday window can still be open
+    # after midnight on Saturday.
+    for offset in range(-1, 4):
+        day = (earliest + timedelta(days=offset)).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        if days and DAY_ABBREV[day.weekday()] not in days:
+            continue
+        opens = day.replace(hour=open_pair[0], minute=open_pair[1])
+        closes = day.replace(hour=close_pair[0], minute=close_pair[1])
+        if closes <= opens:
+            closes += timedelta(days=1)
+        arrival = max(earliest, opens)
+        departure = arrival + dwell
+        if departure <= closes:
+            return arrival, departure
+    return None
+
+
+def schedule_itinerary(
+    stops: List[ItineraryStop],
+    window_start: datetime,
+    window_hours: float,
+    speed_kmph: float,
+    fallback_km: float,
+) -> tuple[List[ItineraryStop], float] | None:
+    """Schedule travel and dwell so every stop fits its opening window.
+
+    The returned elapsed minutes include any wait for a venue to open and the
+    final trip back to port. An option is rejected when it cannot fit inside
+    the crew's complete shore-leave window.
+    """
+    if not stops:
+        return None
+    cursor = window_start
+    previous: ItineraryStop | None = None
+    safe_speed = max(1.0, speed_kmph)
+    for stop in stops:
+        distance = (
+            max(0.0, float(stop.distance_from_port or fallback_km))
+            if previous is None
+            else distance_between_stops(previous, stop, fallback_km)
+        )
+        travel_minutes = (distance / safe_speed) * 60
+        earliest = cursor + timedelta(minutes=travel_minutes)
+        slot = _schedule_inside_opening_window(stop, earliest)
+        if not slot:
+            return None
+        arrival, departure = slot
+        stop.travel_minutes_from_prev = round(travel_minutes, 1)
+        stop.scheduled_arrival = arrival.isoformat()
+        stop.scheduled_departure = departure.isoformat()
+        cursor = departure
+        previous = stop
+
+    return_km = max(0.0, float(stops[-1].distance_from_port or fallback_km))
+    stops[-1].travel_minutes_to_port = round((return_km / safe_speed) * 60, 1)
+    cursor += timedelta(minutes=stops[-1].travel_minutes_to_port)
+    if cursor > window_start + timedelta(hours=window_hours):
+        return None
+    return stops, (cursor - window_start).total_seconds() / 60
 
 
 def route_distance_for_order(stops: List[ItineraryStop], fallback_km: float) -> float:
@@ -872,18 +955,19 @@ def suggest_itinerary(body: ItinerarySuggestIn, db: Session = Depends(get_db)):
                 hour=parsed_start[0], minute=parsed_start[1], second=0, microsecond=0
             )
 
-    open_vendors = [
+    def has_verified_hours(vendor) -> bool:
+        info = vendor.other_information if isinstance(vendor.other_information, dict) else {}
+        return bool(_parse_hhmm(info.get("open_time")) and _parse_hhmm(info.get("close_time")))
+
+    vendors = [
         v for v in vendors
-        if vendor_open_during(v.other_information, window_start, body.hours)
+        if has_verified_hours(v)
+        and vendor_open_during(v.other_information, window_start, body.hours)
     ]
-    # Never return an empty plan purely because opening hours are misconfigured;
-    # fall back to the unfiltered list rather than showing the crew nothing.
-    if open_vendors:
-        vendors = open_vendors
-    else:
+    if not vendors:
         logger.warning(
-            "Every vendor at port %s looks closed for a %sh shore leave from %s; "
-            "ignoring opening hours for this suggestion.",
+            "No vendor at port %s has a verified opening window compatible with "
+            "a %sh shore leave from %s.",
             port.id, body.hours, window_start.strftime("%Y-%m-%d %H:%M"),
         )
 
@@ -1099,6 +1183,14 @@ def suggest_itinerary(body: ItinerarySuggestIn, db: Session = Depends(get_db)):
             for t in s.tags
         ))
         
+        scheduled = schedule_itinerary(
+            stops_result, window_start, body.hours, speed_kmph, fallback_km
+        )
+        if not scheduled:
+            continue
+        stops_result, elapsed_minutes = scheduled
+        total_hours = round(elapsed_minutes / 60, 2)
+
         # Create ItineraryOption with diversity score stored temporarily
         itinerary = ItineraryOption(
             itinerary_number=len(itineraries) + 1,
@@ -1185,6 +1277,14 @@ def suggest_itinerary(body: ItinerarySuggestIn, db: Session = Depends(get_db)):
                 for t in s.tags
             ))
             
+            scheduled = schedule_itinerary(
+                stops_result, window_start, body.hours, speed_kmph, fallback_km
+            )
+            if not scheduled:
+                continue
+            stops_result, elapsed_minutes = scheduled
+            total_hours = round(elapsed_minutes / 60, 2)
+
             itinerary = ItineraryOption(
                 itinerary_number=len(itineraries) + 1,
                 label=label_for(stops_result, len(itineraries) + 1),

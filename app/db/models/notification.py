@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey
+from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey, JSON
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 
@@ -13,6 +13,10 @@ class Notification(Base):
     message = Column(Text, nullable=False)
     port_name = Column(String(128), nullable=True)
     vessel = Column(String(128), nullable=True)
+    # Explicit audience metadata prevents an agent's "all vessels" message
+    # from being confused with the legacy NULL-vessel meaning "whole port".
+    audience_type = Column(String(32), nullable=True, index=True)
+    target_vessel_ids = Column(JSON, nullable=True)
     sos_id = Column(Integer, ForeignKey("crew_sos_requests.id", ondelete="SET NULL"), nullable=True)
     created_by = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())

@@ -19,6 +19,7 @@ from sqlalchemy.orm import Session
 from app.api.v1.routes_agents import _agent_scope, get_dashboard_data
 from app.db.models.cab_booking import BookingStatus, CabBooking
 from app.db.models.crew_profile import CrewProfile
+from app.db.models.incident import Incident, IncidentStatus, IncidentType
 from app.db.models.shore_pass import ShorePass
 from app.db.models.user import User
 from app.db.models.vessel import Vessel
@@ -94,14 +95,18 @@ class AgentDashboardScopingTests(unittest.TestCase):
         return get_dashboard_data(db=self.db, current_user=agent_user)
 
     def test_agent_sees_only_their_own_trips_and_crew(self):
-        agent_a, _ = self.make_agent(live_trips=2, crew_ashore=1)
+        agent_a, vessel_a = self.make_agent(live_trips=2, crew_ashore=1)
         self.make_agent(live_trips=7, crew_ashore=5)  # a second, unrelated agency
 
-        stats = self.dashboard(agent_a).stats
+        dashboard = self.dashboard(agent_a)
+        stats = dashboard.stats
 
         self.assertEqual(stats.active_trips, 2, "counted another agency's trips")
         self.assertEqual(stats.crew_in_shore, 1, "counted another agency's crew ashore")
         self.assertEqual(stats.total_vessels, 1)
+        card = next(item for item in dashboard.active_vessels if item.id == vessel_a.id)
+        self.assertEqual(card.ongoing_trips_count, stats.active_trips)
+        self.assertEqual(card.crew_ashore_count, stats.crew_in_shore)
 
     def test_active_trips_is_not_just_the_crew_ashore_count(self):
         # The original bug: active_trips = crew_in_shore, so the dashboard showed
@@ -148,6 +153,31 @@ class AgentDashboardScopingTests(unittest.TestCase):
     def test_agent_scope_returns_empty_when_agent_has_no_vessels(self):
         vessel_ids, crew_ids = _agent_scope(self.db, 10**9)
         self.assertEqual((vessel_ids, crew_ids), ([], []))
+
+    def test_departed_vessels_are_not_counted_as_active(self):
+        agent, vessel = self.make_agent(live_trips=0, crew_ashore=0)
+        vessel.status = "Departed"
+        self.db.flush()
+
+        self.assertEqual(self.dashboard(agent).stats.total_vessels, 0)
+
+    def test_per_vessel_and_headline_incidents_use_canonical_vessel_link(self):
+        agent, vessel = self.make_agent(live_trips=0, crew_ashore=0)
+        self.db.add(Incident(
+            incident_id=_uniq("INC"),
+            type=IncidentType.CREW,
+            title="Needs assistance",
+            description="Canonical vessel-linked incident",
+            status=IncidentStatus.ACTIVE,
+            reporter_id="HP-NOT-IN-CURRENT-MANIFEST",
+            vessel_id=vessel.id,
+        ))
+        self.db.flush()
+
+        result = self.dashboard(agent)
+
+        self.assertEqual(result.stats.open_incidents, 1)
+        self.assertEqual(result.active_vessels[0].incidents_count, 1)
 
 
 if __name__ == "__main__":

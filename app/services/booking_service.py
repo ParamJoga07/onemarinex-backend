@@ -839,7 +839,7 @@ def list_bookings_for_user(
     if date_to:
         query = query.filter(CabBooking.created_at <= date_to)
 
-    return query.order_by(CabBooking.created_at.desc()).all()
+    return query.order_by(CabBooking.created_at.desc(), CabBooking.id.desc()).all()
 
 
 def get_dashboard_metrics(db: Session, port_id: Optional[int] = None) -> Dict[str, int]:

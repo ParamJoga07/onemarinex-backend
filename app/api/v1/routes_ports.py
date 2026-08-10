@@ -14,7 +14,7 @@ def safe_parse_json(val, default_val):
             pass
     return default_val
 
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, Field
 
 from app.db.session import get_db
 from app.db.models.user import User
@@ -27,6 +27,7 @@ from app.services.port_time import (
     port_clock_snapshot,
     validate_timezone_name,
 )
+from app.services.port_identity import canonical_port_key, matching_port_values
 
 router = APIRouter()
 
@@ -44,8 +45,8 @@ class ServiceRequestOut(BaseModel):
 
 
 class RuleItem(BaseModel):
-    title: str
-    description: str
+    title: str = Field(min_length=1, max_length=160)
+    description: str = Field(min_length=1, max_length=5000)
     icon_type: str # e.g., 'time', 'policy', 'doc', 'alert'
 
 class PortRulesIn(BaseModel):
@@ -55,7 +56,7 @@ class PortRulesIn(BaseModel):
     working_days: Optional[List[str]] = None
     timezone: Optional[str] = None
     advance_booking_buffer_minutes: Optional[int] = None
-    contact_email: Optional[str] = None
+    contact_email: Optional[EmailStr] = None
     helpline_number: Optional[str] = None
 
 class PortRulesOut(BaseModel):
@@ -84,6 +85,64 @@ class PortOut(BaseModel):
     class Config:
         from_attributes = True
 
+
+def _rule_candidates(db: Session, value: str) -> list[str]:
+    return matching_port_values(db.query(Port).all(), value)
+
+
+def _validate_support_number(value: Optional[str]) -> Optional[str]:
+    cleaned = str(value or "").strip()
+    if not cleaned:
+        return None
+    compact = "".join(ch for ch in cleaned if ch.isdigit())
+    known_placeholders = {
+        "9118004251234",
+        "919876542064",
+        "9198765403251",
+        "919876543251",
+    }
+    if compact in known_placeholders or "HEYPORTS" in cleaned.upper():
+        raise HTTPException(status_code=422, detail="Replace the placeholder with a verified support number")
+    if len(compact) < 7 or len(compact) > 15:
+        raise HTTPException(status_code=422, detail="Support number must contain 7 to 15 digits")
+    return cleaned
+
+
+@router.get("/quality-report")
+def port_quality_report(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if current_user.role != "superadmin":
+        raise HTTPException(status_code=403, detail="Superadmin access required")
+    ports = db.query(Port).all()
+    rules = db.query(PortRule).all()
+    groups = {}
+    for port in ports:
+        groups.setdefault(
+            port.canonical_key or canonical_port_key(port.code or port.name), []
+        ).append(port)
+    missing_contacts = []
+    for port in ports:
+        if not port.is_active:
+            continue
+        candidates = matching_port_values(ports, port.code)
+        rule = next((item for item in rules if item.port_name in candidates), None)
+        if not rule or not rule.helpline_number or not rule.contact_email:
+            missing_contacts.append({
+                "port_id": port.id,
+                "name": port.name,
+                "missing_helpline": not bool(rule and rule.helpline_number),
+                "missing_email": not bool(rule and rule.contact_email),
+            })
+    return {
+        "missing_support_contacts": missing_contacts,
+        "duplicate_port_groups": [
+            [{"id": p.id, "name": p.name, "code": p.code} for p in group]
+            for group in groups.values() if len(group) > 1
+        ],
+    }
+
 @router.get("/", response_model=List[PortOut])
 def get_ports(db: Session = Depends(get_db)):
     """Get list of active ports"""
@@ -97,8 +156,7 @@ def get_port_rules(port_name: str, db: Session = Depends(get_db)):
         .filter((Port.code == port_name) | (Port.name == port_name))
         .first()
     )
-    candidates = [port.code, port.name, port_name] if port else [port_name]
-    candidates = [item for item in candidates if item]
+    candidates = _rule_candidates(db, port_name)
     rules = (
         db.query(PortRule)
         .filter(PortRule.port_name.in_(candidates))
@@ -168,6 +226,31 @@ def update_port_rules(
     )
     canonical_port_name = port.code if port else port_name
 
+    if current_user.role == "agent":
+        assigned = (
+            current_user.agent_profile.assigned_port
+            if current_user.agent_profile else None
+        )
+        assigned_port = None
+        if assigned:
+            assigned_port = (
+                db.query(Port)
+                .filter((Port.code == assigned) | (Port.name == assigned))
+                .first()
+            )
+        assigned_key = assigned_port.code if assigned_port else assigned
+        if not assigned_key or canonical_port_key(canonical_port_name) != canonical_port_key(assigned_key):
+            # Do not reveal whether a different port has configuration.
+            raise HTTPException(status_code=404, detail="Port rules not found")
+
+        allowed_agent_fields = {"rules", "helpline_number"}
+        forbidden = set(body.model_fields_set) - allowed_agent_fields
+        if forbidden:
+            raise HTTPException(
+                status_code=403,
+                detail="Agents may update only the contact number and rules.",
+            )
+
     port_rules = (
         db.query(PortRule)
         .filter(
@@ -179,6 +262,8 @@ def update_port_rules(
     )
 
     update_data = body.model_dump(exclude_unset=True)
+    if "helpline_number" in update_data:
+        update_data["helpline_number"] = _validate_support_number(update_data["helpline_number"])
     for field_name in ("opening_time", "closing_time"):
         configured_time = update_data.get(field_name)
         if configured_time:
@@ -224,8 +309,8 @@ def update_port_rules(
             working_days=body.working_days,
             timezone=update_data.get("timezone"),
             advance_booking_buffer_minutes=body.advance_booking_buffer_minutes if body.advance_booking_buffer_minutes is not None else 30,
-            contact_email=body.contact_email,
-            helpline_number=body.helpline_number,
+            contact_email=update_data.get("contact_email"),
+            helpline_number=update_data.get("helpline_number"),
         )
         db.add(port_rules)
     

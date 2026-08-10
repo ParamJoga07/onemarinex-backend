@@ -17,6 +17,7 @@ back, so it leaves no rows behind.
 
 import unittest
 import uuid
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 
 import app.db.base  # noqa: F401 — registers every model on Base
@@ -29,6 +30,7 @@ from app.db.models.user import User
 from app.db.models.vessel import Vessel
 from app.db.models.vessel_crew import VesselCrew
 from app.db.session import engine
+from app.services.booking_service import list_bookings_for_user
 
 
 def _uniq(prefix):
@@ -66,15 +68,17 @@ class TripMonitoringBucketTests(unittest.TestCase):
         self.trans.rollback()
         self.connection.close()
 
-    def add_trip(self, status):
-        self.db.add(CabBooking(
+    def add_trip(self, status, created_at=None):
+        trip = CabBooking(
             booking_id=_uniq("CAB"), crew_id=self.crew.id,
             pickup_address="Gate", pickup_lat=0, pickup_lng=0,
             drop_address="City", drop_lat=0, drop_lng=0,
             vehicle_type="ac", vehicle_name="Sedan", estimated_price=100,
-            distance_km=5, status=status,
-        ))
+            distance_km=5, status=status, created_at=created_at or datetime.utcnow(),
+        )
+        self.db.add(trip)
         self.db.flush()
+        return trip
 
     def buckets(self):
         r = get_trip_monitoring(db=self.db, current_user=self.agent_user)
@@ -134,6 +138,30 @@ class TripMonitoringBucketTests(unittest.TestCase):
             len(live),
             f"a live trip is missing from every tab: {counts}",
         )
+
+    def test_each_tab_is_newest_first(self):
+        older = self.add_trip(
+            BookingStatus.ON_TRIP, datetime.utcnow() - timedelta(hours=1)
+        )
+        newer = self.add_trip(BookingStatus.ON_TRIP, datetime.utcnow())
+
+        result = get_trip_monitoring(db=self.db, current_user=self.agent_user)
+
+        self.assertEqual(
+            [trip.booking_id for trip in result.ongoing],
+            [newer.booking_id, older.booking_id],
+        )
+
+    def test_general_booking_list_uses_id_as_stable_tiebreaker(self):
+        created = datetime.utcnow()
+        first = self.add_trip(BookingStatus.ON_TRIP, created)
+        second = self.add_trip(BookingStatus.ON_TRIP, created)
+
+        crew_user = self.db.query(User).filter(User.id == self.crew.user_id).one()
+        result = list_bookings_for_user(self.db, crew_user)
+
+        ids = [trip.id for trip in result if trip.id in {first.id, second.id}]
+        self.assertEqual(ids, [second.id, first.id])
 
 
 if __name__ == "__main__":

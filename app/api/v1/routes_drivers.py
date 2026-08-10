@@ -283,7 +283,7 @@ async def get_driver_rides(
         
     rides = db.query(CabBooking).options(joinedload(CabBooking.crew)).filter(
         or_(CabBooking.driver_id == driver.id, CabBooking.assigned_driver_id == driver.id)
-    ).order_by(CabBooking.created_at.desc()).all()
+    ).order_by(CabBooking.created_at.desc(), CabBooking.id.desc()).all()
     
     return rides
 

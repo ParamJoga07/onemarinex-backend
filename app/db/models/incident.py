@@ -4,6 +4,7 @@ from datetime import datetime
 import enum
 
 from app.db.base import Base
+from app.db.types import UTCDateTime
 
 class IncidentStatus(str, enum.Enum):
     ACTIVE = "ACTIVE"
@@ -49,11 +50,11 @@ class Incident(Base):
     sub_category = Column(String(64), nullable=True)
     severity = Column(String(16), nullable=True)  # high | medium | low
 
-    resolved_at = Column(DateTime, nullable=True)
-    cancelled_at = Column(DateTime, nullable=True)
+    resolved_at = Column(UTCDateTime, nullable=True)
+    cancelled_at = Column(UTCDateTime, nullable=True)
 
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(UTCDateTime, default=datetime.utcnow)
+    updated_at = Column(UTCDateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     # Relationships
     aggregator = relationship("AggregatorProfile", backref="incidents")
@@ -87,8 +88,8 @@ class IncidentTimelineEvent(Base):
     detail = Column(Text, nullable=True)
 
     actor_name = Column(String(255), nullable=True)
-    event_time = Column(DateTime, default=datetime.utcnow, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    event_time = Column(UTCDateTime, default=datetime.utcnow, nullable=False)
+    created_at = Column(UTCDateTime, default=datetime.utcnow)
 
     incident = relationship("Incident", back_populates="timeline")
 
@@ -100,7 +101,7 @@ class IncidentNote(Base):
     incident_id = Column(Integer, ForeignKey("incidents.id", ondelete="CASCADE"))
     author_name = Column(String(255), nullable=True)
     note = Column(Text, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(UTCDateTime, default=datetime.utcnow)
 
     # Relationships
     incident = relationship("Incident", back_populates="notes")

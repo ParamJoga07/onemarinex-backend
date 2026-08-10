@@ -35,13 +35,14 @@ from app.db.models.port_rule import PortRule # noqa: F401
 from app.db.models import contact_message # noqa: F401
 from app.db.models import early_access      # noqa: F401
 from app.db.models import login_event      # noqa: F401
+from app.db.models import agent_roster_event  # noqa: F401
 from app.db.models import port_service_request  # noqa: F401
 from app.db.models.facility_scan import FacilityScan # noqa: F401
 from app.db.models.chat import ChatMessage # noqa: F401
 from app.db.models.venue_review import VenueReview # noqa: F401
 from app.db.models.notification import Notification # noqa: F401
 from app.db.models.notification_read import NotificationRead # noqa: F401
-from app.db.models.crew_sos import CrewSos # noqa: F401
+from app.db.models.crew_sos import CrewSos, CrewSosTimelineEvent, CrewSosNote # noqa: F401
 from app.db.models import pricing_controls # noqa: F401
 from app.db.models import driver_magic_link # noqa: F401
 from app.db.models import pricing_controls # noqa: F401

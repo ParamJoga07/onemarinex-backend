@@ -77,25 +77,39 @@ def get_booking_timeline(db: Session, booking_db_id: int) -> List[Dict[str, Any]
         .first()
     )
     if magic_link and magic_link.itinerary_stops:
-        for stop_idx, stop in enumerate(magic_link.itinerary_stops):
-            stop_type = (stop.get("type") or stop.get("stop_type") or "custom").lower()
+        reached_by_stop = {
+            event.stop_id: event for event in (magic_link.reach_events or [])
+        }
+        for stop in magic_link.itinerary_stops:
+            stop_id = str(stop.get("id") or "")
+            reached = reached_by_stop.get(stop_id)
+            if not reached:
+                # Unreached itinerary entries belong in the Planned Stops
+                # panel, not in a chronological activity timeline.
+                continue
+            stop_type = (
+                stop.get("type") or stop.get("stop_type") or "custom"
+            ).lower()
             events.append({
-                "id": -(abs(hash(str(stop.get("name", "")) + str(stop.get("address", "")))) % 1000000),
-                "event_type": f"STOP_{stop_type.upper()}",
-                "event_label": STOP_EVENT_LABELS.get(stop_type, stop.get("name", "Stop")),
-                "event_time": stop.get("reached_at") or stop.get("created_at"),
+                "id": -reached.id,
+                "event_type": f"STOP_{stop_type.upper()}_REACHED",
+                "event_label": (
+                    f"{stop.get('name') or STOP_EVENT_LABELS.get(stop_type, 'Stop')} reached"
+                ),
+                "event_time": reached.reached_at,
                 "actor_id": None,
                 "actor_type": "stop",
                 "metadata": {
+                    "stop_id": stop_id,
                     "name": stop.get("name"),
                     "address": stop.get("address"),
-                    "latitude": stop.get("latitude"),
-                    "longitude": stop.get("longitude"),
+                    "latitude": reached.latitude,
+                    "longitude": reached.longitude,
                     "stop_type": stop_type,
-                    "reached": stop.get("reached", False),
+                    "reached": True,
+                    "notes": reached.notes,
                 },
-                "created_at": stop.get("created_at"),
-                "_sort_order": 1000 + stop_idx,
+                "created_at": reached.reached_at,
             })
 
     def _to_naive(dt_val):
@@ -112,10 +126,10 @@ def get_booking_timeline(db: Session, booking_db_id: int) -> List[Dict[str, Any]
             return dt_val
         return datetime.min
 
-    def _sort_key(e):
-        if "_sort_order" in e:
-            return (1, e["_sort_order"])
-        return (0, _to_naive(e.get("event_time") or e.get("created_at")))
-
-    events.sort(key=_sort_key, reverse=False)
+    events.sort(
+        key=lambda event: (
+            _to_naive(event.get("event_time") or event.get("created_at")),
+            int(event.get("id") or 0),
+        )
+    )
     return events
