@@ -12,6 +12,7 @@ surface as a message the agent can act on rather than a stack trace.
 import csv
 import io
 import unittest
+import uuid
 from datetime import datetime
 from unittest.mock import patch
 
@@ -237,6 +238,88 @@ class FormatRoutingTests(unittest.TestCase):
         with self.assertRaises(cm.ManifestError) as ctx:
             cm.parse_manifest(b"data", "crew.docx")
         self.assertIn("CSV, Excel", str(ctx.exception))
+
+
+class ManifestSaveTests(unittest.TestCase):
+    """Saving the reviewed rows, which is where a real manifest was rejected.
+
+    Parsing a manifest and saving it are separate steps, and only parsing was
+    covered. Nationalities are validated strictly on save, so a demonym the
+    alias table did not know ("UKRAINIAN" — manifests print the demonym far more
+    often than the country name) raised on the first offending row and took the
+    whole upload down with it. The tests above happily parsed "UKRAINIAN"
+    because parsing never normalises, which is why they stayed green while no
+    crew list could be imported.
+
+    Runs inside a transaction that is always rolled back.
+    """
+
+    def setUp(self):
+        import app.db.base  # noqa: F401 — registers every model on Base
+        from sqlalchemy.orm import Session
+        from app.db.models.user import User
+        from app.db.models.vessel import Vessel
+        from app.db.session import engine
+
+        self.connection = engine.connect()
+        self.trans = self.connection.begin()
+        self.db = Session(bind=self.connection)
+
+        suffix = uuid.uuid4().hex[:10]
+        agent = User(email=f"agent-{suffix}@example.com", hashed_password="x", role="agent")
+        self.db.add(agent)
+        self.db.flush()
+        self.vessel = Vessel(
+            agent_id=agent.id, name=f"MV-{suffix}", imo_number=f"IMO-{suffix}",
+            vessel_type="Bulk Carrier", status="Active",
+        )
+        self.db.add(self.vessel)
+        self.db.flush()
+
+    def tearDown(self):
+        self.db.close()
+        self.trans.rollback()
+        self.connection.close()
+
+    def save(self, rows):
+        from app.api.v1.routes_vessels import _save_manifest_rows
+        return _save_manifest_rows(self.db, self.vessel, rows, "port_test")
+
+    def test_a_manifest_of_demonyms_imports(self):
+        rows = [
+            cm.ParsedCrewRow(name="Malyuga Vitaliy", rank="MASTER",
+                             nationality="UKRAINIAN", passport_number="FJ917654"),
+            cm.ParsedCrewRow(name="Kothawale Yogesh Tushar", rank="CH OFF",
+                             nationality="INDIAN", passport_number="Z5262WB"),
+            cm.ParsedCrewRow(name="Reyes Juan", rank="AB",
+                             nationality="FILIPINO", passport_number="P1234567"),
+        ]
+
+        self.assertEqual(self.save(rows), 3)
+
+        from app.db.models.vessel_crew import VesselCrew
+        saved = {
+            row.passport_number: row.nationality
+            for row in self.db.query(VesselCrew).filter(
+                VesselCrew.vessel_id == self.vessel.id).all()
+        }
+        self.assertEqual(saved["FJ917654"], "UA")
+        self.assertEqual(saved["Z5262WB"], "IN")
+        self.assertEqual(saved["P1234567"], "PH")
+
+    def test_an_unrecognised_nationality_names_the_crew_member_and_the_value(self):
+        """The agent has to be told which cell to correct."""
+        from fastapi import HTTPException
+
+        rows = [cm.ParsedCrewRow(name="Someone", rank="AB",
+                                 nationality="Atlantean", passport_number="X1")]
+
+        with self.assertRaises(HTTPException) as ctx:
+            self.save(rows)
+
+        self.assertEqual(ctx.exception.status_code, 422)
+        self.assertIn("Someone", ctx.exception.detail)
+        self.assertIn("Atlantean", ctx.exception.detail)
 
 
 if __name__ == "__main__":

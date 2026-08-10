@@ -9,26 +9,91 @@ still need an explicit repair review.
 from typing import Optional
 
 
+# Crew manifests print the nationality column as a demonym far more often than
+# as a country name ("UKRAINIAN", not "Ukraine"), so every country below lists
+# its demonyms alongside its names. An entry missing its demonym is not a
+# cosmetic gap: manifest import validates strictly and one unrecognised row
+# rejects the whole upload.
+#
+# Keyed alpha-2 -> every spelling seen on a manifest. COUNTRY_ALIASES is
+# inverted from this so each spelling is written exactly once.
+_COUNTRY_SPELLINGS = {
+    "AZ": ("AZERBAIJAN", "AZERBAIJANI", "AZERI"),
+    "BD": ("BANGLADESH", "BANGLADESHI"),
+    "BG": ("BULGARIA", "BULGARIAN"),
+    "BR": ("BRAZIL", "BRAZILIAN"),
+    "CN": ("CHINA", "CHINESE", "PEOPLES REPUBLIC OF CHINA", "PR CHINA"),
+    "CO": ("COLOMBIA", "COLOMBIAN"),
+    "CU": ("CUBA", "CUBAN"),
+    "DE": ("GERMANY", "GERMAN"),
+    "DK": ("DENMARK", "DANISH", "DANE"),
+    "EE": ("ESTONIA", "ESTONIAN"),
+    "EG": ("EGYPT", "EGYPTIAN"),
+    "ES": ("SPAIN", "SPANISH", "SPANIARD"),
+    "ET": ("ETHIOPIA", "ETHIOPIAN"),
+    "FR": ("FRANCE", "FRENCH"),
+    "GB": ("UK", "UNITED KINGDOM", "GREAT BRITAIN", "BRITAIN", "BRITISH",
+           "ENGLAND", "ENGLISH", "SCOTLAND", "SCOTTISH", "WALES", "WELSH",
+           "NORTHERN IRELAND"),
+    "GE": ("GEORGIA", "GEORGIAN"),
+    "GH": ("GHANA", "GHANAIAN", "GHANIAN"),
+    "GR": ("GREECE", "GREEK", "HELLENIC REPUBLIC"),
+    "HR": ("CROATIA", "CROATIAN", "CROAT"),
+    "HU": ("HUNGARY", "HUNGARIAN"),
+    "ID": ("INDONESIA", "INDONESIAN"),
+    "IN": ("INDIA", "INDIAN", "REPUBLIC OF INDIA"),
+    "IR": ("IRAN", "IRANIAN"),
+    "IT": ("ITALY", "ITALIAN"),
+    "JP": ("JAPAN", "JAPANESE"),
+    "KE": ("KENYA", "KENYAN"),
+    "KR": ("SOUTH KOREA", "REPUBLIC OF KOREA", "KOREA", "KOREAN",
+           "SOUTH KOREAN"),
+    "LK": ("SRI LANKA", "SRILANKA", "SRI LANKAN", "SRILANKAN", "CEYLON"),
+    "LT": ("LITHUANIA", "LITHUANIAN"),
+    "LV": ("LATVIA", "LATVIAN"),
+    "MM": ("MYANMAR", "BURMA", "BURMESE", "MYANMARESE"),
+    "MX": ("MEXICO", "MEXICAN"),
+    "MY": ("MALAYSIA", "MALAYSIAN"),
+    "NG": ("NIGERIA", "NIGERIAN"),
+    "NL": ("NETHERLANDS", "DUTCH", "HOLLAND"),
+    "NO": ("NORWAY", "NORWEGIAN"),
+    "NP": ("NEPAL", "NEPALI", "NEPALESE"),
+    "PA": ("PANAMA", "PANAMANIAN"),
+    "PE": ("PERU", "PERUVIAN"),
+    "PH": ("PHILIPPINES", "PHILIPPINE", "FILIPINO", "FILIPINA", "PILIPINO"),
+    "PK": ("PAKISTAN", "PAKISTANI"),
+    "PL": ("POLAND", "POLISH", "POLE"),
+    "PT": ("PORTUGAL", "PORTUGUESE"),
+    "RO": ("ROMANIA", "ROMANIAN", "RUMANIA", "ROUMANIA"),
+    "RU": ("RUSSIA", "RUSSIAN", "RUSSIAN FEDERATION"),
+    "SG": ("SINGAPORE", "SINGAPOREAN"),
+    "TH": ("THAILAND", "THAI"),
+    "TR": ("TURKEY", "TURKIYE", "TURKISH", "TURK"),
+    "TZ": ("TANZANIA", "TANZANIAN"),
+    "UA": ("UKRAINE", "UKRAINIAN", "UKRAINIAN FEDERATION"),
+    "US": ("USA", "UNITED STATES", "UNITED STATES OF AMERICA", "AMERICAN",
+           "AMERICA"),
+    "VN": ("VIETNAM", "VIET NAM", "VIETNAMESE"),
+    "ZA": ("SOUTH AFRICA", "SOUTH AFRICAN"),
+}
+
 COUNTRY_ALIASES = {
-    "BANGLADESH": "BD", "BULGARIA": "BG", "CHINA": "CN", "CHINESE": "CN",
-    "CROATIA": "HR", "EGYPT": "EG", "GEORGIA": "GE", "GHANA": "GH",
-    "GREECE": "GR", "INDIA": "IN", "INDIAN": "IN", "INDONESIA": "ID",
-    "ITALY": "IT", "LATVIA": "LV", "MALAYSIA": "MY", "MYANMAR": "MM",
-    "BURMA": "MM", "NIGERIA": "NG", "NORWAY": "NO", "PAKISTAN": "PK",
-    "PANAMA": "PA", "PERU": "PE", "PHILIPPINES": "PH", "FILIPINO": "PH",
-    "POLAND": "PL", "ROMANIA": "RO", "RUSSIA": "RU", "RUSSIAN FEDERATION": "RU",
-    "SOUTH KOREA": "KR", "REPUBLIC OF KOREA": "KR", "KOREA": "KR",
-    "SPAIN": "ES", "SRI LANKA": "LK", "TURKEY": "TR", "TURKIYE": "TR",
-    "UK": "GB", "UNITED KINGDOM": "GB", "GREAT BRITAIN": "GB",
-    "USA": "US", "UNITED STATES": "US", "UNITED STATES OF AMERICA": "US",
-    "UKRAINE": "UA", "VIETNAM": "VN", "VIET NAM": "VN",
+    spelling: code
+    for code, spellings in _COUNTRY_SPELLINGS.items()
+    for spelling in spellings
 }
 
 
 def normalize_nationality(value: Optional[str], *, strict: bool = False) -> Optional[str]:
     if value is None:
         return None
-    cleaned = " ".join(str(value).strip().upper().replace(".", "").split())
+    # Manifests punctuate freely — "U.S.A.", "Sri-Lankan", "Filipino/Filipina".
+    # Periods close up ("U.S.A." -> "USA"); the rest become word breaks
+    # ("Sri-Lankan" -> "SRI LANKAN").
+    cleaned = str(value).strip().upper().replace(".", "")
+    for character in "-/\\,()":
+        cleaned = cleaned.replace(character, " ")
+    cleaned = " ".join(cleaned.split())
     if not cleaned:
         return None
     if len(cleaned) == 2 and cleaned.isalpha():
@@ -37,7 +102,12 @@ def normalize_nationality(value: Optional[str], *, strict: bool = False) -> Opti
     if result:
         return result
     if strict:
-        raise ValueError("Nationality must be a supported ISO alpha-2 code or country name")
+        # Naming the value it choked on turns a dead-end upload into something
+        # the agent can actually correct in the manifest.
+        raise ValueError(
+            f"Nationality '{value}' is not a recognised country name, "
+            "demonym or ISO alpha-2 code"
+        )
     return None
 
 

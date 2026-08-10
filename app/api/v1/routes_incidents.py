@@ -650,7 +650,13 @@ def agent_incident_list(
     db: Session = Depends(get_db),
     current_user = Depends(get_current_user),
 ):
-    """Incidents raised by crew on this agent's vessels."""
+    """Safety records raised by crew on this agent's vessels.
+
+    Carries both incidents and SOS alerts, each tagged with `kind`. An SOS is
+    not an incident and no longer leaves a copycat Incident row behind, so
+    without it here the vessel page would show nothing at all where it used to
+    show the emergency mislabelled as an incident.
+    """
     if current_user.role != "agent":
         raise HTTPException(status_code=403, detail="Only agents can view these incidents")
 
@@ -668,7 +674,71 @@ def agent_incident_list(
             raise HTTPException(status_code=400, detail=f"Unknown status: {status_filter}")
 
     rows = query.order_by(Incident.created_at.desc()).all()
-    return {"incidents": [_serialize_incident(db, i) for i in rows]}
+    records = [dict(_serialize_incident(db, i), kind="incident") for i in rows]
+    records.extend(_agent_sos_records(db, current_user.id, vessel_id, status_filter))
+    # created_at mixes naive legacy Incident values with timezone-aware SOS
+    # ones; comparing those directly raises TypeError.
+    records.sort(key=lambda item: _sort_instant(item.get("created_at")), reverse=True)
+    return {"incidents": records}
+
+
+def _sort_instant(value) -> float:
+    if value is None:
+        return float("-inf")
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.timestamp()
+
+
+def _agent_sos_records(db: Session, agent_user_id: int, vessel_id: Optional[int],
+                       status_filter: Optional[str]) -> List[dict]:
+    """This agent's SOS alerts, shaped like the incident rows beside them."""
+    from app.db.models.crew_sos import CrewSos
+    from app.db.models.vessel import Vessel
+    from app.services.crew_linkage import vessel_crew_profile_ids
+
+    vessels = db.query(Vessel).filter(Vessel.agent_id == agent_user_id)
+    if vessel_id is not None:
+        vessels = vessels.filter(Vessel.id == vessel_id)
+
+    records: List[dict] = []
+    for vessel in vessels.all():
+        crew_ids = vessel_crew_profile_ids(db, vessel)
+        if not crew_ids:
+            continue
+        for sos in db.query(CrewSos).filter(CrewSos.crew_profile_id.in_(crew_ids)).all():
+            status = str(sos.status or "ACTIVE").upper()
+            if status_filter and status != status_filter.upper():
+                continue
+            records.append({
+                "kind": "sos",
+                "id": sos.id,
+                "incident_id": f"SOS-{sos.id}",
+                "type": "sos",
+                "title": "SOS Alert",
+                "description": None,
+                "status": status,
+                "category": None,
+                "sub_category": None,
+                # An SOS has no severity grading — it is the top of the scale.
+                "severity": "critical",
+                "category_label": "SOS Alert",
+                "sub_category_label": None,
+                "reporter_name": sos.crew_email,
+                "reporter_role": None,
+                "reporter_id": None,
+                "trip_id": sos.trip_id,
+                "port_name": sos.port_name,
+                "vessel_id": vessel.id,
+                "vessel_name": vessel.name,
+                "resolved_at": sos.closed_at,
+                "cancelled_at": sos.cancelled_at,
+                "created_at": sos.created_at,
+                "updated_at": sos.created_at,
+                "routing_status": "assigned",
+                "routing_message": None,
+            })
+    return records
 
 
 @router.get("/agent/reports")
@@ -680,10 +750,9 @@ def agent_safety_report_records(
     """Newest-first Incident/SOS report index for one owned vessel."""
     if current_user.role != "agent":
         raise HTTPException(status_code=403, detail="Only agents can view reports")
-    from app.db.models.crew_profile import CrewProfile
     from app.db.models.crew_sos import CrewSos
     from app.db.models.vessel import Vessel
-    from app.db.models.vessel_crew import VesselCrew
+    from app.services.crew_linkage import vessel_crew_profile_ids
 
     vessel = db.query(Vessel).filter(
         Vessel.id == vessel_id, Vessel.agent_id == current_user.id,
@@ -692,14 +761,11 @@ def agent_safety_report_records(
         raise HTTPException(status_code=404, detail="Vessel not found")
 
     incidents = db.query(Incident).filter(Incident.vessel_id == vessel.id).all()
-    hpids = [row[0] for row in db.query(VesselCrew.hp_id).filter(
-        VesselCrew.vessel_id == vessel.id, VesselCrew.hp_id.isnot(None),
-    ).all()]
-    crew_ids = []
-    if hpids:
-        crew_ids = [row[0] for row in db.query(CrewProfile.id).filter(
-            CrewProfile.hpid.in_(hpids)
-        ).all()]
+    # Matching the manifest on HPID alone dropped crew whose registration
+    # spelled their nationality differently, so their SOS never reached this
+    # feed — and the only trace of the emergency was the Incident the SOS used
+    # to mirror, which is why the vessel page labelled it "Incident".
+    crew_ids = vessel_crew_profile_ids(db, vessel)
     sos_rows = db.query(CrewSos).filter(CrewSos.crew_profile_id.in_(crew_ids)).all() if crew_ids else []
 
     records = [{

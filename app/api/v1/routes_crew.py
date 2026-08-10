@@ -1042,28 +1042,16 @@ def trigger_sos(
     )
     db.add(sos_notification)
 
-    # Also record as an incident (for Super Admin tracking)
-    incident_id = f"INC-{uuid.uuid4().hex[:6].upper()}"
-    description = (
-        f"SOS triggered by {profile.full_name} (Vessel: {profile.vessel or 'N/A'}) "
-        f"at {port_name}. Location: {body.lat}, {body.lng}"
-    )
-    from app.api.v1.routes_incidents import _resolve_vessel_for_crew
-    new_incident = Incident(
-        incident_id=incident_id,
-        type=IncidentType.CREW,
-        title="SOS Alert",
-        description=description,
-        status=IncidentStatus.ACTIVE,
-        port_name=port_name,
-        reporter_name=profile.full_name or current_user.name,
-        reporter_role=profile.rank,
-        reporter_id=profile.hpid or profile.passport_number,
-        trip_id=active_booking.booking_id,
-        vessel_id=_resolve_vessel_for_crew(db, profile),
-    )
-    db.add(new_incident)
-    
+    # An SOS is deliberately NOT mirrored into an Incident row.
+    #
+    # It used to be, "for Super Admin tracking", but superadmins already get the
+    # full SOS list from GET /api/v1/sos/admin, and agents get their own from
+    # the safety summary — both read CrewSos directly. The mirror only created
+    # a second record of one event: the SOS showed up in Incident Management
+    # alongside the SOS page, it inflated the open-incident counts, and because
+    # nothing linked the two, closing the SOS left its twin sitting open
+    # forever. The vessel report feed reads CrewSos too, so the vessel page
+    # labelled the event "Incident" instead of "SOS".
     try:
         db.commit()
     except Exception as e:

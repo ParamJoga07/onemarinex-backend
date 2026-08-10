@@ -82,7 +82,7 @@ class ShoreLeaveAverageTests(unittest.TestCase):
         self.trans.rollback()
         self.connection.close()
 
-    def crew(self):
+    def crew(self, shore_pass_eligible=True):
         """One crew member on this vessel's manifest."""
         crew_user = User(
             email=_uniq("crew") + "@example.com", hashed_password="x", role="crew"
@@ -98,7 +98,7 @@ class ShoreLeaveAverageTests(unittest.TestCase):
         self.db.flush()
         self.db.add(VesselCrew(
             vessel_id=self.vessel.id, name="Crew", rank="able_seaman",
-            hp_id=hpid, shore_pass_eligible=True,
+            hp_id=hpid, shore_pass_eligible=shore_pass_eligible,
         ))
         self.db.flush()
         return profile
@@ -168,6 +168,84 @@ class ShoreLeaveAverageTests(unittest.TestCase):
 
         self.assertEqual(result.crew_went_ashore, 2)
         self.assertEqual(result.still_ashore, 1)
+        self.assertEqual(result.average_duration_minutes, 120)
+
+    def test_time_back_aboard_between_two_trips_is_not_shore_leave(self):
+        """The "12h 21m" defect: gaps between separate trips billed as leave.
+
+        Each person's time ashore was the envelope from first departure to last
+        return, so a crew member who took a short cab in the morning and another
+        in the evening was reported as having spent the whole day ashore —
+        including the hours they were back aboard in between.
+        """
+        crew = self.crew()
+        self.trip_for(crew, started=_at(8), completed=_at(9))
+        self.trip_for(crew, started=_at(19), completed=_at(20, 21))
+
+        result = self.report()
+
+        self.assertEqual(result.crew_went_ashore, 1)
+        # Two hours and 21 minutes ashore, not the 12h 21m envelope.
+        self.assertEqual(result.average_duration_minutes, 141)
+
+    def test_a_completed_trip_without_timestamps_still_counts_as_returned(self):
+        """Legacy rows recorded the status but not the times.
+
+        The trip is finished, so the crew member is demonstrably back aboard.
+        Inferring "still ashore" from the missing end timestamp stranded them
+        ashore permanently and left the day unable to close out.
+        """
+        crew = self.crew()
+        self.db.add(CabBooking(
+            booking_id=_uniq("CAB"), crew_id=crew.id,
+            pickup_address="Gate", pickup_lat=0, pickup_lng=0,
+            drop_address="City", drop_lat=0, drop_lng=0,
+            vehicle_type="ac", vehicle_name="Sedan",
+            estimated_price=100, distance_km=5,
+            status=BookingStatus.COMPLETED,
+            created_at=_at(9),
+        ))
+        self.db.flush()
+
+        result = self.report()
+
+        self.assertEqual(result.crew_went_ashore, 1)
+        self.assertEqual(result.returned_safely, 1)
+        self.assertEqual(result.still_ashore, 0)
+        self.assertTrue(result.all_returned)
+        # Back aboard, but with no timestamps there is nothing to measure.
+        self.assertIsNone(result.average_duration_minutes)
+
+    def test_a_cab_ashore_and_back_counts_as_returned_without_a_shore_pass(self):
+        """Returns used to be read off shore-pass in_time alone.
+
+        Crew who went ashore by cab had no pass to sign back in, so the report
+        showed "0 / 1 returned" and "1 still ashore" beside their own completed
+        trip.
+        """
+        crew = self.crew()
+        self.trip_for(crew, started=_at(10), completed=_at(12))
+
+        result = self.report()
+
+        self.assertEqual(result.crew_went_ashore, 1)
+        self.assertEqual(result.returned_safely, 1)
+        self.assertEqual(result.still_ashore, 0)
+        self.assertTrue(result.all_returned)
+
+    def test_only_shore_leave_eligible_crew_are_in_the_average(self):
+        """The average answers how long *eligible* crew are getting ashore."""
+        eligible = self.crew()
+        ineligible = self.crew(shore_pass_eligible=False)
+        self.pass_for(eligible, out=_at(10), back=_at(12))
+        self.pass_for(ineligible, out=_at(9), back=_at(17))
+
+        result = self.report()
+
+        self.assertEqual(result.eligible_for_shore_leave, 1)
+        # Both went ashore and are reported as such; only the eligible crew
+        # member's two hours feed the average.
+        self.assertEqual(result.crew_went_ashore, 2)
         self.assertEqual(result.average_duration_minutes, 120)
 
 
@@ -262,7 +340,14 @@ class TripReportingDayTests(ShoreLeaveAverageTests):
         self.assertEqual(result.crew_went_ashore, 0)
         self.assertIsNone(result.average_duration_minutes)
 
-    def test_a_booking_that_never_started_stays_on_the_day_it_was_booked(self):
+    def test_a_booking_that_never_started_puts_nobody_ashore(self):
+        """Booked but never driven: nobody has gone ashore on it yet.
+
+        This used to count as a departure, which was wrong twice over. The crew
+        member is sitting aboard waiting for a driver, and because the trip
+        never runs there is nothing for them to finish — so they were also
+        counted as never having returned, and stayed "still ashore" forever.
+        """
         crew = self.crew()
         self.db.add(CabBooking(
             booking_id=_uniq("CAB"), crew_id=crew.id,
@@ -278,8 +363,8 @@ class TripReportingDayTests(ShoreLeaveAverageTests):
         result = self.report()
 
         self.assertEqual(result.completed_trips, 0)
-        # Booked but never driven: nobody has gone ashore on it yet.
-        self.assertEqual(result.crew_went_ashore, 1)
+        self.assertEqual(result.crew_went_ashore, 0)
+        self.assertEqual(result.still_ashore, 0)
         self.assertIsNone(result.average_duration_minutes)
 
 
