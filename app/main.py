@@ -33,7 +33,7 @@ if _root_logger.level == logging.NOTSET or _root_logger.level > logging.INFO:
     _root_logger.setLevel(logging.INFO)
 
 from app.core.config import settings
-from app.db.session import engine
+from app.db.session import ddl_transaction, engine
 from app.db.base import Base
 from app.services.shore_pass_reminders import run_shore_pass_reminders
 
@@ -211,7 +211,7 @@ def ensure_legacy_schema_columns():
     columns = {column["name"] for column in inspector.get_columns("aggregator_profiles")}
     if "provider_type" in columns:
         return
-    with engine.begin() as connection:
+    with ddl_transaction() as connection:
         connection.execute(
             text("ALTER TABLE aggregator_profiles ADD COLUMN provider_type VARCHAR(32) DEFAULT 'aggregator' NOT NULL")
         )
@@ -251,7 +251,7 @@ def ensure_chat_message_columns():
         if not missing and not need_index and not need_fk:
             return
 
-        with engine.begin() as connection:
+        with ddl_transaction() as connection:
             for name, ddl in missing.items():
                 connection.execute(
                     text(f"ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS {name} {ddl}")
@@ -301,7 +301,7 @@ def ensure_expense_bill_columns():
     missing = {name: ddl for name, ddl in additions.items() if name not in existing}
     if not missing:
         return
-    with engine.begin() as connection:
+    with ddl_transaction() as connection:
         for name, ddl in missing.items():
             connection.execute(text(f"ALTER TABLE expense_bills ADD COLUMN IF NOT EXISTS {name} {ddl}"))
 
@@ -352,7 +352,7 @@ def ensure_magic_link_hardening_schema():
         if not link_additions and not need_event_constraint:
             return
 
-        with engine.begin() as connection:
+        with ddl_transaction() as connection:
             for name, ddl in link_additions.items():
                 connection.execute(
                     text(
@@ -469,7 +469,7 @@ def ensure_port_time_and_sos_context_schema():
 
         if not statements:
             return
-        with engine.begin() as connection:
+        with ddl_transaction() as connection:
             for statement in statements:
                 connection.execute(text(statement))
         log.info("port timezone and trip-bound SOS schema verified")
@@ -498,7 +498,7 @@ def ensure_vendor_commission_schema():
             "CREATE INDEX IF NOT EXISTS ix_vendors_port_category_commission ON vendors (port_id, category, commission_percentage)"
         )
 
-        with engine.begin() as connection:
+        with ddl_transaction() as connection:
             for statement in statements:
                 connection.execute(text(statement))
         log.info("vendor commission schema verified")
@@ -605,7 +605,7 @@ def ensure_agent_dashboard_schema():
                 "ON notifications (audience_type)"
             )
 
-        with engine.begin() as connection:
+        with ddl_transaction() as connection:
             for statement in statements:
                 connection.execute(text(statement))
 
@@ -640,7 +640,7 @@ def ensure_agent_support_number():
         columns = {c["name"] for c in inspector.get_columns("agent_profiles")}
         if "support_number" in columns:
             return
-        with engine.begin() as connection:
+        with ddl_transaction() as connection:
             connection.execute(text(
                 "ALTER TABLE agent_profiles ADD COLUMN IF NOT EXISTS support_number VARCHAR(32)"
             ))
@@ -680,7 +680,7 @@ def ensure_placeholder_helplines_removed():
                 targets.append((table_name, "agent_number", "agent_number IN (:agent_placeholder_one, :agent_placeholder_two, :agent_placeholder_three)"))
 
         cleared = 0
-        with engine.begin() as connection:
+        with ddl_transaction() as connection:
             for table_name, column_name, predicate in targets:
                 result = connection.execute(
                     text(
@@ -711,7 +711,7 @@ def ensure_port_identity_schema():
         if "ports" not in inspector.get_table_names():
             return
         columns = {column["name"] for column in inspector.get_columns("ports")}
-        with engine.begin() as connection:
+        with ddl_transaction() as connection:
             if "canonical_key" not in columns:
                 connection.execute(
                     text("ALTER TABLE ports ADD COLUMN canonical_key VARCHAR(255)")
