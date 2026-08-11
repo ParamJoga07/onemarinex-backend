@@ -108,8 +108,9 @@ class VesselAttributionTests(unittest.TestCase):
 
     def _list_for(self, vessel):
         from app.api.v1.routes_incidents import agent_incident_list
+        # The vessel page shows one combined safety list, so it opts in.
         payload = agent_incident_list(
-            status_filter=None, vessel_id=vessel.id,
+            status_filter=None, vessel_id=vessel.id, include_sos=True,
             db=self.db, current_user=self.agent)
         return payload["incidents"]
 
@@ -133,6 +134,23 @@ class VesselAttributionTests(unittest.TestCase):
 
         self.assertEqual(old_refs, [f"SOS-{old_sos.id}"])
         self.assertEqual(new_refs, [f"SOS-{new_sos.id}"])
+
+    def test_incident_management_does_not_repeat_sos_alerts(self):
+        """It has a dedicated SOS view beside it.
+
+        Returning SOS here unconditionally put every emergency in both places
+        at once — the duplication that removing the mirrored Incident row was
+        meant to end.
+        """
+        from app.api.v1.routes_incidents import agent_incident_list
+
+        self._sos("MV JIM MING 82")
+
+        payload = agent_incident_list(
+            status_filter=None, vessel_id=None,
+            db=self.db, current_user=self.agent)
+
+        self.assertEqual(payload["incidents"], [])
 
     def test_the_stamp_is_matched_case_and_space_insensitively(self):
         """The stamp is a free string copied from the profile, not a key."""

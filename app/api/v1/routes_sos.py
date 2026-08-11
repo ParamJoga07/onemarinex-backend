@@ -284,7 +284,9 @@ def get_sos_timeline(
             "phone": sos.user.mobile_number if sos.user else None,
             "email": sos.crew_email or (sos.user.email if sos.user else None),
         },
-        trip=booking_context(db, booking),
+        # As of when the SOS was raised: where the crew actually were at that
+        # moment, not wherever the cab ended up afterwards.
+        trip=booking_context(db, booking, as_of=sos.created_at),
     )
 
 

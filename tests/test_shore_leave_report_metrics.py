@@ -167,14 +167,49 @@ class ShoreLeaveAverageTests(unittest.TestCase):
         self.assertEqual(result.crew_went_ashore, 1)
         self.assertEqual(result.average_duration_minutes, 480)
 
-    def test_crew_still_ashore_contribute_no_time_but_stay_in_the_divisor(self):
+    def test_the_worked_example(self):
+        """Two cabs of four, out two hours and three.
+
+            trip 1: 4 crew x 2h =  8 crew-hours
+            trip 2: 4 crew x 3h = 12 crew-hours
+            total  = 20 crew-hours over 8 crew ashore = 2.5h each
+
+        Crew-hours count each passenger's own time, so a shared cab is not one
+        person's two hours but four people's.
+        """
+        first = [self.crew() for _ in range(4)]
+        second = [self.crew() for _ in range(4)]
+        self.trip_for(first[0], started=_at(9), completed=_at(11),
+                      passengers=[c.hpid for c in first[1:]])
+        self.trip_for(second[0], started=_at(13), completed=_at(16),
+                      passengers=[c.hpid for c in second[1:]])
+
+        result = self.report()
+
+        self.assertEqual(result.crew_went_ashore, 8)
+        self.assertEqual(result.average_duration_minutes, 150)
+
+    def test_a_crew_member_on_two_trips_counts_their_whole_time_once(self):
+        """The same person out twice is one head, with both stretches summed.
+
+        Their four hours ashore are four hours, not two trips of two averaged
+        back down — and the gap they spent aboard between the two is not leave.
+        """
+        crew = self.crew()
+        self.trip_for(crew, started=_at(9), completed=_at(11))
+        self.trip_for(crew, started=_at(14), completed=_at(16))
+
+        result = self.report()
+
+        self.assertEqual(result.crew_went_ashore, 1)
+        self.assertEqual(result.average_duration_minutes, 240)
+
+    def test_crew_still_ashore_are_left_out_of_the_average(self):
         """The figure is leave per *eligible* head, not per completed trip.
 
-        Someone still ashore has no finished duration to add, but they are
-        eligible crew and so remain in the divisor. Two hours over two eligible
-        crew is one hour per head, which is the trade-off this definition
-        accepts: the average moves with how many people got ashore, not only
-        with how long those who did were out.
+        Someone still ashore has no finished duration to contribute yet, so
+        they are left out of both the crew-hours and the head count rather than
+        counted as a zero. They are reported separately as `still_ashore`.
         """
         returned = self.crew()
         still_out = self.crew()
@@ -185,13 +220,14 @@ class ShoreLeaveAverageTests(unittest.TestCase):
 
         self.assertEqual(result.crew_went_ashore, 2)
         self.assertEqual(result.still_ashore, 1)
-        self.assertEqual(result.average_duration_minutes, 60)
+        self.assertEqual(result.average_duration_minutes, 120)
 
-    def test_one_short_ride_among_six_eligible_crew(self):
-        """The reported case: a ten-minute ride on a ship with six eligible.
+    def test_the_average_does_not_sag_when_most_of_the_ship_stays_aboard(self):
+        """One ten-minute ride among six eligible crew is a ten-minute ride.
 
-        Reported as 10/6 of a minute per eligible head, not as a ten-minute
-        trip and not as the two-and-a-half hours the old envelope produced.
+        Eligibility belongs to utilisation — one of six went, so 17% — not to
+        the average, which answers how long a crew member who went ashore was
+        actually out.
         """
         rider = self.crew()
         for _ in range(5):
@@ -202,7 +238,8 @@ class ShoreLeaveAverageTests(unittest.TestCase):
 
         self.assertEqual(result.eligible_for_shore_leave, 6)
         self.assertEqual(result.crew_went_ashore, 1)
-        self.assertAlmostEqual(result.average_duration_minutes, 10 / 6, places=4)
+        self.assertEqual(result.shore_leave_utilisation_pct, 17)
+        self.assertEqual(result.average_duration_minutes, 10)
 
     def test_an_unregistered_passenger_still_counts_as_ashore(self):
         """A cab booked for three puts three ashore.
@@ -301,8 +338,13 @@ class ShoreLeaveAverageTests(unittest.TestCase):
         self.assertEqual(result.still_ashore, 0)
         self.assertTrue(result.all_returned)
 
-    def test_only_shore_leave_eligible_crew_are_in_the_average(self):
-        """The average answers how long *eligible* crew are getting ashore."""
+    def test_anyone_who_went_ashore_counts_towards_the_average(self):
+        """Eligibility gates utilisation, not time actually spent ashore.
+
+        A crew member the manifest did not mark eligible who nonetheless went
+        ashore was really ashore, and their hours are real. Excluding them would
+        report an average over people while quietly dropping some of them.
+        """
         eligible = self.crew()
         ineligible = self.crew(shore_pass_eligible=False)
         self.pass_for(eligible, out=_at(10), back=_at(12))
@@ -311,10 +353,9 @@ class ShoreLeaveAverageTests(unittest.TestCase):
         result = self.report()
 
         self.assertEqual(result.eligible_for_shore_leave, 1)
-        # Both went ashore and are reported as such; only the eligible crew
-        # member's two hours feed the average.
         self.assertEqual(result.crew_went_ashore, 2)
-        self.assertEqual(result.average_duration_minutes, 120)
+        # (120 + 480) / 2
+        self.assertEqual(result.average_duration_minutes, 300)
 
 
 class GroupBookingPassengerTests(ShoreLeaveAverageTests):

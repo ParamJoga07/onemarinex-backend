@@ -647,15 +647,20 @@ def agent_safety_summary(
 def agent_incident_list(
     status_filter: Optional[str] = None,
     vessel_id: Optional[int] = None,
+    include_sos: bool = False,
     db: Session = Depends(get_db),
     current_user = Depends(get_current_user),
 ):
-    """Safety records raised by crew on this agent's vessels.
+    """Incidents raised by crew on this agent's vessels.
 
-    Carries both incidents and SOS alerts, each tagged with `kind`. An SOS is
-    not an incident and no longer leaves a copycat Incident row behind, so
-    without it here the vessel page would show nothing at all where it used to
-    show the emergency mislabelled as an incident.
+    `include_sos` adds SOS alerts, tagged with `kind`, for the vessel page —
+    which shows one combined safety list and would otherwise show nothing where
+    an emergency happened, since an SOS no longer leaves a copycat Incident row.
+
+    It is off by default because Incident Management has a dedicated SOS view
+    beside it. Returning SOS there unconditionally put every emergency in both
+    places at once, which is the duplication removing the copycat row was meant
+    to end.
     """
     if current_user.role != "agent":
         raise HTTPException(status_code=403, detail="Only agents can view these incidents")
@@ -675,7 +680,8 @@ def agent_incident_list(
 
     rows = query.order_by(Incident.created_at.desc()).all()
     records = [dict(_serialize_incident(db, i), kind="incident") for i in rows]
-    records.extend(_agent_sos_records(db, current_user.id, vessel_id, status_filter))
+    if include_sos:
+        records.extend(_agent_sos_records(db, current_user.id, vessel_id, status_filter))
     # created_at mixes naive legacy Incident values with timezone-aware SOS
     # ones; comparing those directly raises TypeError.
     records.sort(key=lambda item: _sort_instant(item.get("created_at")), reverse=True)
@@ -921,7 +927,9 @@ def agent_incident_detail(
         "incident": detail,
         "reporter": reporter,
         "vessel": vessel_context(vessel, port_name=incident.port_name),
-        "trip": booking_context(db, booking),
+        # As of when the incident was filed, not now: a trip that has since
+        # finished must not report a skipped stop as the crew's next destination.
+        "trip": booking_context(db, booking, as_of=incident.created_at),
         "timeline": [
             {
                 "id": e.id,
