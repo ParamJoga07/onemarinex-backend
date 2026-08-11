@@ -1033,14 +1033,17 @@ def shore_leave_report(
 
     completed_trips = sum(1 for t in day_trips if t.status == BookingStatus.COMPLETED)
 
-    # Average time ashore per crew member eligible for shore leave.
+    # Average time ashore, as crew-hours over the crew who actually went.
     #
-    # Who counts. The divisor is every eligible crew member, not just those who
-    # went — so a ship where one of six eligible crew took a ten-minute ride
-    # reports 10/6, not 10. It reads as leave taken per eligible head, which
-    # stays low when few people get ashore, rather than as how long a typical
-    # trip lasts. Crew still ashore contribute no finished duration yet and are
-    # reported separately as `still_ashore`.
+    #     average = total crew-hours ashore / crew who went ashore
+    #
+    # Crew-hours count each person's own time, so a cab carrying four people for
+    # two hours contributes eight crew-hours, not two. Dividing by the crew who
+    # went — not by everyone eligible — answers "how long was a crew member
+    # ashore", and does not sag because most of the ship stayed aboard.
+    #
+    # Crew still ashore have no finished duration to add yet and are left out of
+    # both halves; they are reported separately as `still_ashore`.
     #
     # How each person's time is measured. Their departures are merged, then the
     # merged lengths summed. Merging is what stops a cab ride booked *during* a
@@ -1072,12 +1075,11 @@ def shore_leave_report(
     person_minutes = [
         _merged_minutes(intervals)
         for person, intervals in spans.items()
-        if person in eligible_keys and person not in still_ashore_crew
+        if person not in still_ashore_crew
     ]
     eligible_count = len(eligible_keys)
     average_minutes = (
-        sum(person_minutes) / eligible_count
-        if person_minutes and eligible_count else None
+        sum(person_minutes) / len(person_minutes) if person_minutes else None
     )
 
     day_sos = db.query(CrewSos).filter(
