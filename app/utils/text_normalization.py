@@ -48,11 +48,10 @@ def validate_input(text: str) -> Tuple[Optional[str], Optional[str]]:
     return text, None
 
 
-def normalize(text: str) -> str:
-    """Complete normalization pipeline.
+def _apply_normalization_base(text: str) -> str:
+    """Apply normalization steps 1-6 (core text processing).
 
-    Returns normalized text suitable for dictionary matching.
-    Original text is preserved separately for logging.
+    Shared by normalize() and normalize_for_dictionary_matching().
     """
     if not text:
         return ""
@@ -60,7 +59,6 @@ def normalize(text: str) -> str:
     result = text
 
     # 1. Unicode NFKD (compatible decomposition)
-    # Converts 𝐩 (mathematical bold) → p
     result = unicodedata.normalize('NFKD', result)
 
     # 2. Remove combining marks (accents, diacritics)
@@ -79,32 +77,36 @@ def normalize(text: str) -> str:
     result = re.sub(r'\s+', ' ', result)
 
     # 6. Remove control/format/unassigned characters
-    # Keep: letters, digits, spaces (U+0020), common punctuation
     result = ''.join(
         c for c in result
         if unicodedata.category(c) not in ('Cf', 'Cc', 'Cn') or c == ' '
     )
 
-    # 7. Collapse character runs (aaa → aa)
-    result = _CHAR_RUN_PATTERN.sub(r'\1\1', result)
+    return result
+
+
+def _apply_evasion_detection_normalization(text: str) -> str:
+    """Apply normalization steps 8-12 (evasion detection).
+
+    Handles: punctuation obfuscation, spaced letters, leetspeak, emoji removal.
+    Shared by normalize() and normalize_for_dictionary_matching().
+
+    Note: Skips steps 7 and 13 (character-run collapsing) which corrupt exact word forms.
+    """
+    result = text
 
     # 8. Collapse multiple punctuation (!!! → !)
     result = re.sub(r'([.!?]){2,}', r'\1', result)
 
     # 9. Remove intra-word obfuscation symbols (p##rn → prn, p@@rn → prn, etc.)
-    # Remove non-alphanumeric chars between letter pairs
-    # Extended character set to catch: # @ * _ + = ~ | \ / $ % ^ & etc.
     while re.search(r'[a-z][#@*_+=~|\\/$%^&\-\.!]+[a-z]', result):
         result = re.sub(r'([a-z])[#@*_+=~|\\/$%^&\-\.!]+([a-z])', r'\1\2', result)
 
     # 10. Remove spaced-out letters (p o r n → porn, s e x → sex)
-    # Pattern: letter space letter space... including repeated letters with spaces
     def remove_letter_spaces(match):
         token = match.group(0)
         letters = sum(1 for c in token if c.isalpha())
         spaces = sum(1 for c in token if c == ' ')
-        # If heavily spaced (spaces >= letters - 1), remove spaces
-        # Catch patterns like: s e, e x, p o (min 2 letters with spaces)
         if spaces >= letters - 1 and letters >= 2:
             return token.replace(' ', '')
         return token
@@ -115,8 +117,53 @@ def normalize(text: str) -> str:
     result = ''.join(_LEET_TABLE.get(c, c) for c in result)
 
     # 12. Remove emoji and non-ASCII symbols
-    # Keep: a-z, 0-9, spaces, apostrophes only
     result = re.sub(r'[^a-z0-9\s\']', '', result)
+
+    return result
+
+
+def normalize_for_dictionary_matching(text: str) -> str:
+    """Normalize text for dictionary matching (preserves repeated character runs).
+
+    Applies steps 1-6 and 8-12 (core processing + evasion detection).
+    SKIPS steps 7 and 13 (character-run collapsing) to preserve exact word forms.
+
+    This ensures exact word matching: "butt" matches "butt", not "but".
+    And "seeeex" remains "seeeex" (not collapsed to "sex").
+
+    Used for checking restricted-word dictionary to avoid false positives where
+    legitimate short words match longer database entries due to character collapse.
+    """
+    result = _apply_normalization_base(text)
+
+    # Skip step 7: Collapse character runs (aaa → aa)
+    # Skip step 13: Collapse excessively repeated letters (seeeex → sex, aaaa → a)
+    # Both steps corrupt the exact form of words for dictionary purposes.
+
+    result = _apply_evasion_detection_normalization(result)
+
+    # 14. Final whitespace collapse and strip
+    result = re.sub(r'\s+', ' ', result).strip()
+
+    return result
+
+
+def normalize(text: str) -> str:
+    """Complete normalization pipeline for spam/evasion detection.
+
+    Returns normalized text suitable for spam detection, charset validation,
+    and other security heuristics.
+
+    Note: For restricted-word dictionary matching, use normalize_for_dictionary_matching()
+    instead to preserve legitimate repeated characters in words like "butt" and "ass".
+    """
+    result = _apply_normalization_base(text)
+
+    # 7. Collapse character runs (aaa → aa)
+    result = _CHAR_RUN_PATTERN.sub(r'\1\1', result)
+
+    # 8-12. Evasion detection normalization
+    result = _apply_evasion_detection_normalization(result)
 
     # 13. Collapse excessively repeated letters (seeeex → sex, aaaa → a)
     # After removing symbols, any 2+ identical consecutive letters likely indicate obfuscation
@@ -169,41 +216,30 @@ def detect_repeated_characters(text: str) -> bool:
 
 
 def _is_keyboard_smash(text: str) -> bool:
-    """Detect keyboard smash by analyzing randomness and entropy.
+    """Detect keyboard smash by analyzing vowel distribution.
 
     Characteristics of keyboard smash:
-    - High ratio of consonant clusters (3+ consonants in a row)
-    - Excessive character repetition (same char appears 3+ times non-contiguously)
-    - Low vowel ratio (< 15% for alphanumeric text)
+    - Low vowel ratio (< 20% for alphanumeric text)
     - No real word patterns
-    - High entropy (random character distribution)
+
+    Gibberish and keyboard smash (random letter mashing) consistently have
+    very few vowels. Legitimate English always has 25%+ vowels.
     """
     if len(text) < 5:
         return False
 
     vowels = 'aeiou'
-    consonants = 'bcdfghjklmnpqrstvwxyz'
 
     # Count letters only (not numbers)
     letter_chars = [c for c in text if c.isalpha()]
     letter_text = ''.join(letter_chars)
 
-    # 1. Check vowel ratio among letters - legitimate text has 30%+ vowels
+    # Check vowel ratio among letters - legitimate text has 30%+ vowels
     if letter_text and len(letter_text) >= 4:
         vowel_count = sum(1 for c in letter_text if c in vowels)
         vowel_ratio = vowel_count / len(letter_text)
         if vowel_ratio < 0.2:  # Low vowel ratio in letter-only text is suspicious
             return True
-
-    # 2. Check for excessive consonant clusters (3+ consonants in a row)
-    consonant_clusters = len(re.findall(r'[bcdfghjklmnpqrstvwxyz]{3,}', text))
-    if consonant_clusters >= 2:  # Multiple weird consonant clusters
-        return True
-
-    # 3. Check for character distribution randomness
-    # Legitimate text has predictable char distribution; smash has highly varied
-    if _has_high_entropy(text):
-        return True
 
     return False
 

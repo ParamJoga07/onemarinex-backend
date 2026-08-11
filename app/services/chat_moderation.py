@@ -15,7 +15,7 @@ from typing import Optional, Dict, Set
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from app.utils.text_normalization import normalize
+from app.utils.text_normalization import normalize, normalize_for_dictionary_matching
 from app.services.moderation_ai import check_language, check_context
 
 logger = logging.getLogger("heyports.chat_moderation")
@@ -79,7 +79,7 @@ def reload_restricted_words(db: Session) -> None:
     phrases = []
 
     for w in words:
-        normalized = normalize(w.word)
+        normalized = w.word.lower().strip()
         if ' ' in normalized:
             phrases.append(re.escape(normalized))
         else:
@@ -169,7 +169,8 @@ async def moderate_message(
         return result
 
     single_words, phrase_regex = _get_cached_dictionary(db)
-    matched_term = _check_dictionary(normalized, single_words, phrase_regex)
+    normalized_for_dict = normalize_for_dictionary_matching(raw_text)
+    matched_term = _check_dictionary(normalized_for_dict, single_words, phrase_regex)
 
     if matched_term:
         result = ModerationResult(
