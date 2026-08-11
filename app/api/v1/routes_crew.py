@@ -2141,6 +2141,11 @@ def book_cab(
     now = datetime.utcnow()
     booking_port_rule = _port_rule_for(db, port_value)
 
+    from app.services import agent_contact
+
+    booking_vessel = agent_contact.vessel_for_crew(db, profile)
+    booking_agent_number = agent_contact.support_number_for_crew(db, profile)
+
     new_booking = CabBooking(
         booking_id=booking_id,
         crew_id=profile.id,
@@ -2165,7 +2170,14 @@ def book_cab(
         provider_id=None,
         aggregator_id=None,
         aggregator_name=None,
-        agent_number=booking_port_rule.helpline_number if booking_port_rule else None,
+        # The ship this trip is taken from, pinned now rather than inferred
+        # later — see app/services/agent_contact.py.
+        vessel_id=booking_vessel.id if booking_vessel else None,
+        # The agency's own number, not the port's. These two were previously
+        # both filled from port_rules.helpline_number, so the "agent number" was
+        # really the shared port helpline: an agent editing their contact number
+        # changed nothing here, which is why it looked frozen.
+        agent_number=booking_agent_number,
         # The helpline is whatever the super admin configured for this port.
         # No placeholder fallback: a made-up number is worse than an honest
         # unavailable state on an emergency contact row.
@@ -2345,7 +2357,13 @@ def get_booking_details(
             raise HTTPException(status_code=404, detail="Booking not found")
     
     from app.services.booking_service import serialize_booking
+    from app.services import agent_contact
     serialized = serialize_booking(booking)
+    # Read the agency's number live, falling back to whatever the booking
+    # stored. The column is a snapshot, so an agent who corrects their contact
+    # number would otherwise never see it change on a trip already running —
+    # which is exactly how it looked frozen.
+    live_agent_number = agent_contact.support_number_for_crew(db, booking.crew)
     return CabBookingDetailsOut(
         booking_id=booking.booking_id,
         vehicle_name=booking.vehicle_name,
@@ -2356,7 +2374,7 @@ def get_booking_details(
         driver_phone=serialized.get("driver_phone") or "Not Yet Assigned",
         assigned_driver_id=serialized.get("assigned_driver_id"),
         otp=booking.otp,
-        agent_number=booking.agent_number,
+        agent_number=live_agent_number or booking.agent_number,
         helpline_number=serialized.get("helpline_number"),
         status=booking.status.value,
         ride_type=serialized.get("ride_type"),

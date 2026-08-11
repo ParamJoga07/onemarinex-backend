@@ -60,6 +60,23 @@ def get_current_user(
     return user
 
 
+def get_current_user_optional(
+    db: Session = Depends(get_db),
+    authorization: Optional[str] = Header(None),
+) -> Optional[User]:
+    """The signed-in user, or None — never raises.
+
+    For endpoints that must keep serving anonymous callers but can tailor the
+    response when they do know who is asking. Port rules are the case: the
+    screen is readable without signing in, yet an agent's own rules must reach
+    only their crew.
+    """
+    try:
+        return get_current_user(db=db, authorization=authorization)
+    except HTTPException:
+        return None
+
+
 # ----------------------------
 # Schemas
 # ----------------------------

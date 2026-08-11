@@ -213,6 +213,52 @@ class NotificationVesselScopingTests(unittest.TestCase):
 
         self.assertEqual([item.title for item in visible], ["Own fleet"])
 
+    def test_crew_who_changed_ship_stop_receiving_the_old_ships_notices(self):
+        """The reported leak: notices reaching vessels they were not sent to.
+
+        Recipients were resolved by matching HPID and passport against the whole
+        manifest table with no vessel filter. A crew member who joins a second
+        ship is on both manifests, so they stayed a recipient for the ship they
+        had left — and a notice addressed to one vessel arrived on another.
+        """
+        # A second ship under the same agent, so both notices are legitimate.
+        new_ship = Vessel(
+            agent_id=self.agent_a.id, name=_uniq("MV"), imo_number=_uniq("IMO"),
+            vessel_type="Bulk Carrier", status="Active",
+        )
+        self.db.add(new_ship)
+        self.db.flush()
+
+        crew_user = User(
+            email=_uniq("crew") + "@example.com", hashed_password="x", role="crew"
+        )
+        self.db.add(crew_user)
+        self.db.flush()
+        hpid = _uniq("HP")
+        passport = _uniq("P").replace("-", "")[:12].upper()
+        self.db.add(CrewProfile(
+            user_id=crew_user.id, full_name="Crew", rank="able_seaman",
+            nationality="IN", hpid=hpid, passport_number=passport,
+            current_port=self.PORT,
+            # They have transferred to the new ship.
+            vessel=new_ship.name,
+        ))
+        # The same person is still listed on both manifests.
+        for vessel in (self.vessel_a, new_ship):
+            self.db.add(VesselCrew(
+                vessel_id=vessel.id, name="Crew", rank="able_seaman",
+                hp_id=hpid, passport_number=passport,
+            ))
+        self.db.flush()
+
+        self.send(self.agent_a, self.vessel_a.name)
+        self.send(self.agent_a, new_ship.name)
+
+        crew = SimpleNamespace(id=crew_user.id, role="crew")
+        visible = list_notifications_for_crew(db=self.db, current_user=crew)
+
+        self.assertEqual([item.vessel for item in visible], [new_ship.name])
+
 
 if __name__ == "__main__":
     unittest.main()

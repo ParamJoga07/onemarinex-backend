@@ -21,7 +21,7 @@ from app.db.models.user import User
 from app.db.models.port import Port
 from app.db.models.port_rule import PortRule
 from app.db.models.port_service_request import PortServiceRequest
-from app.api.v1.routes_auth import get_current_user
+from app.api.v1.routes_auth import get_current_user, get_current_user_optional
 from app.services.port_time import (
     minutes_from_hhmm,
     port_clock_snapshot,
@@ -149,8 +149,58 @@ def get_ports(db: Session = Depends(get_db)):
     ports = db.query(Port).filter(Port.is_active == True).all()
     return ports
 
+def _visible_rules(db: Session, viewer, port_rules: list) -> list:
+    """The rules this reader should see.
+
+    Three different answers, because two different people own rules here:
+
+    - an **agent** gets only their agency's, because this is also what the
+      editor loads. Handing them the port's rules too would mean saving swept
+      the superadmin's wording into their agency and showed it back as theirs.
+    - **crew** get the port's rules *and* their agency's — both genuinely apply
+      to them, and neither can overwrite the other.
+    - anyone else, signed in or not, gets the port's rules alone.
+    """
+    if viewer is not None and viewer.role == "agent":
+        return _agency_rules_for(db, viewer)
+    return list(port_rules) + _agency_rules_for(db, viewer)
+
+
+def _agency_rules_for(db: Session, viewer) -> list:
+    """Rules authored by the agency responsible for `viewer`.
+
+    Empty for everyone else — these belong to one agency, not to the port.
+    """
+    if viewer is None:
+        return []
+
+    if viewer.role == "agent":
+        profile = getattr(viewer, "agent_profile", None)
+        return safe_parse_json(getattr(profile, "agency_rules", None), []) if profile else []
+
+    if viewer.role == "crew":
+        from app.db.models.agent_profile import AgentProfile
+        from app.db.models.crew_profile import CrewProfile
+        from app.services import agent_contact
+
+        crew = db.query(CrewProfile).filter(CrewProfile.user_id == viewer.id).first()
+        vessel = agent_contact.vessel_for_crew(db, crew)
+        if vessel is None or not vessel.agent_id:
+            return []
+        profile = db.query(AgentProfile).filter(
+            AgentProfile.user_id == vessel.agent_id
+        ).first()
+        return safe_parse_json(profile.agency_rules, []) if profile else []
+
+    return []
+
+
 @router.get("/{port_name}/rules", response_model=PortRulesOut)
-def get_port_rules(port_name: str, db: Session = Depends(get_db)):
+def get_port_rules(
+    port_name: str,
+    db: Session = Depends(get_db),
+    viewer: Optional[User] = Depends(get_current_user_optional),
+):
     port = (
         db.query(Port)
         .filter((Port.code == port_name) | (Port.name == port_name))
@@ -167,7 +217,7 @@ def get_port_rules(port_name: str, db: Session = Depends(get_db)):
         clock = port_clock_snapshot(canonical_port)
         return {
             "port_name": canonical_port,
-            "rules": [],
+            "rules": _visible_rules(db, viewer, []),
             "opening_time": None,
             "closing_time": None,
             "working_days": None,
@@ -194,7 +244,7 @@ def get_port_rules(port_name: str, db: Session = Depends(get_db)):
     clock = port_clock_snapshot(rules.port_name, rules.timezone)
     return {
         "port_name": rules.port_name,
-        "rules": safe_parse_json(rules.rules, []),
+        "rules": _visible_rules(db, viewer, safe_parse_json(rules.rules, [])),
         "opening_time": rules.opening_time,
         "closing_time": rules.closing_time,
         "working_days": working_days,
@@ -228,6 +278,7 @@ def update_port_rules(
 
     is_agent = current_user.role == "agent"
     agent_support_number = None
+    agent_rules = None
     if is_agent:
         assigned = (
             current_user.agent_profile.assigned_port
@@ -264,6 +315,24 @@ def update_port_rules(
             profile.support_number = _validate_support_number(body.helpline_number)
             agent_support_number = profile.support_number
 
+        # Rules the agent writes are their agency's, for the same reason. The
+        # port holds one rules row shared by every agency berthed there, so an
+        # agent saving guidance used to replace what all the others were showing
+        # their crew.
+        if "rules" in body.model_fields_set:
+            profile = getattr(current_user, "agent_profile", None)
+            if profile is None:
+                raise HTTPException(status_code=403, detail="No agency profile on this account")
+            profile.agency_rules = [
+                {
+                    "title": (rule.title or "").strip(),
+                    "description": (rule.description or "").strip(),
+                    "icon_type": (rule.icon_type or "time").strip() or "time",
+                }
+                for rule in (body.rules or [])
+            ]
+            agent_rules = profile.agency_rules
+
     port_rules = (
         db.query(PortRule)
         .filter(
@@ -276,7 +345,10 @@ def update_port_rules(
 
     update_data = body.model_dump(exclude_unset=True)
     if is_agent:
+        # Both already went to the agency profile above; letting either through
+        # here would write them onto the shared port row as well.
         update_data.pop("helpline_number", None)
+        update_data.pop("rules", None)
     if "helpline_number" in update_data:
         update_data["helpline_number"] = _validate_support_number(update_data["helpline_number"])
     for field_name in ("opening_time", "closing_time"):
@@ -350,7 +422,11 @@ def update_port_rules(
     clock = port_clock_snapshot(port_rules.port_name, port_rules.timezone)
     return {
         "port_name": port_rules.port_name,
-        "rules": safe_parse_json(port_rules.rules, []),
+        # An agent gets back the rules they just saved, not the port's. Echoing
+        # the port row would make their own rules appear to vanish on save, the
+        # way the contact number did.
+        "rules": (agent_rules if agent_rules is not None
+                  else safe_parse_json(port_rules.rules, [])),
         "opening_time": port_rules.opening_time,
         "closing_time": port_rules.closing_time,
         "working_days": working_days,
@@ -361,7 +437,8 @@ def update_port_rules(
         "port_day": clock["port_day"],
         "advance_booking_buffer_minutes": port_rules.advance_booking_buffer_minutes,
         "contact_email": port_rules.contact_email,
-        "helpline_number": port_rules.helpline_number,
+        "helpline_number": (agent_support_number if is_agent
+                            else port_rules.helpline_number),
     }
 
 

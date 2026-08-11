@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, ForeignKey, DateTime, func
+from sqlalchemy import Column, Integer, String, ForeignKey, DateTime, JSON, func
 from sqlalchemy.orm import relationship
 from app.db.base import Base
 
@@ -23,6 +23,12 @@ class AgentProfile(Base):
     # The agency's own crew-support number. Kept here rather than on port_rules,
     # which the superadmin owns and every agency at the port shares.
     support_number = Column(String(32), nullable=True)
+    # Guidance this agency shows its own crew, for the same reason: an agent
+    # editing rules used to write into the single shared port_rules row, so one
+    # agency's instructions replaced what every other agency at that port was
+    # showing. These reach only the vessels this agent manages; the port's own
+    # rules still come from port_rules and apply to everyone.
+    agency_rules = Column(JSON, nullable=True)
     agent_identifier = Column(String(64), nullable=True)  # e.g., "12287-28792-87258"
     auth_document_url = Column(String(512), nullable=True)
 

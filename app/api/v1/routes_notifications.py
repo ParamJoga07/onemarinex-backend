@@ -289,26 +289,37 @@ def _recipient_context(db: Session, current_user):
         if profile:
             port_name = profile.current_port
             vessel_name = profile.vessel
-            clauses = []
-            if profile.hpid:
-                clauses.append(
-                    func.upper(func.trim(VesselCrew.hp_id)) == profile.hpid.strip().upper()
-                )
-            if profile.passport_number:
-                clauses.append(
-                    func.upper(func.trim(VesselCrew.passport_number))
-                    == profile.passport_number.strip().upper()
-                )
-            if clauses:
-                vessel_ids.update(
-                    row[0] for row in db.query(VesselCrew.vessel_id).filter(or_(*clauses)).all()
-                )
+
+            # The ship they are on *now*, not every ship they have ever sailed.
+            #
+            # This used to match their HPID and passport against the whole
+            # vessel_crew table with no vessel filter, so a crew member who had
+            # joined a second ship stayed a recipient for their old one — and a
+            # notice addressed to one vessel reached crew on another. Their
+            # current vessel is the one their profile names; the manifest match
+            # is the fallback for crew whose profile has no vessel set.
             if vessel_name:
                 vessel_ids.update(
                     row[0] for row in db.query(Vessel.id).filter(
-                        func.lower(Vessel.name) == vessel_name.strip().lower()
+                        func.lower(func.trim(Vessel.name)) == vessel_name.strip().lower()
                     ).all()
                 )
+
+            if not vessel_ids:
+                clauses = []
+                if profile.hpid:
+                    clauses.append(
+                        func.upper(func.trim(VesselCrew.hp_id)) == profile.hpid.strip().upper()
+                    )
+                if profile.passport_number:
+                    clauses.append(
+                        func.upper(func.trim(VesselCrew.passport_number))
+                        == profile.passport_number.strip().upper()
+                    )
+                if clauses:
+                    vessel_ids.update(
+                        row[0] for row in db.query(VesselCrew.vessel_id).filter(or_(*clauses)).all()
+                    )
     else:
         from app.db.models.agent_profile import AgentProfile
         profile = db.query(AgentProfile).filter(AgentProfile.user_id == current_user.id).first()

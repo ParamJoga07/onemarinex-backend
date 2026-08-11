@@ -44,6 +44,16 @@ class CabBooking(Base):
     crew_id = Column(Integer, ForeignKey("crew_profiles.id"), nullable=False)
     crew = relationship("CrewProfile", back_populates="cab_bookings")
 
+    # The ship this trip was taken from, resolved once when the booking is made.
+    #
+    # Without it a trip's vessel had to be inferred at read time from whoever
+    # booked it — and a crew member who joins a second ship is on both
+    # manifests, so every trip they ever took followed them onto the new one.
+    # Nullable because rows written before this column cannot be backfilled
+    # reliably; readers fall back to crew linkage for those.
+    vessel_id = Column(Integer, ForeignKey("vessels.id", ondelete="SET NULL"),
+                       nullable=True, index=True)
+
     pickup_address = Column(String, nullable=False)
     pickup_lat = Column(Float, nullable=False)
     pickup_lng = Column(Float, nullable=False)

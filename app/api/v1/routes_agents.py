@@ -875,7 +875,7 @@ class ShoreLeaveReportOut(BaseModel):
     # server-side so the report and any other reader agree.
     shore_leave_utilisation_pct: int = 0
     completed_trips: int
-    average_duration_minutes: Optional[int] = None
+    average_duration_minutes: Optional[float] = None
     returned_safely: int
     still_ashore: int
     sos_raised: int
@@ -915,15 +915,14 @@ def shore_leave_report(
 
     manifest = db.query(VesselCrew).filter(VesselCrew.vessel_id == vessel.id).all()
     hp_ids = [c.hp_id for c in manifest if c.hp_id]
-    # HPID alone under-matches: a manifest that spells the nationality
-    # differently from the crew member's own registration generates a different
-    # HPID for the same person, and everything they did drops off this report.
+    # The manifest decides who is aboard; an account is only how their own
+    # records are found. Counting by crew profile alone dropped anyone who had
+    # never registered — so a cab booked for three read as one person ashore.
     from app.services import crew_linkage
 
-    manifest_profiles = crew_linkage.vessel_crew_profiles(db, vessel)
-    crew_profile_ids = [profile.id for profile in manifest_profiles]
-    profile_id_by_hpid = crew_linkage.profile_id_by_hpid(manifest_profiles)
-    eligible_profile_ids = crew_linkage.eligible_profile_ids(db, vessel, manifest_profiles)
+    roster = crew_linkage.vessel_roster(db, vessel)
+    crew_profile_ids = roster.profile_ids
+    eligible_keys = roster.eligible_keys
 
     passes = db.query(ShorePass).filter(
         ShorePass.crew_profile_id.in_(crew_profile_ids),
@@ -942,6 +941,11 @@ def shore_leave_report(
     trip_start = func.coalesce(CabBooking.trip_started_at, CabBooking.started_at)
     day_trips = db.query(CabBooking).filter(
         CabBooking.crew_id.in_(crew_profile_ids),
+        # A trip pinned to a different ship is not this vessel's, however the
+        # crew member is linked now. Crew who join a second vessel sit on both
+        # manifests, so without this every trip they ever took was counted here
+        # too — which is how one booking could be reported as five.
+        or_(CabBooking.vessel_id.is_(None), CabBooking.vessel_id == vessel.id),
         or_(
             and_(trip_start.isnot(None), trip_start >= day_start, trip_start < day_end),
             and_(
@@ -961,14 +965,20 @@ def shore_leave_report(
         typo — or another ship's ID — would otherwise become a person on this
         report. Resolving them through the manifest drops anything that is not
         this vessel's crew, and an unrecognised ID simply does not count.
+
+        Passengers are resolved to a manifest identity, not to an account, so
+        crew who have never registered still count as having gone ashore.
         """
-        people = {trip.crew_id} if trip.crew_id else set()
+        people = set()
+        booker = roster.key_for_profile(trip.crew_id)
+        if booker:
+            people.add(booker)
         extra = trip.crew_member_ids
         if isinstance(extra, list):
             for hpid in extra:
-                profile_id = crew_linkage.resolve_hpid(profile_id_by_hpid, hpid)
-                if profile_id is not None:
-                    people.add(profile_id)
+                key = roster.key_for_hpid(hpid)
+                if key is not None:
+                    people.add(key)
         return people
 
     # Every departure ashore, as (person, left_at, came_back_at, is_back).
@@ -993,7 +1003,8 @@ def shore_leave_report(
     departures: List[tuple] = []
     for p in passes:
         if p.out_time:
-            departures.append((p.crew_profile_id, p.out_time, p.in_time, p.in_time is not None))
+            person = roster.key_for_profile(p.crew_profile_id)
+            departures.append((person, p.out_time, p.in_time, p.in_time is not None))
     for t in day_trips:
         if t.status == BookingStatus.CANCELLED:
             continue
@@ -1022,15 +1033,14 @@ def shore_leave_report(
 
     completed_trips = sum(1 for t in day_trips if t.status == BookingStatus.COMPLETED)
 
-    # Average time ashore, per crew member, over crew eligible for shore leave
-    # who actually completed a period of leave that day.
+    # Average time ashore per crew member eligible for shore leave.
     #
-    # Who counts. Only shore-leave-eligible crew, and only those who went ashore
-    # *and* came back: someone still ashore has no finished duration to measure,
-    # and someone who never left has no duration at all. Counting either as a
-    # zero would drag the figure down and stop it answering the question the
-    # tile asks — how long our crew are actually getting ashore. They are
-    # reported separately as `still_ashore` and in the utilisation percentage.
+    # Who counts. The divisor is every eligible crew member, not just those who
+    # went — so a ship where one of six eligible crew took a ten-minute ride
+    # reports 10/6, not 10. It reads as leave taken per eligible head, which
+    # stays low when few people get ashore, rather than as how long a typical
+    # trip lasts. Crew still ashore contribute no finished duration yet and are
+    # reported separately as `still_ashore`.
     #
     # How each person's time is measured. Their departures are merged, then the
     # merged lengths summed. Merging is what stops a cab ride booked *during* a
@@ -1062,10 +1072,12 @@ def shore_leave_report(
     person_minutes = [
         _merged_minutes(intervals)
         for person, intervals in spans.items()
-        if person in eligible_profile_ids and person not in still_ashore_crew
+        if person in eligible_keys and person not in still_ashore_crew
     ]
+    eligible_count = len(eligible_keys)
     average_minutes = (
-        int(sum(person_minutes) / len(person_minutes)) if person_minutes else None
+        sum(person_minutes) / eligible_count
+        if person_minutes and eligible_count else None
     )
 
     day_sos = db.query(CrewSos).filter(
@@ -1080,7 +1092,6 @@ def shore_leave_report(
         Incident.created_at < day_end,
     ).all() if hp_ids else []
 
-    eligible_count = sum(1 for c in manifest if c.shore_pass_eligible)
 
     from app.services import incident_taxonomy as tax
 
