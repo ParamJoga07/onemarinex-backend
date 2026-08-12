@@ -9,9 +9,28 @@ class CrewSos(Base):
     __tablename__ = "crew_sos_requests"
 
     id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
-    crew_profile_id = Column(Integer, ForeignKey("crew_profiles.id", ondelete="CASCADE"), nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    crew_profile_id = Column(Integer, ForeignKey("crew_profiles.id", ondelete="SET NULL"), nullable=True)
     cab_booking_id = Column(Integer, ForeignKey("cab_bookings.id", ondelete="SET NULL"), nullable=True, index=True)
+    vessel_call_id = Column(
+        Integer, ForeignKey("vessel_calls.id", ondelete="RESTRICT"), nullable=True, index=True
+    )
+    vessel_id = Column(
+        Integer, ForeignKey("vessels.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    agency_id = Column(
+        Integer, ForeignKey("agent_profiles.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    crew_assignment_id = Column(
+        Integer,
+        ForeignKey("crew_assignments.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    port_id = Column(
+        Integer, ForeignKey("ports.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    context_resolution = Column(String(32), nullable=True)
     trip_id = Column(String(64), nullable=True, index=True)
     crew_email = Column(String(255), nullable=True)
     sos_email = Column(String(255), nullable=True)
@@ -29,6 +48,8 @@ class CrewSos(Base):
     user = relationship("User")
     crew_profile = relationship("CrewProfile")
     cab_booking = relationship("CabBooking")
+    vessel_call = relationship("VesselCall")
+    crew_assignment = relationship("CrewAssignment")
     timeline = relationship(
         "CrewSosTimelineEvent", back_populates="sos", cascade="all, delete-orphan",
         order_by="CrewSosTimelineEvent.event_time",

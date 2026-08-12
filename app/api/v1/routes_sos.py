@@ -4,6 +4,7 @@ from typing import Optional, List
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
+from sqlalchemy import and_, or_
 
 from app.api.v1.routes_auth import get_current_user
 from app.db.models.crew_sos import CrewSos, CrewSosNote, CrewSosTimelineEvent
@@ -71,7 +72,19 @@ def _agent_crew_profile_ids(db: Session, agent_user_id: int) -> List[int]:
 def _agent_may_handle(db: Session, current_user, sos: CrewSos) -> bool:
     if current_user.role == "superadmin":
         return True
-    return sos.crew_profile_id in _agent_crew_profile_ids(db, current_user.id)
+    from app.db.models.agent_profile import AgentProfile
+
+    agent_profile_id = db.query(AgentProfile.id).filter(
+        AgentProfile.user_id == current_user.id
+    ).scalar()
+    if sos.agency_id is not None:
+        return agent_profile_id is not None and sos.agency_id == agent_profile_id
+    # Compatibility only for unresolved rows written before Release 1. New SOS
+    # records always carry agency_id and never follow a crew member to a new ship.
+    return (
+        sos.crew_profile_id is not None
+        and sos.crew_profile_id in _agent_crew_profile_ids(db, current_user.id)
+    )
 
 
 @router.get("/admin", response_model=List[SosAdminOut])
@@ -83,12 +96,25 @@ def list_sos_requests(
         raise HTTPException(status_code=403, detail="Only superadmins or agents can view SOS")
 
     if current_user.role == "agent":
+        from app.db.models.agent_profile import AgentProfile
+
+        agent_profile_id = db.query(AgentProfile.id).filter(
+            AgentProfile.user_id == current_user.id
+        ).scalar()
         crew_ids = _agent_crew_profile_ids(db, current_user.id)
-        if not crew_ids:
+        clauses = []
+        if agent_profile_id is not None:
+            clauses.append(CrewSos.agency_id == agent_profile_id)
+        if crew_ids:
+            clauses.append(and_(
+                CrewSos.agency_id.is_(None),
+                CrewSos.crew_profile_id.in_(crew_ids),
+            ))
+        if not clauses:
             return []
         sos_list = (
             db.query(CrewSos)
-            .filter(CrewSos.crew_profile_id.in_(crew_ids))
+            .filter(or_(*clauses))
             .order_by(CrewSos.created_at.desc())
             .all()
         )
@@ -207,18 +233,19 @@ def get_sos_timeline(
         ))
 
     from app.db.models.vessel import Vessel
-    from app.db.models.vessel_crew import VesselCrew
+    from app.db.models.vessel_call import VesselCall
+    from app.services.historical_context import vessel_call_context
     from app.services.operations_context import booking_context, find_booking, vessel_context
 
     vessel = None
-    if sos.crew_profile and sos.crew_profile.hpid:
-        vessel = (
-            db.query(Vessel)
-            .join(VesselCrew, VesselCrew.vessel_id == Vessel.id)
-            .filter(VesselCrew.hp_id == sos.crew_profile.hpid)
-            .first()
-        )
-    if vessel is None and sos.vessel:
+    vessel_call = (
+        db.query(VesselCall).filter(VesselCall.id == sos.vessel_call_id).first()
+        if sos.vessel_call_id
+        else None
+    )
+    if vessel_call is None and sos.vessel_id:
+        vessel = db.query(Vessel).filter(Vessel.id == sos.vessel_id).first()
+    if vessel_call is None and vessel is None and sos.vessel:
         vessel = db.query(Vessel).filter(Vessel.name == sos.vessel).first()
     booking = find_booking(db, sos.trip_id, booking_id=sos.cab_booking_id)
 
@@ -276,7 +303,11 @@ def get_sos_timeline(
             "id": note.id, "author_name": note.author_name,
             "note": note.note, "created_at": note.created_at,
         } for note in notes],
-        vessel_details=vessel_context(vessel, port_name=sos.port_name),
+        vessel_details=(
+            vessel_call_context(vessel_call, fallback_port=sos.port_name)
+            if vessel_call
+            else vessel_context(vessel, port_name=sos.port_name)
+        ),
         crew_details={
             "name": sos.crew_profile.full_name if sos.crew_profile else None,
             "rank": sos.crew_profile.rank if sos.crew_profile else None,
@@ -284,7 +315,9 @@ def get_sos_timeline(
             "phone": sos.user.mobile_number if sos.user else None,
             "email": sos.crew_email or (sos.user.email if sos.user else None),
         },
-        trip=booking_context(db, booking),
+        # As of when the SOS was raised: where the crew actually were at that
+        # moment, not wherever the cab ended up afterwards.
+        trip=booking_context(db, booking, as_of=sos.created_at),
     )
 
 

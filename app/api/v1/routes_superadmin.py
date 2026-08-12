@@ -1351,6 +1351,10 @@ def create_vessel_superadmin(
     )
     db.add(vessel)
     try:
+        db.flush()
+        from app.services.historical_context import active_vessel_call
+
+        active_vessel_call(db, vessel)
         db.commit()
         db.refresh(vessel)
     except Exception as e:
@@ -1374,6 +1378,7 @@ def update_vessel_superadmin(
     if not vessel:
         raise HTTPException(status_code=404, detail="Vessel not found")
 
+    original_agent_id = vessel.agent_id
     vessel.name = body.name
     vessel.imo_number = body.imo_number
     vessel.vessel_type = body.vessel_type
@@ -1392,6 +1397,19 @@ def update_vessel_superadmin(
 
     vessel.eta = body.eta
     vessel.etd = body.etd
+
+    from app.services.historical_context import (
+        active_vessel_call,
+        finish_vessel_call,
+        refresh_active_vessel_call,
+    )
+
+    if vessel.agent_id != original_agent_id:
+        finish_vessel_call(db, vessel, status="REASSIGNED")
+        db.flush()
+        active_vessel_call(db, vessel)
+    else:
+        refresh_active_vessel_call(db, vessel)
 
     try:
         db.commit()
@@ -1416,7 +1434,14 @@ def delete_vessel_superadmin(
     if not vessel:
         raise HTTPException(status_code=404, detail="Vessel not found")
 
-    db.delete(vessel)
+    # Removing a ship from the operational roster is an archive action. The
+    # canonical vessel and its call history remain for SOS/incident/report
+    # audit; a destructive delete is not exposed through the ordinary UI.
+    from app.services.historical_context import finish_vessel_call
+
+    finish_vessel_call(db, vessel, status="ARCHIVED")
+    vessel.agent_id = None
+    vessel.status = "Archived"
     db.commit()
     return None
 
@@ -1451,6 +1476,10 @@ def create_vessel_under_agent(
     )
     db.add(vessel)
     try:
+        db.flush()
+        from app.services.historical_context import active_vessel_call
+
+        active_vessel_call(db, vessel)
         db.commit()
         db.refresh(vessel)
     except Exception as e:

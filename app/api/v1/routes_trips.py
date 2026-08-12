@@ -9,6 +9,7 @@ from datetime import datetime
 from app.db.session import get_db
 from app.db.models.cab_booking import CabBooking, BookingStatus
 from app.db.models.crew_profile import CrewProfile
+from app.db.models.agent_profile import AgentProfile
 from app.db.models.vessel import Vessel
 from app.db.models.vessel_crew import VesselCrew
 from app.api.v1.routes_auth import get_current_user
@@ -73,6 +74,18 @@ def _agent_trip_scope(db: Session, agent_user_id: int):
     return vessel_ids, crew_profile_ids
 
 
+def _agent_owns_trip(db: Session, agent_user_id: int, booking: CabBooking) -> bool:
+    agency_id = db.query(AgentProfile.id).filter(
+        AgentProfile.user_id == agent_user_id
+    ).scalar()
+    if booking.agency_id is not None:
+        return agency_id is not None and booking.agency_id == agency_id
+    vessel_ids, crew_profile_ids = _agent_trip_scope(db, agent_user_id)
+    if booking.vessel_id is not None:
+        return booking.vessel_id in vessel_ids
+    return booking.crew_id is not None and booking.crew_id in crew_profile_ids
+
+
 @router.get("/monitoring", response_model=MonitoringResponse)
 def get_trip_monitoring(
     vessel_id: Optional[int] = None,
@@ -114,21 +127,44 @@ def get_trip_monitoring(
             cp.id for cp in db.query(CrewProfile).filter(CrewProfile.hpid.in_(crew_hpids)).all()
         ]
 
-    if not crew_profile_ids:
+    if not vessel_ids:
         return MonitoringResponse(ongoing=[], requested=[], completed=[])
 
     # Use raw SQL to avoid SQLEnum deserialization errors from inconsistent DB data
-    placeholders = ",".join([str(pid) for pid in crew_profile_ids])
+    vessel_placeholders = ",".join([str(value) for value in vessel_ids])
+    legacy_crew_clause = "FALSE"
+    if crew_profile_ids:
+        crew_placeholders = ",".join([str(value) for value in crew_profile_ids])
+        legacy_crew_clause = f"cb.crew_id IN ({crew_placeholders})"
+    agency_profile_id = db.query(AgentProfile.id).filter(
+        AgentProfile.user_id == current_user.id
+    ).scalar()
+    strong_clause = "FALSE"
+    if agency_profile_id is not None:
+        strong_clause = (
+            f"cb.agency_id = {int(agency_profile_id)} "
+            f"AND cb.vessel_id IN ({vessel_placeholders})"
+        )
     rows = db.execute(text(f"""
         SELECT cb.id, cb.booking_id, cb.pickup_address, cb.drop_address,
                cb.pickup_lat, cb.pickup_lng, cb.drop_lat, cb.drop_lng,
                cb.vehicle_name, cb.estimated_price, cb.driver_name,
                cb.driver_phone, cb.driver_plate, cb.aggregator_name,
                cb.status, cb.created_at, cb.scheduled_time, cb.port, cb.ride_type,
-               cp.full_name, cp.rank, cp.hpid
+               COALESCE(cp.full_name, ca.crew_name, 'Historical crew') AS full_name,
+               COALESCE(cp.rank, ca.rank, 'Unknown') AS rank,
+               COALESCE(cp.hpid, ca.hpid, '') AS hpid
         FROM cab_bookings cb
-        JOIN crew_profiles cp ON cb.crew_id = cp.id
-        WHERE cb.crew_id IN ({placeholders})
+        LEFT JOIN crew_profiles cp ON cb.crew_id = cp.id
+        LEFT JOIN crew_assignments ca ON cb.crew_assignment_id = ca.id
+        WHERE ({strong_clause})
+           OR (
+                cb.agency_id IS NULL
+                AND (
+                    cb.vessel_id IN ({vessel_placeholders})
+                    OR (cb.vessel_id IS NULL AND {legacy_crew_clause})
+                )
+           )
         ORDER BY cb.created_at DESC, cb.id DESC
     """)).all()
 
@@ -258,8 +294,7 @@ def get_trip_activity(
     if not booking:
         raise HTTPException(status_code=404, detail="Trip not found")
 
-    _, crew_profile_ids = _agent_trip_scope(db, current_user.id)
-    if booking.crew_id not in crew_profile_ids:
+    if not _agent_owns_trip(db, current_user.id, booking):
         # Same shape as "not found", so an agent cannot probe for other
         # agencies' booking ids.
         raise HTTPException(status_code=404, detail="Trip not found")

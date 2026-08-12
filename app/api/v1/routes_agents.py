@@ -15,7 +15,9 @@ from app.db.models.incident import Incident, IncidentStatus
 from app.db.models.shore_pass import ShorePass
 from app.db.models.crew_sos import CrewSos
 from app.db.models.crew_profile import CrewProfile
+from app.db.models.crew_assignment import CrewAssignment
 from app.db.models.vessel_crew import VesselCrew
+from app.db.models.vessel_call import VesselCall
 from app.db.models.aggregator_profile import AggregatorProfile
 from app.db.models.driver import Driver
 from app.api.v1.routes_auth import get_current_user
@@ -292,6 +294,26 @@ def get_dashboard_data(
     # reports the whole platform's activity, which is what made Crew Ashore and
     # Active Trips show the same number for every agent.
     vessel_ids, crew_profile_ids = _agent_scope(db, current_user.id)
+    agency_profile_id = db.query(AgentProfile.id).filter(
+        AgentProfile.user_id == current_user.id
+    ).scalar()
+
+    def _current_event_scope(model, *, legacy_identity_clause=None):
+        """Prefer immutable event ownership; isolate legacy identity fallback."""
+        clauses = []
+        if agency_profile_id is not None and vessel_ids:
+            clauses.append(and_(
+                model.agency_id == agency_profile_id,
+                model.vessel_id.in_(vessel_ids),
+            ))
+        legacy = [model.agency_id.is_(None)]
+        if vessel_ids:
+            legacy.append(model.vessel_id.in_(vessel_ids))
+        if legacy_identity_clause is not None:
+            legacy.append(and_(model.vessel_id.is_(None), legacy_identity_clause))
+        if len(legacy) > 1:
+            clauses.append(and_(legacy[0], or_(*legacy[1:])))
+        return or_(*clauses) if clauses else None
 
     # Crew ashore: they have actually left the ship and not signed back in.
     # Counting every pass with no in_time also counted passes that were issued
@@ -313,8 +335,14 @@ def get_dashboard_data(
     trips_in_progress_count = 0
     active_trips_count = 0
     live_trips_data = []
-    if crew_profile_ids:
-        agent_trips = db.query(CabBooking).filter(CabBooking.crew_id.in_(crew_profile_ids))
+    trip_scope = _current_event_scope(
+        CabBooking,
+        legacy_identity_clause=(
+            CabBooking.crew_id.in_(crew_profile_ids) if crew_profile_ids else None
+        ),
+    )
+    if trip_scope is not None:
+        agent_trips = db.query(CabBooking).filter(trip_scope)
         todays_trips_count = agent_trips.filter(
             CabBooking.created_at >= today_start,
             CabBooking.created_at < today_end,
@@ -340,16 +368,14 @@ def get_dashboard_data(
     ] if vessel_ids else []
 
     open_incidents = investigating_incidents = closed_incidents = 0
-    if vessel_ids or agent_hp_ids:
-        incident_scope = []
-        if vessel_ids:
-            incident_scope.append(Incident.vessel_id.in_(vessel_ids))
-        if agent_hp_ids:
-            incident_scope.append(and_(
-                Incident.vessel_id.is_(None),
-                Incident.reporter_id.in_(agent_hp_ids),
-            ))
-        agent_incidents = db.query(Incident).filter(or_(*incident_scope))
+    incident_scope = _current_event_scope(
+        Incident,
+        legacy_identity_clause=(
+            Incident.reporter_id.in_(agent_hp_ids) if agent_hp_ids else None
+        ),
+    )
+    if incident_scope is not None:
+        agent_incidents = db.query(Incident).filter(incident_scope)
         open_incidents = agent_incidents.filter(Incident.status == IncidentStatus.ACTIVE).count()
         investigating_incidents = agent_incidents.filter(
             Incident.status == IncidentStatus.INVESTIGATING
@@ -361,9 +387,15 @@ def get_dashboard_data(
     # The tile is labelled "Open SOS/Incidents", so unresolved SOS alerts from
     # this agent's crew belong in it too. They were not counted at all before.
     open_sos = 0
-    if crew_profile_ids:
+    sos_scope = _current_event_scope(
+        CrewSos,
+        legacy_identity_clause=(
+            CrewSos.crew_profile_id.in_(crew_profile_ids) if crew_profile_ids else None
+        ),
+    )
+    if sos_scope is not None:
         open_sos = db.query(CrewSos).filter(
-            CrewSos.crew_profile_id.in_(crew_profile_ids),
+            sos_scope,
             CrewSos.closed_at.is_(None),
             CrewSos.cancelled_at.is_(None),
         ).count()
@@ -383,6 +415,10 @@ def get_dashboard_data(
 
     vessels_data = []
     for v in active_vessels_list:
+        current_call_id = db.query(VesselCall.id).filter(
+            VesselCall.vessel_id == v.id,
+            VesselCall.ended_at.is_(None),
+        ).scalar()
         # Get crew HPIDs for this vessel
         crew_hpids = [c.hp_id for c in db.query(VesselCrew).filter(VesselCrew.vessel_id == v.id).all() if c.hp_id]
 
@@ -394,9 +430,23 @@ def get_dashboard_data(
 
         # 1. Ongoing Trips
         ongoing_trips = 0
-        if vessel_crew_ids:
+        vessel_trip_scope = or_(
+            CabBooking.vessel_call_id == current_call_id
+            if current_call_id is not None else False,
+            and_(
+                CabBooking.vessel_call_id.is_(None),
+                or_(
+                    CabBooking.vessel_id == v.id,
+                    and_(
+                        CabBooking.vessel_id.is_(None),
+                        CabBooking.crew_id.in_(vessel_crew_ids),
+                    ) if vessel_crew_ids else False,
+                ),
+            ),
+        )
+        if current_call_id is not None or vessel_crew_ids:
             ongoing_trips = db.query(CabBooking).filter(
-                CabBooking.crew_id.in_(vessel_crew_ids),
+                vessel_trip_scope,
                 CabBooking.status.in_(LIVE_TRIP_STATUSES),
             ).count()
 
@@ -411,9 +461,17 @@ def get_dashboard_data(
 
         # 3. SOS/Incidents of ship — the card says "SOS/Incidents", so count both.
         incidents = 0
-        incident_scope = [Incident.vessel_id == v.id]
+        incident_scope = [
+            Incident.vessel_call_id == current_call_id
+            if current_call_id is not None else False,
+            and_(
+                Incident.vessel_call_id.is_(None),
+                Incident.vessel_id == v.id,
+            ),
+        ]
         if crew_hpids:
             incident_scope.append(and_(
+                Incident.vessel_call_id.is_(None),
                 Incident.vessel_id.is_(None),
                 Incident.reporter_id.in_(crew_hpids),
             ))
@@ -421,9 +479,23 @@ def get_dashboard_data(
             or_(*incident_scope),
             Incident.status.in_([IncidentStatus.ACTIVE, IncidentStatus.INVESTIGATING])
         ).count()
-        if vessel_crew_ids:
+        if current_call_id is not None or vessel_crew_ids:
+            sos_scope = or_(
+                CrewSos.vessel_call_id == current_call_id
+                if current_call_id is not None else False,
+                and_(
+                    CrewSos.vessel_call_id.is_(None),
+                    or_(
+                        CrewSos.vessel_id == v.id,
+                        and_(
+                            CrewSos.vessel_id.is_(None),
+                            CrewSos.crew_profile_id.in_(vessel_crew_ids),
+                        ) if vessel_crew_ids else False,
+                    ),
+                ),
+            )
             incidents += db.query(CrewSos).filter(
-                CrewSos.crew_profile_id.in_(vessel_crew_ids),
+                sos_scope,
                 CrewSos.closed_at.is_(None),
                 CrewSos.cancelled_at.is_(None),
             ).count()
@@ -448,16 +520,35 @@ def get_dashboard_data(
         crew_rows = db.query(CrewProfile).filter(CrewProfile.id.in_(trip_crew_ids)).all() if trip_crew_ids else []
         crew_by_id = {cp.id: cp for cp in crew_rows}
 
-        vessel_name_by_hpid = {}
+        trip_vessel_ids = {b.vessel_id for b in live_trips_data if b.vessel_id}
+        vessel_name_by_id = dict(
+            db.query(Vessel.id, Vessel.name).filter(Vessel.id.in_(trip_vessel_ids)).all()
+        ) if trip_vessel_ids else {}
+        trip_call_ids = {b.vessel_call_id for b in live_trips_data if b.vessel_call_id}
+        vessel_name_by_call = dict(
+            db.query(VesselCall.id, VesselCall.vessel_name).filter(
+                VesselCall.id.in_(trip_call_ids)
+            ).all()
+        ) if trip_call_ids else {}
+        # Only unstamped legacy bookings need the current-manifest fallback.
+        # Keep it only when one HPID maps to one owned vessel; ambiguity is
+        # shown as unknown rather than moving a historical trip to a new ship.
+        legacy_vessels_by_hpid = {}
         hpids = [cp.hpid for cp in crew_rows if cp.hpid]
         if hpids:
-            for vc, vessel_name in (
+            candidates = {}
+            for hpid, vessel_name in (
                 db.query(VesselCrew.hp_id, Vessel.name)
                 .join(Vessel, Vessel.id == VesselCrew.vessel_id)
                 .filter(VesselCrew.hp_id.in_(hpids), Vessel.agent_id == current_user.id)
                 .all()
             ):
-                vessel_name_by_hpid[vc] = vessel_name
+                candidates.setdefault(hpid, set()).add(vessel_name)
+            legacy_vessels_by_hpid = {
+                hpid: next(iter(names))
+                for hpid, names in candidates.items()
+                if len(names) == 1
+            }
 
         for b in live_trips_data:
             crew = crew_by_id.get(b.crew_id)
@@ -465,7 +556,12 @@ def get_dashboard_data(
                 DashboardTrip(
                     id=b.id,
                     crew_name=(crew.full_name if crew else None) or "Unknown crew",
-                    vessel_name=vessel_name_by_hpid.get(crew.hpid if crew else None) or "—",
+                    vessel_name=(
+                        vessel_name_by_call.get(b.vessel_call_id)
+                        or vessel_name_by_id.get(b.vessel_id)
+                        or legacy_vessels_by_hpid.get(crew.hpid if crew else None)
+                        or "—"
+                    ),
                     from_loc=b.pickup_address or "—",
                     to_loc=b.drop_address or "—",
                     status=b.status.value if hasattr(b.status, "value") else str(b.status),
@@ -616,7 +712,10 @@ def get_agent_bookings(
         raise HTTPException(status_code=403, detail="Only agents can access agent bookings")
 
     crew_profile_ids = _get_agent_crew_profile_ids(db, current_user.id)
-    if not crew_profile_ids:
+    agency_profile_id = db.query(AgentProfile.id).filter(
+        AgentProfile.user_id == current_user.id
+    ).scalar()
+    if agency_profile_id is None and not crew_profile_ids:
         return []
 
     status_labels = {
@@ -674,9 +773,9 @@ def get_agent_bookings(
         CabBooking.created_at,
         CabBooking.updated_at,
         CrewProfile.id.label("crew_id"),
-        CrewProfile.full_name.label("crew_name"),
-        CrewProfile.hpid.label("crew_hpid"),
-        CrewProfile.vessel.label("crew_vessel"),
+        func.coalesce(CrewAssignment.crew_name, CrewProfile.full_name).label("crew_name"),
+        func.coalesce(CrewAssignment.hpid, CrewProfile.hpid).label("crew_hpid"),
+        func.coalesce(VesselCall.vessel_name, CrewProfile.vessel).label("crew_vessel"),
         AggregatorProfile.company_name.label("provider_company_name"),
         AggregatorProfile.provider_type.label("provider_type"),
         Driver.name.label("assigned_driver_name"),
@@ -684,6 +783,10 @@ def get_agent_bookings(
         Driver.vehicle_number.label("assigned_driver_vehicle_number"),
     )
     query = query.outerjoin(CrewProfile, CabBooking.crew_id == CrewProfile.id)
+    query = query.outerjoin(
+        CrewAssignment, CabBooking.crew_assignment_id == CrewAssignment.id
+    )
+    query = query.outerjoin(VesselCall, CabBooking.vessel_call_id == VesselCall.id)
     query = query.outerjoin(
         AggregatorProfile,
         or_(
@@ -693,8 +796,15 @@ def get_agent_bookings(
     )
     query = query.outerjoin(Driver, CabBooking.assigned_driver_id == Driver.id)
 
-    # Filter to only bookings by crew mapped under this agent
-    query = query.filter(CabBooking.crew_id.in_(crew_profile_ids))
+    ownership = []
+    if agency_profile_id is not None:
+        ownership.append(CabBooking.agency_id == agency_profile_id)
+    if crew_profile_ids:
+        ownership.append(and_(
+            CabBooking.agency_id.is_(None),
+            CabBooking.crew_id.in_(crew_profile_ids),
+        ))
+    query = query.filter(or_(*ownership))
 
     if status_filter:
         query = query.filter(cast(CabBooking.status, String) == status_filter.lower())
@@ -939,13 +1049,14 @@ def shore_leave_report(
     # A trip that never started put nobody ashore and has no running time, so
     # it stays on the day it was booked rather than disappearing from the count.
     trip_start = func.coalesce(CabBooking.trip_started_at, CabBooking.started_at)
+    booking_scope = [CabBooking.vessel_id == vessel.id]
+    if crew_profile_ids:
+        booking_scope.append(and_(
+            CabBooking.vessel_id.is_(None),
+            CabBooking.crew_id.in_(crew_profile_ids),
+        ))
     day_trips = db.query(CabBooking).filter(
-        CabBooking.crew_id.in_(crew_profile_ids),
-        # A trip pinned to a different ship is not this vessel's, however the
-        # crew member is linked now. Crew who join a second vessel sit on both
-        # manifests, so without this every trip they ever took was counted here
-        # too — which is how one booking could be reported as five.
-        or_(CabBooking.vessel_id.is_(None), CabBooking.vessel_id == vessel.id),
+        or_(*booking_scope),
         or_(
             and_(trip_start.isnot(None), trip_start >= day_start, trip_start < day_end),
             and_(
@@ -954,7 +1065,15 @@ def shore_leave_report(
                 CabBooking.created_at < day_end,
             ),
         ),
-    ).all() if crew_profile_ids else []
+    ).all()
+
+    assignment_ids = {t.crew_assignment_id for t in day_trips if t.crew_assignment_id}
+    assignments = {
+        row.id: row
+        for row in db.query(CrewAssignment).filter(
+            CrewAssignment.id.in_(assignment_ids)
+        ).all()
+    } if assignment_ids else {}
 
     def _trip_crew(trip):
         """Everyone a trip put ashore, limited to this vessel's manifest.
@@ -971,6 +1090,10 @@ def shore_leave_report(
         """
         people = set()
         booker = roster.key_for_profile(trip.crew_id)
+        if booker is None and trip.crew_assignment_id:
+            assignment = assignments.get(trip.crew_assignment_id)
+            if assignment and assignment.hpid:
+                booker = roster.key_for_hpid(assignment.hpid)
         if booker:
             people.add(booker)
         extra = trip.crew_member_ids
@@ -1033,14 +1156,17 @@ def shore_leave_report(
 
     completed_trips = sum(1 for t in day_trips if t.status == BookingStatus.COMPLETED)
 
-    # Average time ashore per crew member eligible for shore leave.
+    # Average time ashore, as crew-hours over the crew who actually went.
     #
-    # Who counts. The divisor is every eligible crew member, not just those who
-    # went — so a ship where one of six eligible crew took a ten-minute ride
-    # reports 10/6, not 10. It reads as leave taken per eligible head, which
-    # stays low when few people get ashore, rather than as how long a typical
-    # trip lasts. Crew still ashore contribute no finished duration yet and are
-    # reported separately as `still_ashore`.
+    #     average = total crew-hours ashore / crew who went ashore
+    #
+    # Crew-hours count each person's own time, so a cab carrying four people for
+    # two hours contributes eight crew-hours, not two. Dividing by the crew who
+    # went — not by everyone eligible — answers "how long was a crew member
+    # ashore", and does not sag because most of the ship stayed aboard.
+    #
+    # Crew still ashore have no finished duration to add yet and are left out of
+    # both halves; they are reported separately as `still_ashore`.
     #
     # How each person's time is measured. Their departures are merged, then the
     # merged lengths summed. Merging is what stops a cab ride booked *during* a
@@ -1072,25 +1198,36 @@ def shore_leave_report(
     person_minutes = [
         _merged_minutes(intervals)
         for person, intervals in spans.items()
-        if person in eligible_keys and person not in still_ashore_crew
+        if person not in still_ashore_crew
     ]
     eligible_count = len(eligible_keys)
     average_minutes = (
-        sum(person_minutes) / eligible_count
-        if person_minutes and eligible_count else None
+        sum(person_minutes) / len(person_minutes) if person_minutes else None
     )
 
+    sos_scope = [CrewSos.vessel_id == vessel.id]
+    if crew_profile_ids:
+        sos_scope.append(and_(
+            CrewSos.vessel_id.is_(None),
+            CrewSos.crew_profile_id.in_(crew_profile_ids),
+        ))
     day_sos = db.query(CrewSos).filter(
-        CrewSos.crew_profile_id.in_(crew_profile_ids),
+        or_(*sos_scope),
         CrewSos.created_at >= day_start,
         CrewSos.created_at < day_end,
-    ).all() if crew_profile_ids else []
+    ).all()
 
+    incident_scope = [Incident.vessel_id == vessel.id]
+    if hp_ids:
+        incident_scope.append(and_(
+            Incident.vessel_id.is_(None),
+            Incident.reporter_id.in_(hp_ids),
+        ))
     day_incidents = db.query(Incident).filter(
-        Incident.reporter_id.in_(hp_ids),
+        or_(*incident_scope),
         Incident.created_at >= day_start,
         Incident.created_at < day_end,
-    ).all() if hp_ids else []
+    ).all()
 
 
     from app.services import incident_taxonomy as tax

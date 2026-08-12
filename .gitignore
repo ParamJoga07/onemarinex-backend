@@ -24,6 +24,7 @@ scripts/*
 !scripts/repair_hpid_links.py
 !scripts/consolidate_ports.py
 !scripts/preflight_release_zero.py
+!scripts/preflight_release_one.py
 apply_port_id_migration.py
 migrations/
 seeds/

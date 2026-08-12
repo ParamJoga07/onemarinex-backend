@@ -41,7 +41,9 @@ class CabBooking(Base):
     booking_id = Column(String, unique=True, index=True, nullable=False)
     port = Column(String(255), nullable=True, index=True)
 
-    crew_id = Column(Integer, ForeignKey("crew_profiles.id"), nullable=False)
+    crew_id = Column(
+        Integer, ForeignKey("crew_profiles.id", ondelete="SET NULL"), nullable=True
+    )
     crew = relationship("CrewProfile", back_populates="cab_bookings")
 
     # The ship this trip was taken from, resolved once when the booking is made.
@@ -53,6 +55,22 @@ class CabBooking(Base):
     # reliably; readers fall back to crew linkage for those.
     vessel_id = Column(Integer, ForeignKey("vessels.id", ondelete="SET NULL"),
                        nullable=True, index=True)
+    vessel_call_id = Column(
+        Integer, ForeignKey("vessel_calls.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    crew_assignment_id = Column(
+        Integer,
+        ForeignKey("crew_assignments.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    agency_id = Column(
+        Integer, ForeignKey("agent_profiles.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    port_id = Column(
+        Integer, ForeignKey("ports.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    context_resolution = Column(String(32), nullable=True)
 
     pickup_address = Column(String, nullable=False)
     pickup_lat = Column(Float, nullable=False)

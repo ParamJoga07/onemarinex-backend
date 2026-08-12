@@ -34,6 +34,7 @@ class Vessel(Base):
     # Relationships
     agent = relationship("User", backref="vessels")
     crew_manifest = relationship("VesselCrew", back_populates="vessel", cascade="all, delete-orphan")
+    calls = relationship("VesselCall", back_populates="vessel", order_by="VesselCall.id")
 
     @property
     def total_crew(self) -> int:

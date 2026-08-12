@@ -148,6 +148,7 @@ def on_startup():
     ensure_agent_support_number()
     ensure_cab_booking_vessel_id()
     ensure_agent_agency_rules()
+    ensure_historical_context_schema()
     ensure_placeholder_helplines_removed()
     ensure_port_identity_schema()
     ensure_alembic_baseline()
@@ -716,6 +717,70 @@ def ensure_agent_agency_rules():
         log.info("agent agency rules column added")
     except Exception:
         log.exception("ensure_agent_agency_rules failed")
+
+
+def ensure_historical_context_schema():
+    """Additive boot guard for Release 1 event-context columns.
+
+    ``create_all`` creates the two new tables, but it cannot alter existing
+    event tables. Alembic remains canonical and performs the backfill and FK
+    replacement; this guard only keeps the freshly deployed API compatible
+    until the operator runs the migration.
+    """
+    log = logging.getLogger("app.startup")
+    definitions = {
+        "cab_bookings": {
+            "vessel_call_id": "INTEGER",
+            "crew_assignment_id": "INTEGER",
+            "agency_id": "INTEGER",
+            "port_id": "INTEGER",
+            "context_resolution": "VARCHAR(32)",
+        },
+        "crew_sos_requests": {
+            "vessel_call_id": "INTEGER",
+            "vessel_id": "INTEGER",
+            "agency_id": "INTEGER",
+            "crew_assignment_id": "INTEGER",
+            "port_id": "INTEGER",
+            "context_resolution": "VARCHAR(32)",
+        },
+        "incidents": {
+            "vessel_call_id": "INTEGER",
+            "agency_id": "INTEGER",
+            "crew_profile_id": "INTEGER",
+            "crew_assignment_id": "INTEGER",
+            "port_id": "INTEGER",
+            "context_resolution": "VARCHAR(32)",
+        },
+    }
+    try:
+        inspector = inspect(engine)
+        tables = set(inspector.get_table_names())
+        statements = []
+        for table, columns in definitions.items():
+            if table not in tables:
+                continue
+            existing = {column["name"] for column in inspector.get_columns(table)}
+            for column, sql_type in columns.items():
+                if column in existing:
+                    continue
+                statements.append(
+                    f'ALTER TABLE "{table}" ADD COLUMN IF NOT EXISTS '
+                    f'"{column}" {sql_type}'
+                )
+                if column.endswith("_id"):
+                    statements.append(
+                        f'CREATE INDEX IF NOT EXISTS "ix_{table}_{column}" '
+                        f'ON "{table}" ("{column}")'
+                    )
+        with ddl_transaction() as connection:
+            for statement in statements:
+                connection.execute(text(statement))
+        log.info("historical context schema verified (%s statement(s))", len(statements))
+    except Exception:
+        log.exception(
+            "ensure_historical_context_schema failed — Release 1 migrations must run"
+        )
 
 
 def ensure_placeholder_helplines_removed():
