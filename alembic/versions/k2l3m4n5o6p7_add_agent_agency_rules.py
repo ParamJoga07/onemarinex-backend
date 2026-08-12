@@ -1,27 +1,28 @@
 """Give each agency its own crew rules.
 
-`port_rules` holds one row per port, so an agent editing the rules wrote into
-the record every agency berthed at that port shares — one agency's guidance
-replaced what all the others were showing their crew.
+``port_rules`` holds one row per port, so agent-authored rules belong on the
+agent profile rather than the shared port record. The port's own rules remain
+superadmin-owned and continue to apply to every agency at that port.
 
-Agent-authored rules move to `agent_profiles.agency_rules` and reach only the
-vessels that agent manages. The port's own rules stay on `port_rules`, remain
-superadmin-owned, and still apply to everyone.
+Existing port rules are not backfilled because the data does not identify which
+agent, if any, authored them. Guessing would incorrectly assign shared guidance
+to one agency, so those rows retain their current port-wide meaning.
 
-Not backfilled: rules currently on `port_rules` cannot be attributed to
-whichever agent last saved them, and guessing would hand one agency's wording
-to another. They stay as port-wide rules, which is how they already behave.
+The first version of this migration accidentally reused revision
+``b3d4e5f6g7h8``, which already belongs to notification audiences. This
+revision follows the booking-vessel repair and restores one linear migration
+head.
 
-Revision ID: b3d4e5f6g7h8
-Revises: a2c3d4e5f6g7
+Revision ID: k2l3m4n5o6p7
+Revises: j1k2l3m4n5o6
 """
 
 import sqlalchemy as sa
 from alembic import op
 from sqlalchemy import inspect
 
-revision = "b3d4e5f6g7h8"
-down_revision = "a2c3d4e5f6g7"
+revision = "k2l3m4n5o6p7"
+down_revision = "j1k2l3m4n5o6"
 branch_labels = None
 depends_on = None
 

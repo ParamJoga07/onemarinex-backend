@@ -630,7 +630,7 @@ def ensure_agent_dashboard_schema():
 def ensure_cab_booking_vessel_id():
     """Additive safety net for cab_bookings.vessel_id.
 
-    Mirrors migration a2c3d4e5f6g7. Without it a trip has no ship of its own and
+    Mirrors migration j1k2l3m4n5o6. Without it a trip has no ship of its own and
     has to be attributed by asking who is on a manifest — which drags a crew
     member's whole trip history onto whichever vessel they most recently joined.
     """
@@ -640,17 +640,32 @@ def ensure_cab_booking_vessel_id():
         if "cab_bookings" not in inspector.get_table_names():
             return
         columns = {c["name"] for c in inspector.get_columns("cab_bookings")}
-        if "vessel_id" in columns:
-            return
+        foreign_keys = inspector.get_foreign_keys("cab_bookings")
+        has_vessel_foreign_key = any(
+            foreign_key.get("constrained_columns") == ["vessel_id"]
+            and foreign_key.get("referred_table") == "vessels"
+            and foreign_key.get("referred_columns") == ["id"]
+            for foreign_key in foreign_keys
+        )
         with ddl_transaction() as connection:
-            connection.execute(text(
-                "ALTER TABLE cab_bookings ADD COLUMN IF NOT EXISTS vessel_id INTEGER"
-            ))
+            if "vessel_id" not in columns:
+                connection.execute(text(
+                    "ALTER TABLE cab_bookings ADD COLUMN IF NOT EXISTS vessel_id INTEGER"
+                ))
+            if not has_vessel_foreign_key:
+                connection.execute(text(
+                    "DO $$ BEGIN "
+                    "ALTER TABLE cab_bookings "
+                    "ADD CONSTRAINT fk_cab_bookings_vessel_id "
+                    "FOREIGN KEY (vessel_id) REFERENCES vessels (id) ON DELETE SET NULL; "
+                    "EXCEPTION WHEN duplicate_object THEN NULL; "
+                    "END $$"
+                ))
             connection.execute(text(
                 "CREATE INDEX IF NOT EXISTS ix_cab_bookings_vessel_id "
                 "ON cab_bookings (vessel_id)"
             ))
-        log.info("cab booking vessel_id column added")
+        log.info("cab booking vessel_id schema verified")
     except Exception:
         log.exception("ensure_cab_booking_vessel_id failed")
 
@@ -682,7 +697,7 @@ def ensure_agent_support_number():
 def ensure_agent_agency_rules():
     """Additive safety net for agent_profiles.agency_rules.
 
-    Mirrors migration b3d4e5f6g7h8. Without it an agent editing their crew rules
+    Mirrors migration k2l3m4n5o6p7. Without it an agent editing their crew rules
     falls back to writing the shared port_rules row, which is the behaviour this
     column exists to stop.
     """
