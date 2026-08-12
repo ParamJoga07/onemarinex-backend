@@ -758,6 +758,12 @@ def get_crew_profile(
     vessel = None
     if v_crew:
         vessel = db.query(Vessel).filter(Vessel.id == v_crew.vessel_id).first()
+    if vessel:
+        from app.services.vessel_lifecycle import synchronize_vessel_lifecycle
+
+        if synchronize_vessel_lifecycle(db, [vessel]):
+            db.commit()
+            db.refresh(vessel)
         
     profile.vessel_imo = vessel.imo_number if vessel else None
     profile.vessel_type = vessel.vessel_type if vessel else None

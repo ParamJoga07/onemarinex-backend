@@ -1,8 +1,8 @@
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Literal, Optional
 from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File
 from pydantic import BaseModel
-from sqlalchemy import or_
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 from app.db.session import get_db
 from app.db.models.vessel import Vessel
@@ -86,7 +86,7 @@ class VesselIn(BaseModel):
     total_crew: Optional[int] = 0
     eta: Optional[datetime] = None
     etd: Optional[datetime] = None
-    status: Optional[str] = "Active"
+    status: Literal["Active"] = "Active"
 
 import csv
 import io
@@ -400,14 +400,16 @@ def create_vessel(body: VesselIn, current_user: User = Depends(get_current_user)
         crew_count=c_count,
         eta=body.eta,
         etd=body.etd,
-        status=body.status or "Active"
+        status="Active"
     )
     db.add(vessel)
     try:
         db.flush()
         from app.services.historical_context import active_vessel_call
+        from app.services.vessel_lifecycle import synchronize_vessel_lifecycle
 
         active_vessel_call(db, vessel)
+        synchronize_vessel_lifecycle(db, [vessel])
         db.commit()
         db.refresh(vessel)
     except Exception as e:
@@ -443,12 +445,11 @@ def update_vessel(vessel_id: int, body: VesselIn, current_user: User = Depends(g
     
     vessel.eta = body.eta
     vessel.etd = body.etd
-    if body.status:
-        vessel.status = body.status
-
     from app.services.historical_context import refresh_active_vessel_call
+    from app.services.vessel_lifecycle import synchronize_vessel_lifecycle
 
     refresh_active_vessel_call(db, vessel)
+    synchronize_vessel_lifecycle(db, [vessel])
         
     try:
         db.commit()
@@ -468,6 +469,10 @@ def get_vessels(current_user: User = Depends(get_current_user), db: Session = De
         raise HTTPException(status_code=403, detail="Only agents can access their vessels")
     
     vessels = db.query(Vessel).filter(Vessel.agent_id == current_user.id).all()
+    from app.services.vessel_lifecycle import synchronize_vessel_lifecycle
+
+    if synchronize_vessel_lifecycle(db, vessels):
+        db.commit()
     for v in vessels:
         if not v.agency_name and v.agent and hasattr(v.agent, "agent_profile") and v.agent.agent_profile:
             v.agency_name = v.agent.agent_profile.agency_name
@@ -497,11 +502,98 @@ def get_public_vessels(
         ))
     return out
 
+
+@router.get("/history/calls")
+def get_agent_vessel_call_history(
+    limit: int = 100,
+    offset: int = 0,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Departed/archived calls remain visible after a vessel leaves the roster."""
+    if current_user.role != "agent":
+        raise HTTPException(status_code=403, detail="Only agents can access vessel history")
+    if not 1 <= limit <= 500 or offset < 0:
+        raise HTTPException(status_code=422, detail="Invalid history pagination")
+
+    from app.db.models.agent_profile import AgentProfile
+    from app.db.models.cab_booking import CabBooking
+    from app.db.models.crew_sos import CrewSos
+    from app.db.models.incident import Incident
+    from app.db.models.report_snapshot import ReportSnapshot
+    from app.db.models.vessel_call import VesselCall
+
+    agency_id = db.query(AgentProfile.id).filter(
+        AgentProfile.user_id == current_user.id
+    ).scalar()
+    if agency_id is None:
+        return []
+
+    calls = (
+        db.query(VesselCall)
+        .filter(
+            VesselCall.agency_id == agency_id,
+            or_(
+                VesselCall.ended_at.isnot(None),
+                VesselCall.status.in_(["DEPARTED", "ARCHIVED", "REASSIGNED"]),
+            ),
+        )
+        .order_by(
+            VesselCall.ended_at.is_(None),
+            VesselCall.ended_at.desc(),
+            VesselCall.id.desc(),
+        )
+        .offset(offset)
+        .limit(limit)
+        .all()
+    )
+    call_ids = [call.id for call in calls]
+
+    def _counts(model):
+        if not call_ids:
+            return {}
+        return dict(
+            db.query(model.vessel_call_id, func.count(model.id))
+            .filter(model.vessel_call_id.in_(call_ids))
+            .group_by(model.vessel_call_id)
+            .all()
+        )
+
+    trip_counts = _counts(CabBooking)
+    incident_counts = _counts(Incident)
+    sos_counts = _counts(CrewSos)
+    report_counts = _counts(ReportSnapshot)
+    output = []
+    for call in calls:
+        output.append({
+            "vessel_call_id": call.id,
+            "vessel_id": call.vessel_id,
+            "vessel_name": call.vessel_name,
+            "imo_number": call.imo_number,
+            "flag": call.flag,
+            "port_name": call.port_name,
+            "eta": call.eta,
+            "etd": call.etd,
+            "started_at": call.started_at,
+            "ended_at": call.ended_at,
+            "status": call.status,
+            "trip_count": trip_counts.get(call.id, 0),
+            "incident_count": incident_counts.get(call.id, 0),
+            "sos_count": sos_counts.get(call.id, 0),
+            "report_count": report_counts.get(call.id, 0),
+        })
+    return output
+
 @router.get("/{vessel_id}", response_model=VesselOut)
 def get_vessel_details(vessel_id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     vessel = db.query(Vessel).filter(Vessel.id == vessel_id, Vessel.agent_id == current_user.id).first()
     if not vessel:
         raise HTTPException(status_code=404, detail="Vessel not found")
+    from app.services.vessel_lifecycle import synchronize_vessel_lifecycle
+
+    if synchronize_vessel_lifecycle(db, [vessel]):
+        db.commit()
+        db.refresh(vessel)
     return vessel
 
 @router.get("/{vessel_id}/crew", response_model=List[CrewMemberOut])

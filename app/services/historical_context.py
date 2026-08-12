@@ -87,11 +87,17 @@ def active_vessel_call(
     return call
 
 
-def finish_vessel_call(db: Session, vessel: Vessel, *, status: str = "ARCHIVED") -> None:
+def finish_vessel_call(
+    db: Session,
+    vessel: Vessel,
+    *,
+    status: str = "ARCHIVED",
+    ended_at: Optional[datetime] = None,
+) -> None:
     call = active_vessel_call(db, vessel, create=False)
     if call is None:
         return
-    ended_at = _utcnow()
+    ended_at = ended_at or _utcnow()
     call.ended_at = ended_at
     call.status = status
     db.query(CrewAssignment).filter(
