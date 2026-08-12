@@ -1,23 +1,24 @@
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from types import SimpleNamespace
 import uuid
 
 import pytest
 from alembic.config import Config
 from alembic.script import ScriptDirectory
 from fastapi import HTTPException
+from pydantic import ValidationError
 from sqlalchemy.orm import Session
 
 import app.db.base  # noqa: F401
 from app.api.v1.routes_superadmin import (
     HistoricalContextResolutionIn,
+    SuperAdminVesselCreate,
     list_all_vessels_superadmin,
     list_unresolved_historical_context,
     reconcile_historical_context,
 )
 from app.db.models.crew_assignment import CrewAssignment
-from app.api.v1.routes_vessels import get_agent_vessel_call_history
+from app.api.v1.routes_vessels import VesselIn, get_agent_vessel_call_history
 from app.db.models.agent_profile import AgentProfile
 from app.db.models.event_context_reconciliation import EventContextReconciliation
 from app.db.models.incident import Incident, IncidentStatus, IncidentType
@@ -124,9 +125,11 @@ def test_agent_history_does_not_expose_another_agencys_call(db):
 
 def test_agent_history_is_bounded_and_paginated(db):
     agent, _agency, vessel, first_call = _agent_and_vessel(db)
-    finish_vessel_call(db, vessel, status="DEPARTED")
+    first_end = datetime(2026, 8, 12, 10, tzinfo=timezone.utc)
+    second_end = first_end + timedelta(hours=1)
+    finish_vessel_call(db, vessel, status="DEPARTED", ended_at=first_end)
     second_call = active_vessel_call(db, vessel)
-    finish_vessel_call(db, vessel, status="DEPARTED")
+    finish_vessel_call(db, vessel, status="DEPARTED", ended_at=second_end)
     db.flush()
 
     first_page = get_agent_vessel_call_history(
@@ -267,6 +270,35 @@ def test_reconciliation_rejects_conflicting_crew_assignment(db):
     assert conflict.value.status_code == 409
     assert incident.vessel_call_id is None
     assert incident.crew_assignment_id == assignment.id
+
+
+def test_reconciliation_notes_are_trimmed_before_length_validation():
+    body = HistoricalContextResolutionIn(
+        vessel_call_id=1,
+        evidence_type="manual_document",
+        notes="   Confirmed by signed port-call document.   ",
+    )
+    assert body.notes == "Confirmed by signed port-call document."
+    with pytest.raises(ValidationError):
+        HistoricalContextResolutionIn(
+            vessel_call_id=1,
+            evidence_type="manual_document",
+            notes="          short          ",
+        )
+
+
+def test_vessel_creation_rejects_client_supplied_lifecycle_status():
+    vessel = {
+        "name": "MV Status Test",
+        "imo_number": "IMO-STATUS-TEST",
+        "vessel_type": "Bulk Carrier",
+    }
+    assert VesselIn(**vessel).status == "Active"
+    assert SuperAdminVesselCreate(**vessel).status == "Active"
+    with pytest.raises(ValidationError):
+        VesselIn(**vessel, status="Departed")
+    with pytest.raises(ValidationError):
+        SuperAdminVesselCreate(**vessel, status="Departing")
 
 
 def test_agent_cannot_reconcile_historical_context(db):

@@ -5,9 +5,9 @@ import shutil
 import uuid
 from sqlalchemy.orm import Session
 from sqlalchemy import String, cast, func, literal, or_, select, union_all
-from typing import List, Optional, Dict, Any
+from typing import Any, Dict, List, Literal, Optional
 from datetime import datetime
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 import logging
 import re
 
@@ -190,7 +190,15 @@ class HistoricalContextResolutionIn(BaseModel):
     vessel_call_id: int
     evidence_type: str
     evidence_reference: Optional[str] = None
-    notes: str = Field(min_length=10, max_length=2000)
+    notes: str
+
+    @field_validator("notes")
+    @classmethod
+    def normalize_notes(cls, value: str) -> str:
+        normalized = value.strip()
+        if not 10 <= len(normalized) <= 2000:
+            raise ValueError("notes must be between 10 and 2000 non-whitespace characters")
+        return normalized
     
 # --- Helpers ---
 
@@ -1306,7 +1314,7 @@ class SuperAdminVesselCreate(BaseModel):
     total_crew: Optional[int] = 0
     eta: Optional[datetime] = None
     etd: Optional[datetime] = None
-    status: Optional[str] = "Active"
+    status: Literal["Active"] = "Active"
 
 from app.api.v1.routes_vessels import VesselOut, is_partnered_agency
 

@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Literal, Optional
 from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File
 from pydantic import BaseModel
 from sqlalchemy import func, or_
@@ -86,7 +86,7 @@ class VesselIn(BaseModel):
     total_crew: Optional[int] = 0
     eta: Optional[datetime] = None
     etd: Optional[datetime] = None
-    status: Optional[str] = "Active"
+    status: Literal["Active"] = "Active"
 
 import csv
 import io
