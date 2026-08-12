@@ -20,6 +20,7 @@ from app.db.session import get_db
 from app.db.models.vessel import Vessel
 from app.db.models.vessel_crew import VesselCrew
 from app.db.models.crew_profile import CrewProfile
+from app.db.models.agent_profile import AgentProfile
 from app.db.models.port import Port
 from app.db.models.vendors import Vendors
 from app.services.booking_service import (
@@ -49,6 +50,36 @@ from app.services.timeline_service import get_booking_timeline
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
+
+def _agent_may_view_booking(db: Session, agent_user_id: int, booking: CabBooking) -> bool:
+    """Authorize by the booking's event-time agency, with a legacy fallback."""
+    agency_id = db.query(AgentProfile.id).filter(
+        AgentProfile.user_id == agent_user_id
+    ).scalar()
+    if booking.agency_id is not None:
+        return agency_id is not None and booking.agency_id == agency_id
+
+    vessel_ids = [
+        row[0] for row in db.query(Vessel.id).filter(Vessel.agent_id == agent_user_id).all()
+    ]
+    if booking.vessel_id is not None:
+        return booking.vessel_id in vessel_ids
+    if not vessel_ids or booking.crew_id is None:
+        return False
+    hpids = [
+        row[0]
+        for row in db.query(VesselCrew.hp_id)
+        .filter(VesselCrew.vessel_id.in_(vessel_ids), VesselCrew.hp_id.isnot(None))
+        .all()
+        if row[0]
+    ]
+    if not hpids:
+        return False
+    return db.query(CrewProfile.id).filter(
+        CrewProfile.id == booking.crew_id,
+        CrewProfile.hpid.in_(hpids),
+    ).first() is not None
 
 
 # Stop labels that are structural, not real venue names — a "drop" stop is
@@ -556,18 +587,7 @@ def get_booking(
         if not provider or provider_id != provider.id:
             raise HTTPException(status_code=403, detail="Unauthorized")
     elif current_user.role == "agent":
-        # Agent can view booking if crew is mapped under their vessels
-        agent_vessel_ids = [v.id for v in db.query(Vessel).filter(Vessel.agent_id == current_user.id).all()]
-        agent_crew_hpids = [
-            c.hp_id for c in db.query(VesselCrew).filter(
-                VesselCrew.vessel_id.in_(agent_vessel_ids),
-                VesselCrew.hp_id.isnot(None),
-            ).all() if c.hp_id
-        ] if agent_vessel_ids else []
-        agent_crew_ids = [
-            cp.id for cp in db.query(CrewProfile).filter(CrewProfile.hpid.in_(agent_crew_hpids)).all()
-        ] if agent_crew_hpids else []
-        if booking.crew_id not in agent_crew_ids:
+        if not _agent_may_view_booking(db, current_user.id, booking):
             raise HTTPException(status_code=403, detail="Unauthorized")
     elif current_user.role != "superadmin":
         raise HTTPException(status_code=403, detail="Unauthorized")
@@ -593,17 +613,7 @@ def get_timeline(
         if not provider or provider_id != provider.id:
             raise HTTPException(status_code=403, detail="Unauthorized")
     elif current_user.role == "agent":
-        agent_vessel_ids = [v.id for v in db.query(Vessel).filter(Vessel.agent_id == current_user.id).all()]
-        agent_crew_hpids = [
-            c.hp_id for c in db.query(VesselCrew).filter(
-                VesselCrew.vessel_id.in_(agent_vessel_ids),
-                VesselCrew.hp_id.isnot(None),
-            ).all() if c.hp_id
-        ] if agent_vessel_ids else []
-        agent_crew_ids = [
-            cp.id for cp in db.query(CrewProfile).filter(CrewProfile.hpid.in_(agent_crew_hpids)).all()
-        ] if agent_crew_hpids else []
-        if booking.crew_id not in agent_crew_ids:
+        if not _agent_may_view_booking(db, current_user.id, booking):
             raise HTTPException(status_code=403, detail="Unauthorized")
     elif current_user.role == "driver":
         raise HTTPException(status_code=403, detail="Drivers should use driver endpoints")

@@ -17,7 +17,7 @@ def _script_directory() -> ScriptDirectory:
 
 
 def test_alembic_has_exactly_one_head():
-    assert _script_directory().get_heads() == ["k2l3m4n5o6p7"]
+    assert _script_directory().get_heads() == ["m4n5o6p7q8r9"]
 
 
 def test_release_zero_revisions_follow_the_deployed_head():

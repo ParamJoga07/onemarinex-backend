@@ -669,6 +669,12 @@ def sync_crew_manifest_helper(profile: CrewProfile, db: Session):
                         status="pending"
                     )
                     db.add(new_pass)
+
+            from app.services.historical_context import assignment_for_manifest
+
+            assignment = assignment_for_manifest(db, vessel, v_crew, profile=profile)
+            if assignment and assignment.crew_profile_id is None:
+                assignment.crew_profile_id = profile.id
                 
         try:
             db.commit()
@@ -979,6 +985,14 @@ def trigger_sos(
         )
 
     port_name = active_booking.port or profile.current_port
+    from app.services.historical_context import event_context
+
+    historical = event_context(db, booking=active_booking, profile=profile)
+    vessel_snapshot = (
+        historical["vessel_call"].vessel_name
+        if historical["vessel_call"]
+        else profile.vessel
+    )
 
     # 1. Ship Email
     recipients = [profile.sos_email]
@@ -994,7 +1008,7 @@ def trigger_sos(
         ship_email=profile.sos_email,
         crew_name=profile.full_name or current_user.email,
         crew_email=current_user.email,
-        vessel=profile.vessel,
+        vessel=vessel_snapshot,
         port_name=port_name,
         lat=body.lat,
         lng=body.lng,
@@ -1005,11 +1019,19 @@ def trigger_sos(
         user_id=current_user.id,
         crew_profile_id=profile.id,
         cab_booking_id=active_booking.id,
+        vessel_call_id=(
+            historical["vessel_call"].id if historical["vessel_call"] else None
+        ),
+        vessel_id=historical["vessel_id"],
+        agency_id=historical["agency_id"],
+        crew_assignment_id=historical["crew_assignment_id"],
+        port_id=historical["port_id"],
+        context_resolution=historical["context_resolution"],
         trip_id=active_booking.booking_id,
         crew_email=current_user.email.strip(),
         sos_email=profile.sos_email.strip(),
         port_name=port_name,
-        vessel=profile.vessel,
+        vessel=vessel_snapshot,
         lat=body.lat,
         lng=body.lng,
         status="ACTIVE",
@@ -1036,7 +1058,7 @@ def trigger_sos(
             "If you are nearby please get in touch."
         ),
         port_name=port_name or None,
-        vessel=profile.vessel or None,
+        vessel=vessel_snapshot or None,
         created_by=current_user.id,
         sos_id=new_sos.id,
     )
@@ -1073,17 +1095,19 @@ def trigger_sos(
         # 1. Crew member themselves — always fires
         notify_sos_crew_in_danger(current_user.mobile_number)
 
-        # 2. Port-assigned agent + all superadmins with a phone on file (additive)
+        # 2. Historical call owner + all superadmins with a phone on file.
         trip_id_for_admin = active_booking.booking_id
         agent_profile = (
             db.query(AgentProfile)
-            .filter(AgentProfile.assigned_port == port_name)
+            .filter(AgentProfile.id == new_sos.agency_id)
             .first()
+            if new_sos.agency_id
+            else None
         )
         if agent_profile and agent_profile.user:
             notify_sos_crew_and_admin(
                 agent_profile.user.mobile_number, trip_id_for_admin,
-                profile.full_name, profile.vessel or "N/A", location_str,
+                profile.full_name, vessel_snapshot or "N/A", location_str,
             )
         superadmins = db.query(User).filter(
             User.role == "superadmin",
@@ -1093,26 +1117,42 @@ def trigger_sos(
         for admin in superadmins:
             notify_sos_crew_and_admin(
                 admin.mobile_number, trip_id_for_admin,
-                profile.full_name, profile.vessel or "N/A", location_str,
+                profile.full_name, vessel_snapshot or "N/A", location_str,
             )
 
-        # 2b. Fellow crew members at the same port (excluding the crew member who
-        # triggered the SOS) — broadcasts the alert so nearby crew can help.
+        # 2b. Fellow crew on this exact vessel call. Port-wide matching leaked
+        # emergencies to unrelated agencies berthed at the same harbour.
+        from app.db.models.crew_assignment import CrewAssignment
+
+        fellow_profile_ids = []
+        if new_sos.vessel_call_id:
+            fellow_profile_ids = [
+                row[0]
+                for row in db.query(CrewAssignment.crew_profile_id)
+                .filter(
+                    CrewAssignment.vessel_call_id == new_sos.vessel_call_id,
+                    CrewAssignment.ended_at.is_(None),
+                    CrewAssignment.crew_profile_id.isnot(None),
+                    CrewAssignment.crew_profile_id != profile.id,
+                )
+                .all()
+            ]
         fellow_crew = (
             db.query(CrewProfile)
             .join(User, User.id == CrewProfile.user_id)
             .filter(
-                CrewProfile.current_port == port_name,
-                CrewProfile.user_id != current_user.id,
+                CrewProfile.id.in_(fellow_profile_ids),
                 User.mobile_number.isnot(None),
                 User.mobile_number != "",
             )
             .all()
+            if fellow_profile_ids
+            else []
         )
         for fellow in fellow_crew:
             notify_sos_crew_and_admin(
                 fellow.user.mobile_number, trip_id_for_admin,
-                profile.full_name, profile.vessel or "N/A", location_str,
+                profile.full_name, vessel_snapshot or "N/A", location_str,
             )
 
         # 3. Aggregator on the verified active booking, if any.
@@ -1131,7 +1171,7 @@ def trigger_sos(
         "status": "success",
         "message": "SOS Alert sent to all recipients",
         "recipients_count": len(set(recipients)),
-        "incident_id": incident_id,
+        "incident_id": None,
         "trip_id": active_booking.booking_id,
     }
 
@@ -1150,6 +1190,9 @@ def submit_feedback(
     from app.db.models.incident import Incident
     incident_id = f"INC-{uuid.uuid4().hex[:6].upper()}"
     crew = db.query(CrewProfile).filter(CrewProfile.user_id == current_user.id).first()
+    from app.services.historical_context import event_context
+
+    historical = event_context(db, profile=crew)
     feedback_incident = Incident(
         incident_id=incident_id,
         type=IncidentType.CREW,
@@ -1160,6 +1203,15 @@ def submit_feedback(
         reporter_role=crew.rank if crew else "Crew",
         reporter_id=crew.hpid or crew.passport_number if crew else None,
         port_name=crew.current_port if crew else None,
+        vessel_id=historical["vessel_id"],
+        vessel_call_id=(
+            historical["vessel_call"].id if historical["vessel_call"] else None
+        ),
+        agency_id=historical["agency_id"],
+        crew_profile_id=crew.id if crew else None,
+        crew_assignment_id=historical["crew_assignment_id"],
+        port_id=historical["port_id"],
+        context_resolution=historical["context_resolution"],
     )
     db.add(feedback_incident)
     
@@ -2145,6 +2197,10 @@ def book_cab(
 
     booking_vessel = agent_contact.vessel_for_crew(db, profile)
     booking_agent_number = agent_contact.support_number_for_crew(db, profile)
+    from app.services.historical_context import event_context, port_for_reference
+
+    historical = event_context(db, profile=profile, vessel=booking_vessel)
+    booking_port = port_for_reference(db, port_value)
 
     new_booking = CabBooking(
         booking_id=booking_id,
@@ -2173,6 +2229,13 @@ def book_cab(
         # The ship this trip is taken from, pinned now rather than inferred
         # later — see app/services/agent_contact.py.
         vessel_id=booking_vessel.id if booking_vessel else None,
+        vessel_call_id=(
+            historical["vessel_call"].id if historical["vessel_call"] else None
+        ),
+        crew_assignment_id=historical["crew_assignment_id"],
+        agency_id=historical["agency_id"],
+        port_id=historical["port_id"] or (booking_port.id if booking_port else None),
+        context_resolution=historical["context_resolution"],
         # The agency's own number, not the port's. These two were previously
         # both filled from port_rules.helpline_number, so the "agent number" was
         # really the shared port helpline: an agent editing their contact number

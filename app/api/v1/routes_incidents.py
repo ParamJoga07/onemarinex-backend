@@ -10,27 +10,6 @@ from pydantic import BaseModel
 
 router = APIRouter()
 
-def get_agent_incident_filters(agent_user_id: int, db: Session):
-    from app.db.models.vessel import Vessel
-    from app.db.models.vessel_crew import VesselCrew
-    from app.db.models.crew_profile import CrewProfile
-    from app.db.models.cab_booking import CabBooking
-
-    vessel_ids = [r[0] for r in db.query(Vessel.id).filter(Vessel.agent_id == agent_user_id).all()]
-    if not vessel_ids:
-        return None, None
-    
-    crew_hpids = [r[0] for r in db.query(VesselCrew.hp_id).filter(VesselCrew.vessel_id.in_(vessel_ids)).all() if r[0]]
-    if not crew_hpids:
-        return [], []
-    
-    crew_ids = [r[0] for r in db.query(CrewProfile.id).filter(CrewProfile.hpid.in_(crew_hpids)).all()]
-    trip_ids = []
-    if crew_ids:
-        trip_ids = [r[0] for r in db.query(CabBooking.booking_id).filter(CabBooking.crew_id.in_(crew_ids)).all() if r[0]]
-    
-    return crew_hpids, trip_ids
-
 class IncidentNoteBase(BaseModel):
     note: str
     author_name: Optional[str] = None
@@ -101,19 +80,31 @@ def _agent_incident_filter(db: Session, agent_user_id: int):
     HPIDs are now immutable once issued. The HPID clause is kept only for older rows written before `vessel_id`
     existed, which would otherwise vanish.
     """
+    from app.db.models.agent_profile import AgentProfile
     from sqlalchemy import and_, or_
 
     vessel_ids = _agent_vessel_ids(db, agent_user_id)
     hpids, _ = _agent_hpids_and_vessels(db, agent_user_id)
-    if not vessel_ids and not hpids:
+    agency_id = db.query(AgentProfile.id).filter(
+        AgentProfile.user_id == agent_user_id
+    ).scalar()
+    if agency_id is None and not vessel_ids and not hpids:
         return None
 
     clauses = []
+    if agency_id is not None:
+        clauses.append(Incident.agency_id == agency_id)
     if vessel_ids:
-        clauses.append(Incident.vessel_id.in_(vessel_ids))
+        clauses.append(and_(
+            Incident.agency_id.is_(None),
+            Incident.vessel_id.in_(vessel_ids),
+        ))
     if hpids:
-        clauses.append(and_(Incident.vessel_id.is_(None),
-                            Incident.reporter_id.in_(hpids)))
+        clauses.append(and_(
+            Incident.agency_id.is_(None),
+            Incident.vessel_id.is_(None),
+            Incident.reporter_id.in_(hpids),
+        ))
     return or_(*clauses)
 
 
@@ -190,16 +181,26 @@ def _record_timeline(db: Session, incident: Incident, event_type: str, label: st
 
 def _serialize_incident(db: Session, incident: Incident) -> dict:
     from app.services import incident_taxonomy as tax
+    from app.db.models.agent_profile import AgentProfile
     from app.db.models.vessel import Vessel
+    from app.db.models.vessel_call import VesselCall
 
     vessel_name = None
     responsible_agent_id = None
-    if incident.vessel_id:
+    if incident.vessel_call_id:
+        call = db.query(VesselCall).filter(VesselCall.id == incident.vessel_call_id).first()
+        if call:
+            vessel_name = call.vessel_name
+    if incident.agency_id:
+        responsible_agent_id = db.query(AgentProfile.user_id).filter(
+            AgentProfile.id == incident.agency_id
+        ).scalar()
+    if incident.vessel_id and vessel_name is None:
         v = db.query(Vessel.name, Vessel.agent_id).filter(
             Vessel.id == incident.vessel_id
         ).first()
         vessel_name = v[0] if v else None
-        responsible_agent_id = v[1] if v else None
+        responsible_agent_id = responsible_agent_id or (v[1] if v else None)
 
     routing_status = "assigned" if responsible_agent_id else "superadmin_follow_up"
     routing_message = None if responsible_agent_id else (
@@ -302,21 +303,15 @@ async def get_incident_monitoring(
         base_query = base_query.filter(Incident.aggregator_id == aggregator.id)
     
     elif current_user.role == "agent":
-        crew_hpids, trip_ids = get_agent_incident_filters(current_user.id, db)
-        if crew_hpids is None:
+        ownership = _agent_incident_filter(db, current_user.id)
+        if ownership is None:
             return {
                 "active_crew": 0,
                 "active_aggregator": 0,
                 "active_incidents": [],
                 "resolved_incidents": []
             }
-        from sqlalchemy import or_
-        base_query = base_query.filter(
-            or_(
-                Incident.reporter_id.in_(crew_hpids),
-                Incident.trip_id.in_(trip_ids)
-            )
-        )
+        base_query = base_query.filter(ownership)
     
     else:
         raise HTTPException(status_code=403, detail="Not authorized")
@@ -350,16 +345,10 @@ async def get_incidents(
         return db.query(Incident).all()
     
     elif current_user.role == "agent":
-        crew_hpids, trip_ids = get_agent_incident_filters(current_user.id, db)
-        if crew_hpids is None:
+        ownership = _agent_incident_filter(db, current_user.id)
+        if ownership is None:
             return []
-        from sqlalchemy import or_
-        return db.query(Incident).filter(
-            or_(
-                Incident.reporter_id.in_(crew_hpids),
-                Incident.trip_id.in_(trip_ids)
-            )
-        ).all()
+        return db.query(Incident).filter(ownership).all()
     
     else:
         raise HTTPException(status_code=403, detail="Not authorized to list incidents")
@@ -426,6 +415,7 @@ async def create_incident(
 
         reporter_hpid = crew.hpid if crew else None
         trip_id = None
+        selected_booking = None
         if requested_trip_id:
             from app.db.models.cab_booking import CabBooking
             selected_booking = (
@@ -440,6 +430,9 @@ async def create_incident(
                 # Do not reveal whether another crew member owns the supplied id.
                 raise HTTPException(status_code=404, detail="Trip not found")
             trip_id = selected_booking.booking_id
+        from app.services.historical_context import event_context
+
+        historical = event_context(db, booking=selected_booking, profile=crew)
         incident = Incident(
             **incident_data,
             incident_id=incident_id,
@@ -447,9 +440,15 @@ async def create_incident(
             reporter_role=crew.rank if crew else "Crew",
             reporter_id=reporter_hpid,
             port_name=crew.current_port if crew else None,
-            # Resolved now rather than at read time, so the incident stays
-            # findable even if the crew member later leaves the manifest.
-            vessel_id=_resolve_vessel_for_crew(db, crew),
+            vessel_id=historical["vessel_id"],
+            vessel_call_id=(
+                historical["vessel_call"].id if historical["vessel_call"] else None
+            ),
+            agency_id=historical["agency_id"],
+            crew_profile_id=crew.id if crew else None,
+            crew_assignment_id=historical["crew_assignment_id"],
+            port_id=historical["port_id"],
+            context_resolution=historical["context_resolution"],
             trip_id=trip_id,
             type=IncidentType.CREW
         )
@@ -483,16 +482,10 @@ async def get_incident(
     elif current_user.role == "superadmin":
         incident = query.first()
     elif current_user.role == "agent":
-        crew_hpids, trip_ids = get_agent_incident_filters(current_user.id, db)
-        if crew_hpids is None:
+        ownership = _agent_incident_filter(db, current_user.id)
+        if ownership is None:
              raise HTTPException(status_code=403, detail="Not authorized")
-        from sqlalchemy import or_
-        incident = query.filter(
-            or_(
-                Incident.reporter_id.in_(crew_hpids),
-                Incident.trip_id.in_(trip_ids)
-            )
-        ).first()
+        incident = query.filter(ownership).first()
     else:
         raise HTTPException(status_code=403, detail="Not authorized")
 
@@ -597,29 +590,40 @@ def agent_safety_summary(
 
     active_sos = 0
     avg_response_seconds = None
-    if hpids:
-        crew_ids = [
-            cp.id for cp in db.query(CrewProfile.id).filter(CrewProfile.hpid.in_(hpids)).all()
-        ]
-        if crew_ids:
-            active_sos = db.query(CrewSos).filter(
-                CrewSos.crew_profile_id.in_(crew_ids),
-                CrewSos.closed_at.is_(None),
-                CrewSos.cancelled_at.is_(None),
-            ).count()
+    from app.db.models.agent_profile import AgentProfile
+    from sqlalchemy import and_, or_
+    agency_id = db.query(AgentProfile.id).filter(
+        AgentProfile.user_id == current_user.id
+    ).scalar()
+    crew_ids = [
+        cp.id for cp in db.query(CrewProfile.id).filter(CrewProfile.hpid.in_(hpids)).all()
+    ] if hpids else []
+    sos_ownership = []
+    if agency_id is not None:
+        sos_ownership.append(CrewSos.agency_id == agency_id)
+    if crew_ids:
+        sos_ownership.append(and_(
+            CrewSos.agency_id.is_(None),
+            CrewSos.crew_profile_id.in_(crew_ids),
+        ))
+    if sos_ownership:
+        owned_sos = db.query(CrewSos).filter(or_(*sos_ownership))
+        active_sos = owned_sos.filter(
+            CrewSos.closed_at.is_(None),
+            CrewSos.cancelled_at.is_(None),
+        ).count()
 
-            # Agreed definition: SOS raised -> agent acknowledged.
-            acked = db.query(CrewSos.created_at, CrewSos.acknowledged_at).filter(
-                CrewSos.crew_profile_id.in_(crew_ids),
-                CrewSos.acknowledged_at.isnot(None),
-            ).all()
-            deltas = [
-                (a - c).total_seconds()
-                for c, a in acked
-                if c and a and a >= c
-            ]
-            if deltas:
-                avg_response_seconds = int(sum(deltas) / len(deltas))
+        # Agreed definition: SOS raised -> agent acknowledged.
+        acked = owned_sos.filter(CrewSos.acknowledged_at.isnot(None)).with_entities(
+            CrewSos.created_at, CrewSos.acknowledged_at
+        ).all()
+        deltas = [
+            (a - c).total_seconds()
+            for c, a in acked
+            if c and a and a >= c
+        ]
+        if deltas:
+            avg_response_seconds = int(sum(deltas) / len(deltas))
 
     open_incidents = investigating = resolved_today = 0
     ownership = _agent_incident_filter(db, current_user.id)
@@ -699,68 +703,84 @@ def _sort_instant(value) -> float:
 def _agent_sos_records(db: Session, agent_user_id: int, vessel_id: Optional[int],
                        status_filter: Optional[str]) -> List[dict]:
     """This agent's SOS alerts, shaped like the incident rows beside them."""
+    from app.db.models.agent_profile import AgentProfile
+    from app.db.models.crew_profile import CrewProfile
     from app.db.models.crew_sos import CrewSos
     from app.db.models.vessel import Vessel
     from app.services import crew_linkage
     from app.services.crew_linkage import vessel_crew_profile_ids
 
+    agency_id = db.query(AgentProfile.id).filter(
+        AgentProfile.user_id == agent_user_id
+    ).scalar()
+    strong_query = db.query(CrewSos).filter(CrewSos.agency_id == agency_id)
+    if vessel_id is not None:
+        strong_query = strong_query.filter(CrewSos.vessel_id == vessel_id)
+    strong_rows = strong_query.all() if agency_id is not None else []
+
     vessels = db.query(Vessel).filter(Vessel.agent_id == agent_user_id)
     if vessel_id is not None:
         vessels = vessels.filter(Vessel.id == vessel_id)
 
-    from app.db.models.crew_profile import CrewProfile
-
     records: List[dict] = []
+    seen = set()
+
+    def append_record(sos, resolved_vessel_id, resolved_vessel_name):
+        if sos.id in seen:
+            return
+        status = str(sos.status or "ACTIVE").upper()
+        if status_filter and status != status_filter.upper():
+            return
+        profile_name = db.query(CrewProfile.full_name).filter(
+            CrewProfile.id == sos.crew_profile_id
+        ).scalar() if sos.crew_profile_id else None
+        seen.add(sos.id)
+        records.append({
+            "kind": "sos",
+            "id": sos.id,
+            "incident_id": f"SOS-{sos.id}",
+            "type": "sos",
+            "title": "SOS Alert",
+            "description": None,
+            "status": status,
+            "category": None,
+            "sub_category": None,
+            "severity": "critical",
+            "category_label": "SOS Alert",
+            "sub_category_label": None,
+            "reporter_name": profile_name or sos.crew_email,
+            "reporter_role": None,
+            "reporter_id": None,
+            "trip_id": sos.trip_id,
+            "port_name": sos.port_name,
+            "vessel_id": resolved_vessel_id,
+            "vessel_name": resolved_vessel_name,
+            "resolved_at": sos.closed_at,
+            "cancelled_at": sos.cancelled_at,
+            "created_at": sos.created_at,
+            "updated_at": sos.created_at,
+            "routing_status": "assigned",
+            "routing_message": None,
+        })
+
+    for sos in strong_rows:
+        append_record(sos, sos.vessel_id, sos.vessel)
+
+    # Compatibility path for pre-Release-1 rows that could not be backfilled.
+    # Strong rows never enter this branch, so current crew identity cannot move
+    # a stamped event between agencies.
     for vessel in vessels.all():
         crew_ids = vessel_crew_profile_ids(db, vessel)
-        # The crew column reads off the person, not the SOS row: crew_email is
-        # frequently unset on older alerts and left the column blank.
-        names = {
-            row.id: row.full_name
-            for row in db.query(CrewProfile.id, CrewProfile.full_name)
-            .filter(CrewProfile.id.in_(crew_ids)).all()
-        } if crew_ids else {}
         if not crew_ids:
             continue
-        sos_rows = db.query(CrewSos).filter(CrewSos.crew_profile_id.in_(crew_ids)).all()
-        # A crew member who has sailed on two ships is on both manifests, so
-        # both match them above. The SOS stamps the vessel it was raised on;
-        # honouring that stamp is what stops their old ship's emergencies from
-        # following them onto the new one.
+        sos_rows = db.query(CrewSos).filter(
+            CrewSos.agency_id.is_(None),
+            CrewSos.crew_profile_id.in_(crew_ids),
+        ).all()
         for sos in crew_linkage.filter_records_for_vessel(
             vessel, sos_rows, lambda row: row.vessel,
         ):
-            status = str(sos.status or "ACTIVE").upper()
-            if status_filter and status != status_filter.upper():
-                continue
-            records.append({
-                "kind": "sos",
-                "id": sos.id,
-                "incident_id": f"SOS-{sos.id}",
-                "type": "sos",
-                "title": "SOS Alert",
-                "description": None,
-                "status": status,
-                "category": None,
-                "sub_category": None,
-                # An SOS has no severity grading — it is the top of the scale.
-                "severity": "critical",
-                "category_label": "SOS Alert",
-                "sub_category_label": None,
-                "reporter_name": names.get(sos.crew_profile_id) or sos.crew_email,
-                "reporter_role": None,
-                "reporter_id": None,
-                "trip_id": sos.trip_id,
-                "port_name": sos.port_name,
-                "vessel_id": vessel.id,
-                "vessel_name": vessel.name,
-                "resolved_at": sos.closed_at,
-                "cancelled_at": sos.cancelled_at,
-                "created_at": sos.created_at,
-                "updated_at": sos.created_at,
-                "routing_status": "assigned",
-                "routing_message": None,
-            })
+            append_record(sos, vessel.id, vessel.name)
     return records
 
 
@@ -789,11 +809,20 @@ def agent_safety_report_records(
     # feed — and the only trace of the emergency was the Incident the SOS used
     # to mirror, which is why the vessel page labelled it "Incident".
     crew_ids = vessel_crew_profile_ids(db, vessel)
-    sos_rows = db.query(CrewSos).filter(CrewSos.crew_profile_id.in_(crew_ids)).all() if crew_ids else []
+    sos_rows = db.query(CrewSos).filter(CrewSos.vessel_id == vessel.id).all()
+    legacy_sos = db.query(CrewSos).filter(
+        CrewSos.agency_id.is_(None),
+        CrewSos.vessel_id.is_(None),
+        CrewSos.crew_profile_id.in_(crew_ids),
+    ).all() if crew_ids else []
     # Honour the vessel each SOS was raised on, so a crew member joining a new
     # ship does not drag their previous ship's emergencies onto this report.
     from app.services import crew_linkage as _linkage
-    sos_rows = _linkage.filter_records_for_vessel(vessel, sos_rows, lambda row: row.vessel)
+    sos_rows.extend(
+        _linkage.filter_records_for_vessel(
+            vessel, legacy_sos, lambda row: row.vessel
+        )
+    )
 
     records = [{
         "kind": "incident", "id": item.id, "reference": item.incident_id,
@@ -874,6 +903,8 @@ def agent_incident_detail(
     from app.db.models.incident import IncidentTimelineEvent
     from app.db.models.user import User
     from app.db.models.vessel import Vessel
+    from app.db.models.vessel_call import VesselCall
+    from app.services.historical_context import vessel_call_context
     from app.services.operations_context import booking_context, find_booking, vessel_context
 
     incident = _agent_incident_or_404(db, current_user.id, incident_id)
@@ -921,12 +952,21 @@ def agent_incident_detail(
     detail["resolution_seconds"] = resolution_seconds
 
     vessel = db.query(Vessel).filter(Vessel.id == incident.vessel_id).first() if incident.vessel_id else None
+    vessel_call = (
+        db.query(VesselCall).filter(VesselCall.id == incident.vessel_call_id).first()
+        if incident.vessel_call_id
+        else None
+    )
     booking = find_booking(db, incident.trip_id)
 
     return {
         "incident": detail,
         "reporter": reporter,
-        "vessel": vessel_context(vessel, port_name=incident.port_name),
+        "vessel": (
+            vessel_call_context(vessel_call, fallback_port=incident.port_name)
+            if vessel_call
+            else vessel_context(vessel, port_name=incident.port_name)
+        ),
         # As of when the incident was filed, not now: a trip that has since
         # finished must not report a skipped stop as the crew's next destination.
         "trip": booking_context(db, booking, as_of=incident.created_at),

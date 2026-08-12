@@ -63,6 +63,49 @@ This release repairs the migration foundation only. Historical vessel-call and
 crew-assignment tables, event backfills, archival lifecycle changes, and report
 snapshots belong in subsequent releases.
 
+## Release 1: immutable vessel and crew history
+
+Release 1 starts only from the verified Release 0 head and adds a linear chain:
+
+```text
+k2l3m4n5o6p7
+  -> l3m4n5o6p7q8  vessel calls, crew assignments, event ownership, safe deletes
+  -> m4n5o6p7q8r9  booking-to-crew-assignment link
+```
+
+The migrations are additive. They preserve SOS, Incident, and booking rows when
+a crew profile or vessel is removed, and backfill context only from evidence
+stored on the event: linked booking first, then a unique stored vessel. They do
+not assign unresolved or ambiguous events through the crew member's current
+manifest.
+
+After deploying the Release 1 backend code, run in the backend console:
+
+```bash
+python -m alembic current
+python -m alembic heads
+PYTHONPATH=. python scripts/preflight_release_one.py
+python -m app.db.migrate
+echo "migration_exit=$?"
+python -m alembic current
+python -m alembic heads
+PYTHONPATH=. python scripts/preflight_release_one.py
+```
+
+Before migration, `current` must be `k2l3m4n5o6p7 (head)` and `heads` must show
+only `m4n5o6p7q8r9 (head)`. Do not continue if preflight prints `BLOCKED`.
+After migration, both `current` and `heads` must show only:
+
+```text
+m4n5o6p7q8r9 (head)
+```
+
+The post-migration preflight prints resolved and unresolved context counts.
+Unresolved historical rows are intentionally retained for manual reconciliation
+and are not exposed to an agent by current-crew inference. Never "repair" them
+by assigning the crew member's present vessel. Release 1 has no destructive
+downgrade; roll the application back while leaving this additive schema intact.
+
 ## Before the first run, check the stamp
 
 ```sql

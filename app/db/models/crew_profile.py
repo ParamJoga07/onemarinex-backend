@@ -33,7 +33,9 @@ class CrewProfile(Base):
 
     # --- relationship back to user ---
     user = relationship("User", back_populates="crew_profile")
-    cab_bookings = relationship("CabBooking", back_populates="crew", cascade="all, delete-orphan")
+    # A deleted/recreated account must not erase historical trips. The booking
+    # keeps its immutable vessel-call snapshots and the nullable FK is cleared.
+    cab_bookings = relationship("CabBooking", back_populates="crew")
 
     def __repr__(self) -> str:
         return f"<CrewProfile id={self.id} user_id={self.user_id} rank={self.rank}>"

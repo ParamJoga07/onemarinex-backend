@@ -219,6 +219,10 @@ def _save_manifest_rows(db: Session, vessel: Vessel, rows, port: Optional[str]) 
                         is_verified=False,
                         status="pending",
                     ))
+        db.flush()
+        from app.services.historical_context import assignment_for_manifest
+
+        assignment_for_manifest(db, vessel, crew, profile=profile)
         saved += 1
 
     db.commit()
@@ -400,6 +404,10 @@ def create_vessel(body: VesselIn, current_user: User = Depends(get_current_user)
     )
     db.add(vessel)
     try:
+        db.flush()
+        from app.services.historical_context import active_vessel_call
+
+        active_vessel_call(db, vessel)
         db.commit()
         db.refresh(vessel)
     except Exception as e:
@@ -437,6 +445,10 @@ def update_vessel(vessel_id: int, body: VesselIn, current_user: User = Depends(g
     vessel.etd = body.etd
     if body.status:
         vessel.status = body.status
+
+    from app.services.historical_context import refresh_active_vessel_call
+
+    refresh_active_vessel_call(db, vessel)
         
     try:
         db.commit()
@@ -533,6 +545,7 @@ def add_crew_member(vessel_id: int, body: CrewMemberIn, current_user: User = Dep
         shore_pass_valid_upto=body.shore_pass_valid_upto
     )
     db.add(crew)
+    db.flush()
     
     # Check if a matching CrewProfile exists to automatically generate a ShorePass
     profile = db.query(CrewProfile).filter(CrewProfile.hpid == generated_hpid).first()
@@ -561,6 +574,10 @@ def add_crew_member(vessel_id: int, body: CrewMemberIn, current_user: User = Dep
         )
         db.add(new_pass)
         print(f"DEBUG: Automated ShorePass created for {body.name} (HPID: {generated_hpid})")
+
+    from app.services.historical_context import assignment_for_manifest
+
+    assignment_for_manifest(db, vessel, crew, profile=profile)
 
     db.commit()
     db.refresh(crew)
@@ -733,6 +750,7 @@ def unlink_vessel_from_agent(
         raise HTTPException(status_code=404, detail="Vessel not found")
 
     from app.db.models.agent_roster_event import AgentRosterEvent
+    from app.services.historical_context import finish_vessel_call
 
     db.add(AgentRosterEvent(
         actor_user_id=current_user.id,
@@ -740,6 +758,7 @@ def unlink_vessel_from_agent(
         action="VESSEL_UNLINKED",
         subject_name=vessel.name,
     ))
+    finish_vessel_call(db, vessel, status="ARCHIVED")
     vessel.agent_id = None
     db.commit()
     return RosterUnlinkOut(action="vessel_unlinked", vessel_id=vessel.id)
@@ -775,6 +794,7 @@ def unlink_crew_from_vessel(
         raise HTTPException(status_code=404, detail="Crew member not found")
 
     from app.db.models.agent_roster_event import AgentRosterEvent
+    from app.services.historical_context import end_manifest_assignment
 
     db.add(AgentRosterEvent(
         actor_user_id=current_user.id,
@@ -784,6 +804,7 @@ def unlink_crew_from_vessel(
         subject_name=crew.name,
         subject_hpid=crew.hp_id,
     ))
+    end_manifest_assignment(db, crew)
     db.delete(crew)
     db.commit()
     return RosterUnlinkOut(

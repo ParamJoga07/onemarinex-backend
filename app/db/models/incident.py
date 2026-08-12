@@ -43,6 +43,25 @@ class Incident(Base):
     # incident to a vessel was the reporter's HPID, which is indirect and fails
     # entirely for crew who have not registered an account.
     vessel_id = Column(Integer, ForeignKey("vessels.id", ondelete="SET NULL"), nullable=True, index=True)
+    vessel_call_id = Column(
+        Integer, ForeignKey("vessel_calls.id", ondelete="RESTRICT"), nullable=True, index=True
+    )
+    agency_id = Column(
+        Integer, ForeignKey("agent_profiles.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    crew_profile_id = Column(
+        Integer, ForeignKey("crew_profiles.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    crew_assignment_id = Column(
+        Integer,
+        ForeignKey("crew_assignments.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    port_id = Column(
+        Integer, ForeignKey("ports.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    context_resolution = Column(String(32), nullable=True)
 
     # See app/services/incident_taxonomy.py — six categories, each with
     # sub-categories. Stored as values, not labels, so wording can change.
@@ -59,6 +78,9 @@ class Incident(Base):
     # Relationships
     aggregator = relationship("AggregatorProfile", backref="incidents")
     vessel = relationship("Vessel")
+    vessel_call = relationship("VesselCall")
+    crew_profile = relationship("CrewProfile")
+    crew_assignment = relationship("CrewAssignment")
     notes = relationship("IncidentNote", back_populates="incident", cascade="all, delete-orphan")
     timeline = relationship(
         "IncidentTimelineEvent",
