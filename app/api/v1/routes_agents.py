@@ -276,6 +276,13 @@ def get_dashboard_data(
     if current_user.role != "agent":
         raise HTTPException(status_code=403, detail="Only agents can access dashboard data")
     
+    # Resolve lifecycle from backend time before any status-based query.
+    from app.services.vessel_lifecycle import synchronize_vessel_lifecycle
+
+    owned_vessels = db.query(Vessel).filter(Vessel.agent_id == current_user.id).all()
+    if synchronize_vessel_lifecycle(db, owned_vessels):
+        db.commit()
+
     # 1. Stats
     vessels_query = db.query(Vessel).filter(Vessel.agent_id == current_user.id)
     total_vessels = vessels_query.filter(

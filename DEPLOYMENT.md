@@ -147,6 +147,60 @@ This release is additive and does not rewrite existing operational records.
 It deliberately has no destructive downgrade, because generated report
 artifacts are audit records and must survive an application rollback.
 
+## Release 3: vessel lifecycle and reviewed historical reconciliation
+
+Release 3 starts only from the verified Release 2 head and adds one revision:
+
+```text
+n5o6p7q8r9s0
+  -> o6p7q8r9s0t1  append-only historical-context reconciliation audit
+```
+
+Vessel status is derived using backend server time: Active until 24 hours
+before ETD, Departing during the final 24 hours, and Departed at or after ETD.
+Archived remains an explicit removal action. Departed and archived vessel calls
+remain available in the agent's historical-vessel view.
+
+The superadmin reconciliation queue contains only unresolved or mismatched SOS
+and Incident records. A reviewer must select a historical vessel call and cite
+evidence. The service never proposes or infers the crew member's current
+vessel, and every accepted decision is preserved in an append-only audit row.
+
+After deploying the Release 3 backend code, run in the backend console:
+
+```bash
+python -m alembic current
+python -m alembic heads
+PYTHONPATH=. python scripts/preflight_release_three.py
+PYTHONPATH=. python scripts/sync_vessel_lifecycle.py
+python -m app.db.migrate
+echo "migration_exit=$?"
+python -m alembic current
+python -m alembic heads
+PYTHONPATH=. python scripts/preflight_release_three.py
+PYTHONPATH=. python scripts/sync_vessel_lifecycle.py
+```
+
+Before migration, `current` must be `n5o6p7q8r9s0 (head)` and `heads` must show
+only `o6p7q8r9s0t1 (head)`. The lifecycle command is a dry run unless `--apply`
+is supplied. Review its proposed status and call transitions, then apply them:
+
+```bash
+PYTHONPATH=. python scripts/sync_vessel_lifecycle.py --apply
+PYTHONPATH=. python scripts/preflight_release_three.py
+```
+
+After migration, both `current` and `heads` must show only:
+
+```text
+o6p7q8r9s0t1 (head)
+```
+
+Unresolved records are expected and remain visible only to superadmin for
+manual reconciliation. Do not bulk-assign them from current crew identity.
+Release 3 is additive; its downgrade deliberately preserves reconciliation
+audit rows.
+
 ## Before the first run, check the stamp
 
 ```sql

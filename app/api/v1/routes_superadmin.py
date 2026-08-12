@@ -184,6 +184,13 @@ class VendorTagOut(BaseModel):
     sort_order: int
     created_at: datetime
     updated_at: datetime
+
+
+class HistoricalContextResolutionIn(BaseModel):
+    vessel_call_id: int
+    evidence_type: str
+    evidence_reference: Optional[str] = None
+    notes: str = Field(min_length=10, max_length=2000)
     
 # --- Helpers ---
 
@@ -1310,6 +1317,10 @@ def list_all_vessels_superadmin(
 ):
     verify_superadmin(current_user)
     vessels = db.query(Vessel).all()
+    from app.services.vessel_lifecycle import synchronize_vessel_lifecycle
+
+    if synchronize_vessel_lifecycle(db, vessels):
+        db.commit()
     for v in vessels:
         if not v.agency_name and v.agent and hasattr(v.agent, "agent_profile") and v.agent.agent_profile:
             v.agency_name = v.agent.agent_profile.agency_name
@@ -1353,8 +1364,10 @@ def create_vessel_superadmin(
     try:
         db.flush()
         from app.services.historical_context import active_vessel_call
+        from app.services.vessel_lifecycle import synchronize_vessel_lifecycle
 
         active_vessel_call(db, vessel)
+        synchronize_vessel_lifecycle(db, [vessel])
         db.commit()
         db.refresh(vessel)
     except Exception as e:
@@ -1403,6 +1416,7 @@ def update_vessel_superadmin(
         finish_vessel_call,
         refresh_active_vessel_call,
     )
+    from app.services.vessel_lifecycle import synchronize_vessel_lifecycle
 
     if vessel.agent_id != original_agent_id:
         finish_vessel_call(db, vessel, status="REASSIGNED")
@@ -1410,6 +1424,7 @@ def update_vessel_superadmin(
         active_vessel_call(db, vessel)
     else:
         refresh_active_vessel_call(db, vessel)
+    synchronize_vessel_lifecycle(db, [vessel])
 
     try:
         db.commit()
@@ -1472,14 +1487,16 @@ def create_vessel_under_agent(
         crew_count=c_count,
         eta=body.eta,
         etd=body.etd,
-        status=body.status or "Active"
+        status="Active"
     )
     db.add(vessel)
     try:
         db.flush()
         from app.services.historical_context import active_vessel_call
+        from app.services.vessel_lifecycle import synchronize_vessel_lifecycle
 
         active_vessel_call(db, vessel)
+        synchronize_vessel_lifecycle(db, [vessel])
         db.commit()
         db.refresh(vessel)
     except Exception as e:
@@ -1799,3 +1816,230 @@ def get_user_metrics(
         "start_date": start_date,
         "end_date": end_date,
     }
+
+
+HISTORICAL_EVIDENCE_TYPES = {
+    "trip_record",
+    "vessel_record",
+    "agency_confirmation",
+    "manual_document",
+}
+
+
+def _context_dict(record) -> dict:
+    return {
+        "vessel_id": record.vessel_id,
+        "vessel_call_id": record.vessel_call_id,
+        "agency_id": record.agency_id,
+        "crew_assignment_id": record.crew_assignment_id,
+        "port_id": record.port_id,
+        "context_resolution": record.context_resolution,
+    }
+
+
+def _needs_context_reconciliation(record, call) -> bool:
+    if record.vessel_call_id is None or record.vessel_id is None or record.agency_id is None:
+        return True
+    if call is None:
+        return True
+    return record.vessel_id != call.vessel_id or record.agency_id != call.agency_id
+
+
+@router.get("/historical-context/unresolved")
+def list_unresolved_historical_context(
+    record_kind: Optional[str] = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Superadmin work queue; candidates are choices, never automatic matches."""
+    verify_superadmin(current_user)
+    from app.db.models.agent_profile import AgentProfile
+    from app.db.models.crew_sos import CrewSos
+    from app.db.models.vessel_call import VesselCall
+
+    kind = (record_kind or "").strip().lower()
+    if kind and kind not in {"incident", "sos"}:
+        raise HTTPException(status_code=400, detail="record_kind must be incident or sos")
+
+    calls = db.query(VesselCall).order_by(
+        VesselCall.started_at.desc(), VesselCall.id.desc()
+    ).all()
+    call_by_id = {call.id: call for call in calls}
+    records = []
+
+    if kind in {"", "incident"}:
+        for item in db.query(Incident).order_by(Incident.created_at.desc(), Incident.id.desc()).all():
+            call = call_by_id.get(item.vessel_call_id)
+            if _needs_context_reconciliation(item, call):
+                records.append({
+                    "record_kind": "incident",
+                    "record_id": item.id,
+                    "reference": item.incident_id,
+                    "created_at": item.created_at,
+                    "title": item.title,
+                    "trip_id": item.trip_id,
+                    "reporter_reference": item.reporter_id,
+                    "port_name": item.port_name,
+                    "current_context": _context_dict(item),
+                })
+
+    if kind in {"", "sos"}:
+        for item in db.query(CrewSos).order_by(CrewSos.created_at.desc(), CrewSos.id.desc()).all():
+            call = call_by_id.get(item.vessel_call_id)
+            if _needs_context_reconciliation(item, call):
+                records.append({
+                    "record_kind": "sos",
+                    "record_id": item.id,
+                    "reference": f"SOS-{item.id}",
+                    "created_at": item.created_at,
+                    "title": "Crew SOS alert",
+                    "trip_id": item.trip_id,
+                    "reporter_reference": item.crew_email,
+                    "port_name": item.port_name,
+                    "current_context": _context_dict(item),
+                })
+
+    agencies = {
+        row.id: row.agency_name for row in db.query(AgentProfile.id, AgentProfile.agency_name).all()
+    }
+    return {
+        "records": sorted(
+            records,
+            key=lambda item: (
+                item["created_at"].timestamp() if item["created_at"] else 0,
+                item["record_id"],
+            ),
+            reverse=True,
+        ),
+        "vessel_calls": [
+            {
+                "id": call.id,
+                "vessel_id": call.vessel_id,
+                "vessel_name": call.vessel_name,
+                "imo_number": call.imo_number,
+                "agency_id": call.agency_id,
+                "agency_name": call.agency_name or agencies.get(call.agency_id),
+                "port_name": call.port_name,
+                "started_at": call.started_at,
+                "ended_at": call.ended_at,
+                "status": call.status,
+            }
+            for call in calls
+            if call.vessel_id is not None and call.agency_id is not None
+        ],
+    }
+
+
+@router.post("/historical-context/{record_kind}/{record_id}/reconcile")
+def reconcile_historical_context(
+    record_kind: str,
+    record_id: int,
+    body: HistoricalContextResolutionIn,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Attach one legacy event to reviewed historical evidence, with an audit row."""
+    verify_superadmin(current_user)
+    from app.db.models.crew_assignment import CrewAssignment
+    from app.db.models.crew_sos import CrewSos
+    from app.db.models.event_context_reconciliation import EventContextReconciliation
+    from app.db.models.vessel_call import VesselCall
+
+    kind = record_kind.strip().lower()
+    model = Incident if kind == "incident" else CrewSos if kind == "sos" else None
+    if model is None:
+        raise HTTPException(status_code=404, detail="Historical record not found")
+    evidence_type = body.evidence_type.strip().lower()
+    if evidence_type not in HISTORICAL_EVIDENCE_TYPES:
+        raise HTTPException(status_code=422, detail="Unsupported evidence type")
+
+    record = db.query(model).filter(model.id == record_id).with_for_update().first()
+    if record is None:
+        raise HTTPException(status_code=404, detail="Historical record not found")
+    existing_call = db.query(VesselCall).filter(
+        VesselCall.id == record.vessel_call_id
+    ).first() if record.vessel_call_id else None
+    if not _needs_context_reconciliation(record, existing_call):
+        raise HTTPException(status_code=409, detail="Historical record is already resolved")
+
+    call = db.query(VesselCall).filter(VesselCall.id == body.vessel_call_id).first()
+    if call is None or call.vessel_id is None or call.agency_id is None:
+        raise HTTPException(status_code=422, detail="Selected vessel call has incomplete ownership")
+
+    booking = None
+    if kind == "sos" and record.cab_booking_id:
+        booking = db.query(CabBooking).filter(CabBooking.id == record.cab_booking_id).first()
+    if booking is None and record.trip_id:
+        booking = db.query(CabBooking).filter(CabBooking.booking_id == record.trip_id).first()
+    if booking is not None and booking.vessel_call_id is not None:
+        if booking.vessel_call_id != call.id:
+            raise HTTPException(
+                status_code=409,
+                detail="Selected vessel call conflicts with the linked booking",
+            )
+        if evidence_type != "trip_record":
+            raise HTTPException(
+                status_code=422,
+                detail="A linked booking must be recorded as trip_record evidence",
+            )
+
+    previous = _context_dict(record)
+    assignment = None
+    if record.crew_assignment_id:
+        assignment = db.query(CrewAssignment).filter(
+            CrewAssignment.id == record.crew_assignment_id,
+            CrewAssignment.vessel_call_id == call.id,
+        ).first()
+
+    record.vessel_id = call.vessel_id
+    record.vessel_call_id = call.id
+    record.agency_id = call.agency_id
+    record.port_id = call.port_id
+    record.crew_assignment_id = assignment.id if assignment else None
+    record.context_resolution = f"manual_{evidence_type}"
+    resolved = _context_dict(record)
+    db.add(EventContextReconciliation(
+        record_kind=kind,
+        record_id=record.id,
+        previous_context=previous,
+        resolved_context=resolved,
+        evidence_type=evidence_type,
+        evidence_reference=(body.evidence_reference or "").strip() or None,
+        notes=body.notes.strip(),
+        reconciled_by_user_id=current_user.id,
+    ))
+    db.commit()
+    return {
+        "record_kind": kind,
+        "record_id": record.id,
+        "context": resolved,
+    }
+
+
+@router.get("/historical-context/audit")
+def list_historical_context_audit(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    verify_superadmin(current_user)
+    from app.db.models.event_context_reconciliation import EventContextReconciliation
+
+    rows = db.query(EventContextReconciliation).order_by(
+        EventContextReconciliation.created_at.desc(),
+        EventContextReconciliation.id.desc(),
+    ).limit(500).all()
+    return [
+        {
+            "id": row.id,
+            "record_kind": row.record_kind,
+            "record_id": row.record_id,
+            "previous_context": row.previous_context,
+            "resolved_context": row.resolved_context,
+            "evidence_type": row.evidence_type,
+            "evidence_reference": row.evidence_reference,
+            "notes": row.notes,
+            "reconciled_by_user_id": row.reconciled_by_user_id,
+            "created_at": row.created_at,
+        }
+        for row in rows
+    ]

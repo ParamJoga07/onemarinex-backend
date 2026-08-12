@@ -7,12 +7,12 @@ from alembic.script import ScriptDirectory
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_release_two_is_the_only_head():
+def test_release_two_stays_on_the_single_linear_graph():
     config = Config(str(ROOT / "alembic.ini"))
     config.set_main_option("script_location", str(ROOT / "alembic"))
     script = ScriptDirectory.from_config(config)
 
-    assert script.get_heads() == ["n5o6p7q8r9s0"]
+    assert len(script.get_heads()) == 1
     assert script.get_revision("n5o6p7q8r9s0").down_revision == "m4n5o6p7q8r9"
 
 
