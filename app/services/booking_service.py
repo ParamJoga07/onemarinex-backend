@@ -380,20 +380,34 @@ def serialize_booking(booking: CabBooking) -> Dict[str, Any]:
     driver = booking.assigned_driver
 
     itinerary_stops = None
+    tracking_available = False
     try:
-        from app.db.models.driver_magic_link import DriverMagicLink
+        from app.services.magic_link_service import _default_itinerary_stops
+
         magic_link = (
             booking.magic_link if hasattr(booking, 'magic_link') and booking.magic_link
             else None
         )
-        if not magic_link and booking.id:
-            from sqlalchemy.orm import Session as _Session
-            # We can't easily get a session here, so we rely on the relationship
-            pass
         if magic_link:
             itinerary_stops = magic_link.itinerary_stops
+            tracking_available = True
+        else:
+            # Bookings created before driver magic links were introduced still
+            # have a useful, truthful route. Expose the persisted pickup/drop
+            # rather than making the details page look as if no route existed.
+            # These fallback stops are deliberately marked as derived so the UI
+            # can distinguish them from a tracked stop-by-stop itinerary.
+            itinerary_stops = [
+                dict(stop, derived_from_booking=True)
+                # Only the two endpoints are persisted on a legacy booking.
+                # Do not invent an additional return-to-port leg when no
+                # driver itinerary exists to prove that it was planned.
+                for stop in _default_itinerary_stops(booking)[:2]
+            ]
     except Exception:
-        pass
+        # A malformed legacy relationship must not prevent the booking itself
+        # from being read. The route will be absent, but the rest remains usable.
+        itinerary_stops = []
 
     return {
         "id": booking.id,
@@ -444,6 +458,7 @@ def serialize_booking(booking: CabBooking) -> Dict[str, Any]:
         "created_at": booking.created_at,
         "updated_at": booking.updated_at,
         "itinerary_stops": itinerary_stops,
+        "tracking_available": tracking_available,
     }
 
 

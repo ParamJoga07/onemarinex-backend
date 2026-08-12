@@ -19,7 +19,7 @@ from sqlalchemy.orm import Session
 
 from app.api.v1.routes_bookings import _require_magic_link_active
 from app.api.v1.routes_trips import get_trip_activity
-from app.db.models.cab_booking import BookingStatus, CabBooking
+from app.db.models.cab_booking import BookingStatus, CabBooking, VehicleType
 from app.db.models.booking_timeline import BookingTimeline, TimelineEventType
 from app.db.models.crew_profile import CrewProfile
 from app.db.models.driver_magic_link import DriverMagicLink, DriverMagicLinkReachEvent
@@ -28,6 +28,7 @@ from app.db.models.vessel import Vessel
 from app.db.models.vessel_crew import VesselCrew
 from app.db.session import engine
 from app.services.magic_link_service import mark_stop_reached
+from app.services.booking_service import serialize_booking
 from app.services.timeline_service import get_booking_timeline
 
 
@@ -67,7 +68,7 @@ class TripActivityScopingTests(unittest.TestCase):
             booking_id=_uniq("CAB"), crew_id=crew.id,
             pickup_address="Gate", pickup_lat=0, pickup_lng=0,
             drop_address="City", drop_lat=0, drop_lng=0,
-            vehicle_type="ac", vehicle_name="Sedan", estimated_price=100,
+            vehicle_type=VehicleType.AC, vehicle_name="Sedan", estimated_price=100,
             distance_km=5, status=BookingStatus.ON_TRIP,
             driver_name="Ramesh", driver_phone="+910000000000", driver_plate="AP39 AB 1234",
         )
@@ -91,6 +92,43 @@ class TripActivityScopingTests(unittest.TestCase):
 
         self.assertFalse(result.tracking_available)
         self.assertEqual(result.stops_total, 0)
+
+    def test_legacy_booking_details_show_persisted_route_without_claiming_tracking(self):
+        result = serialize_booking(self.booking_a)
+
+        self.assertFalse(result["tracking_available"])
+        self.assertEqual(
+            [stop["address"] for stop in result["itinerary_stops"]],
+            ["Gate", "City"],
+        )
+        self.assertTrue(all(stop["derived_from_booking"] for stop in result["itinerary_stops"]))
+
+    def test_legacy_booking_timeline_uses_only_exact_persisted_timestamps(self):
+        started = datetime.utcnow() - timedelta(minutes=20)
+        completed = datetime.utcnow() - timedelta(minutes=5)
+        self.booking_a.created_at = started - timedelta(minutes=10)
+        self.booking_a.status = BookingStatus.COMPLETED
+        self.booking_a.trip_started_at = started
+        self.booking_a.trip_completed_at = completed
+        self.db.flush()
+
+        timeline = get_booking_timeline(self.db, self.booking_a.id)
+
+        self.assertEqual(
+            [event["event_type"] for event in timeline],
+            ["BOOKING_CREATED", "TRIP_STARTED", "TRIP_COMPLETED"],
+        )
+        self.assertTrue(all(event["metadata"]["derived_from_booking"] for event in timeline))
+
+    def test_legacy_completed_status_does_not_invent_a_completion_time(self):
+        self.booking_a.status = BookingStatus.COMPLETED
+        self.booking_a.trip_completed_at = None
+        self.booking_a.completed_at = None
+        self.db.flush()
+
+        timeline = get_booking_timeline(self.db, self.booking_a.id)
+
+        self.assertEqual([event["event_type"] for event in timeline], ["BOOKING_CREATED"])
 
     def test_another_agents_trip_is_not_readable(self):
         with self.assertRaises(HTTPException) as ctx:

@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Optional
 from sqlalchemy.orm import Session
 
 from app.db.models.booking_timeline import BookingTimeline, TimelineEventType
+from app.db.models.cab_booking import CabBooking, BookingStatus
 
 
 EVENT_LABELS = {
@@ -24,6 +25,18 @@ STOP_EVENT_LABELS = {
     "waypoint": "Waypoint",
     "facility": "Facility Stop",
     "custom": "Driver Added Stop",
+}
+
+EVENT_SORT_ORDER = {
+    TimelineEventType.BOOKING_CREATED.value: 10,
+    TimelineEventType.PROVIDER_NOTIFIED.value: 20,
+    TimelineEventType.PROVIDER_ACCEPTED.value: 30,
+    TimelineEventType.PROVIDER_REJECTED.value: 30,
+    TimelineEventType.DRIVER_ASSIGNED.value: 40,
+    TimelineEventType.DRIVER_ACCEPTED.value: 50,
+    TimelineEventType.TRIP_STARTED.value: 60,
+    TimelineEventType.TRIP_COMPLETED.value: 90,
+    TimelineEventType.TRIP_CANCELLED.value: 90,
 }
 
 
@@ -69,6 +82,48 @@ def get_booking_timeline(db: Session, booking_db_id: int) -> List[Dict[str, Any]
         }
         for entry in entries
     ]
+
+    # Old imports and local seed fixtures predate booking_timeline. Their
+    # lifecycle timestamps still belong on the timeline; otherwise a completed
+    # booking opens to a completely blank screen. Only exact persisted times are
+    # projected here — updated_at is intentionally not treated as a completion
+    # time because doing so would invent history.
+    booking = db.query(CabBooking).filter(CabBooking.id == booking_db_id).first()
+    if booking:
+        existing_types = {str(event.get("event_type")) for event in events}
+        status_value = (
+            booking.status.value
+            if hasattr(booking.status, "value")
+            else str(booking.status or "")
+        ).lower()
+        provider_event = (
+            TimelineEventType.PROVIDER_REJECTED
+            if status_value == BookingStatus.PROVIDER_REJECTED.value
+            or str(booking.provider_response_status or "").lower() == "rejected"
+            else TimelineEventType.PROVIDER_ACCEPTED
+        )
+        lifecycle = [
+            (TimelineEventType.BOOKING_CREATED, booking.created_at),
+            (provider_event, booking.provider_response_at),
+            (TimelineEventType.DRIVER_ASSIGNED, booking.driver_assigned_at),
+            (TimelineEventType.DRIVER_ACCEPTED, booking.driver_accepted_at),
+            (TimelineEventType.TRIP_STARTED, booking.trip_started_at or booking.started_at),
+            (TimelineEventType.TRIP_COMPLETED, booking.trip_completed_at or booking.completed_at),
+        ]
+        for index, (event_type, event_time) in enumerate(lifecycle, start=1):
+            if not event_time or event_type.value in existing_types:
+                continue
+            events.append({
+                "id": -(1_000_000_000 + booking_db_id * 10 + index),
+                "event_type": event_type.value,
+                "event_label": EVENT_LABELS[event_type],
+                "event_time": event_time,
+                "actor_id": None,
+                "actor_type": "system",
+                "metadata": {"derived_from_booking": True},
+                "created_at": event_time,
+            })
+            existing_types.add(event_type.value)
 
     from app.db.models.driver_magic_link import DriverMagicLink
     magic_link = (
@@ -129,6 +184,7 @@ def get_booking_timeline(db: Session, booking_db_id: int) -> List[Dict[str, Any]
     events.sort(
         key=lambda event: (
             _to_naive(event.get("event_time") or event.get("created_at")),
+            EVENT_SORT_ORDER.get(str(event.get("event_type")), 70),
             int(event.get("id") or 0),
         )
     )
