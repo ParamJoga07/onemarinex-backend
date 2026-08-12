@@ -4,7 +4,6 @@ from typing import Optional, List
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
-from sqlalchemy import and_, or_
 
 from app.api.v1.routes_auth import get_current_user
 from app.db.models.crew_sos import CrewSos, CrewSosNote, CrewSosTimelineEvent
@@ -45,30 +44,6 @@ class SosAdminOut(BaseModel):
         from_attributes = True
 
 
-def _agent_crew_profile_ids(db: Session, agent_user_id: int) -> List[int]:
-    """Crew sailing on this agent's vessels.
-
-    SOS was scoped by port, which meant every agency berthed at the same port
-    could see, acknowledge and close each other's emergencies. An agent is
-    responsible for their own ships' crew, so that is the boundary.
-    """
-    from app.db.models.vessel import Vessel
-    from app.db.models.vessel_crew import VesselCrew
-    from app.db.models.crew_profile import CrewProfile
-
-    vessel_ids = [v.id for v in db.query(Vessel.id).filter(Vessel.agent_id == agent_user_id).all()]
-    if not vessel_ids:
-        return []
-    hpids = [
-        c.hp_id for c in db.query(VesselCrew.hp_id).filter(
-            VesselCrew.vessel_id.in_(vessel_ids), VesselCrew.hp_id.isnot(None)
-        ).all() if c.hp_id
-    ]
-    if not hpids:
-        return []
-    return [cp.id for cp in db.query(CrewProfile.id).filter(CrewProfile.hpid.in_(hpids)).all()]
-
-
 def _agent_may_handle(db: Session, current_user, sos: CrewSos) -> bool:
     if current_user.role == "superadmin":
         return True
@@ -77,14 +52,10 @@ def _agent_may_handle(db: Session, current_user, sos: CrewSos) -> bool:
     agent_profile_id = db.query(AgentProfile.id).filter(
         AgentProfile.user_id == current_user.id
     ).scalar()
-    if sos.agency_id is not None:
-        return agent_profile_id is not None and sos.agency_id == agent_profile_id
-    # Compatibility only for unresolved rows written before Release 1. New SOS
-    # records always carry agency_id and never follow a crew member to a new ship.
-    return (
-        sos.crew_profile_id is not None
-        and sos.crew_profile_id in _agent_crew_profile_ids(db, current_user.id)
-    )
+    # An unresolved historical row has no provable agent owner. It remains
+    # available to superadmin for reconciliation, but must never follow the
+    # crew member's current manifest into an agency dashboard.
+    return agent_profile_id is not None and sos.agency_id == agent_profile_id
 
 
 @router.get("/admin", response_model=List[SosAdminOut])
@@ -101,20 +72,11 @@ def list_sos_requests(
         agent_profile_id = db.query(AgentProfile.id).filter(
             AgentProfile.user_id == current_user.id
         ).scalar()
-        crew_ids = _agent_crew_profile_ids(db, current_user.id)
-        clauses = []
-        if agent_profile_id is not None:
-            clauses.append(CrewSos.agency_id == agent_profile_id)
-        if crew_ids:
-            clauses.append(and_(
-                CrewSos.agency_id.is_(None),
-                CrewSos.crew_profile_id.in_(crew_ids),
-            ))
-        if not clauses:
+        if agent_profile_id is None:
             return []
         sos_list = (
             db.query(CrewSos)
-            .filter(or_(*clauses))
+            .filter(CrewSos.agency_id == agent_profile_id)
             .order_by(CrewSos.created_at.desc())
             .all()
         )

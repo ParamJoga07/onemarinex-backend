@@ -18,6 +18,7 @@ import app.db.base  # noqa: F401 — registers every model on Base
 from sqlalchemy.orm import Session
 
 from app.api.v1.routes_incidents import agent_incident_list
+from app.db.models.agent_profile import AgentProfile
 from app.db.models.incident import Incident, IncidentStatus, IncidentType
 from app.db.models.user import User
 from app.db.models.vessel import Vessel
@@ -38,6 +39,13 @@ class IncidentVesselOwnershipTests(unittest.TestCase):
         agent_user = User(email=_uniq("agent") + "@example.com", hashed_password="x", role="agent")
         self.db.add(agent_user)
         self.db.flush()
+        self.agent_profile = AgentProfile(
+            user_id=agent_user.id,
+            agency_name=_uniq("Agency"),
+            location="Test Port",
+        )
+        self.db.add(self.agent_profile)
+        self.db.flush()
 
         self.vessel = Vessel(agent_id=agent_user.id, name=_uniq("MV"), imo_number=_uniq("IMO"),
                              vessel_type="Bulk Carrier", status="Active")
@@ -55,7 +63,8 @@ class IncidentVesselOwnershipTests(unittest.TestCase):
             status=IncidentStatus.ACTIVE, category="driver_vehicle",
             sub_category="late_pickup", severity="medium",
             reporter_name="Yogesh Kothavale", reporter_id=self.hpid,
-            vessel_id=self.vessel.id,
+            vessel_id=self.vessel.id, agency_id=self.agent_profile.id,
+            context_resolution="vessel_id",
         )
         self.db.add(self.incident)
         self.db.flush()
@@ -87,16 +96,23 @@ class IncidentVesselOwnershipTests(unittest.TestCase):
 
         self.assertIn(self.incident.incident_id, self.listed_ids())
 
-    def test_legacy_incident_without_a_vessel_is_still_found_by_hpid(self):
-        """Rows written before vessel_id existed must not disappear."""
+    def test_unresolved_legacy_incident_is_not_inferred_from_current_hpid(self):
+        """Unresolved history must not follow a crew member to a new vessel."""
         self.incident.vessel_id = None
+        self.incident.agency_id = None
+        self.incident.context_resolution = "unresolved"
         self.db.flush()
 
-        self.assertIn(self.incident.incident_id, self.listed_ids())
+        self.assertNotIn(self.incident.incident_id, self.listed_ids())
 
     def test_another_agencys_incident_is_not_listed(self):
         other_user = User(email=_uniq("other") + "@example.com", hashed_password="x", role="agent")
         self.db.add(other_user)
+        self.db.flush()
+        other_profile = AgentProfile(
+            user_id=other_user.id, agency_name=_uniq("Agency"), location="Elsewhere"
+        )
+        self.db.add(other_profile)
         self.db.flush()
         other_vessel = Vessel(agent_id=other_user.id, name=_uniq("MV"), imo_number=_uniq("IMO"),
                               vessel_type="Tanker", status="Active")
@@ -106,6 +122,7 @@ class IncidentVesselOwnershipTests(unittest.TestCase):
             incident_id=_uniq("INC"), type=IncidentType.CREW,
             title="Theirs", description="Not ours.", status=IncidentStatus.ACTIVE,
             reporter_id=_uniq("HP"), vessel_id=other_vessel.id,
+            agency_id=other_profile.id, context_resolution="vessel_id",
         )
         self.db.add(theirs)
         self.db.flush()

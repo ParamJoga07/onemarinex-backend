@@ -27,6 +27,7 @@ from app.api.v1.routes_incidents import (
     agent_incident_detail,
     update_incident_status,
 )
+from app.db.models.agent_profile import AgentProfile
 from app.db.models.crew_profile import CrewProfile
 from app.db.models.crew_sos import CrewSos
 from app.db.models.incident import (
@@ -65,6 +66,13 @@ class IncidentDetailScopingTests(unittest.TestCase):
                          role="crew", mobile_number="+91 90000 00000")
         self.db.add_all([agent_user, crew_user])
         self.db.flush()
+        agent_profile = AgentProfile(
+            user_id=agent_user.id,
+            agency_name=_uniq("Agency"),
+            location="Test Port",
+        )
+        self.db.add(agent_profile)
+        self.db.flush()
 
         hpid = _uniq("HP")
         crew = CrewProfile(user_id=crew_user.id, full_name="Rahul Menon", rank="able_seaman",
@@ -83,6 +91,7 @@ class IncidentDetailScopingTests(unittest.TestCase):
             status=IncidentStatus.RESOLVED if resolved else IncidentStatus.ACTIVE,
             category="general_support", sub_category="lost_property", severity="low",
             reporter_name="Rahul Menon", reporter_id=hpid, vessel_id=vessel.id,
+            agency_id=agent_profile.id, context_resolution="vessel_id",
             created_at=created,
             resolved_at=created + timedelta(hours=1) if resolved else None,
         )
@@ -97,7 +106,9 @@ class IncidentDetailScopingTests(unittest.TestCase):
                                  author_name="Agent"))
         self.db.flush()
 
-        agent = SimpleNamespace(id=agent_user.id, role="agent")
+        agent = SimpleNamespace(
+            id=agent_user.id, role="agent", agent_profile=agent_profile
+        )
         return agent, incident
 
     def test_agent_sees_their_own_incident_in_full(self):
@@ -256,6 +267,9 @@ class IncidentDetailScopingTests(unittest.TestCase):
             user_id=crew.user_id,
             crew_profile_id=crew.id,
             vessel=self.incident_a.vessel.name,
+            vessel_id=self.incident_a.vessel_id,
+            agency_id=self.incident_a.agency_id,
+            context_resolution="vessel_id",
             status="ACTIVE",
             lat=17.7019,
             lng=83.2897,

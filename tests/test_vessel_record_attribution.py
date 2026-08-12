@@ -20,6 +20,7 @@ import app.db.base  # noqa: F401 — registers every model on Base
 from sqlalchemy.orm import Session
 from types import SimpleNamespace
 
+from app.db.models.agent_profile import AgentProfile
 from app.db.models.crew_profile import CrewProfile
 from app.db.models.crew_sos import CrewSos
 from app.db.models.user import User
@@ -42,12 +43,17 @@ class VesselAttributionTests(unittest.TestCase):
                           hashed_password="x", role="agent")
         self.db.add(agent_user)
         self.db.flush()
+        self.agent_profile = AgentProfile(
+            user_id=agent_user.id,
+            agency_name="Test Agency",
+            location="Test Port",
+        )
+        self.db.add(self.agent_profile)
+        self.db.flush()
         self.agent_user = agent_user
         self.agent = SimpleNamespace(
             id=agent_user.id, role="agent",
-            agent_profile=SimpleNamespace(
-                assigned_port=None, agency_name="Test Agency", agency_logo_url=None,
-            ),
+            agent_profile=self.agent_profile,
         )
 
         # Two ships under one agent, and one crew member who sails on both.
@@ -90,11 +96,15 @@ class VesselAttributionTests(unittest.TestCase):
         self.trans.rollback()
         self.connection.close()
 
-    def _sos(self, stamped_vessel):
+    def _sos(self, vessel):
         sos = CrewSos(
             user_id=self.crew.user_id, crew_profile_id=self.crew.id,
             crew_email="crew@example.com", sos_email="ship@example.com",
-            port_name="port_test", vessel=stamped_vessel, status="ACTIVE",
+            port_name="port_test", vessel=vessel.name if vessel else None,
+            vessel_id=vessel.id if vessel else None,
+            agency_id=self.agent_profile.id if vessel else None,
+            context_resolution="vessel_id" if vessel else "unresolved",
+            status="ACTIVE",
         )
         self.db.add(sos)
         self.db.flush()
@@ -117,7 +127,7 @@ class VesselAttributionTests(unittest.TestCase):
     # --- the reported defect ------------------------------------------------
 
     def test_an_sos_stays_on_the_ship_it_was_raised_on(self):
-        old_sos = self._sos("MV BABYLON")
+        old_sos = self._sos(self.old_ship)
 
         old_refs = [r["reference"] for r in self._reports_for(self.old_ship)]
         new_refs = [r["reference"] for r in self._reports_for(self.new_ship)]
@@ -126,8 +136,8 @@ class VesselAttributionTests(unittest.TestCase):
         self.assertNotIn(f"SOS-{old_sos.id}", new_refs)
 
     def test_the_same_holds_for_the_vessel_incident_list(self):
-        old_sos = self._sos("MV BABYLON")
-        new_sos = self._sos("MV JIM MING 82")
+        old_sos = self._sos(self.old_ship)
+        new_sos = self._sos(self.new_ship)
 
         old_refs = [r["incident_id"] for r in self._list_for(self.old_ship)]
         new_refs = [r["incident_id"] for r in self._list_for(self.new_ship)]
@@ -144,7 +154,7 @@ class VesselAttributionTests(unittest.TestCase):
         """
         from app.api.v1.routes_incidents import agent_incident_list
 
-        self._sos("MV JIM MING 82")
+        self._sos(self.new_ship)
 
         payload = agent_incident_list(
             status_filter=None, vessel_id=None,
@@ -152,21 +162,21 @@ class VesselAttributionTests(unittest.TestCase):
 
         self.assertEqual(payload["incidents"], [])
 
-    def test_the_stamp_is_matched_case_and_space_insensitively(self):
-        """The stamp is a free string copied from the profile, not a key."""
-        sos = self._sos("  mv jim ming 82 ")
+    def test_display_name_cannot_override_the_immutable_vessel_id(self):
+        sos = self._sos(self.new_ship)
+        sos.vessel = "MV BABYLON"
+        self.db.flush()
 
         refs = [r["reference"] for r in self._reports_for(self.new_ship)]
 
         self.assertIn(f"SOS-{sos.id}", refs)
 
-    def test_an_unstamped_sos_still_reaches_a_report(self):
-        """Rows written before the stamp existed have only manifest linkage."""
+    def test_an_unresolved_sos_is_not_inferred_into_an_agent_report(self):
         legacy = self._sos(None)
 
         refs = [r["reference"] for r in self._reports_for(self.new_ship)]
 
-        self.assertIn(f"SOS-{legacy.id}", refs)
+        self.assertNotIn(f"SOS-{legacy.id}", refs)
 
     # --- guarding the over-reach that caused it -----------------------------
 

@@ -21,6 +21,7 @@ from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
 from app.api.v1 import routes_incidents as ri
+from app.db.models.agent_profile import AgentProfile
 from app.db.models.cab_booking import CabBooking, VehicleType
 from app.db.models.crew_profile import CrewProfile
 from app.db.models.incident import Incident, IncidentStatus, IncidentTimelineEvent, IncidentType
@@ -58,6 +59,14 @@ class SafetyCenterTests(unittest.TestCase):
                          role="crew", name="Test Crew")
         self.db.add_all([agent_user, crew_user])
         self.db.flush()
+        agent_profile = AgentProfile(
+            user_id=agent_user.id,
+            agency_name=_uniq("Agency"),
+            location="Test Port",
+            assigned_port="port_test",
+        )
+        self.db.add(agent_profile)
+        self.db.flush()
 
         hpid = _uniq("HP")
         crew = CrewProfile(user_id=crew_user.id, full_name="Test Crew", rank="third_officer",
@@ -70,7 +79,9 @@ class SafetyCenterTests(unittest.TestCase):
                                rank="third_officer", hp_id=hpid))
         self.db.flush()
 
-        agent = SimpleNamespace(id=agent_user.id, role="agent", name="Agent", agent_profile=None)
+        agent = SimpleNamespace(
+            id=agent_user.id, role="agent", name="Agent", agent_profile=agent_profile
+        )
         crew_actor = SimpleNamespace(id=crew_user.id, role="crew", name="Test Crew")
         return agent, crew_actor, vessel
 

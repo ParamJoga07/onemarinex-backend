@@ -25,6 +25,7 @@ import app.db.base  # noqa: F401 — registers every model on Base
 from sqlalchemy.orm import Session
 
 from app.api.v1.routes_agents import shore_leave_report
+from app.db.models.agent_profile import AgentProfile
 from app.db.models.cab_booking import BookingStatus, CabBooking
 from app.db.models.crew_profile import CrewProfile
 from app.db.models.shore_pass import ShorePass
@@ -62,6 +63,13 @@ class ShoreLeaveAverageTests(unittest.TestCase):
         )
         self.db.add(self.agent_user)
         self.db.flush()
+        self.agent_profile = AgentProfile(
+            user_id=self.agent_user.id,
+            agency_name="Test Agency",
+            location="Test Port",
+        )
+        self.db.add(self.agent_profile)
+        self.db.flush()
 
         self.vessel = Vessel(
             agent_id=self.agent_user.id, name=_uniq("MV"), imo_number=_uniq("IMO"),
@@ -72,9 +80,7 @@ class ShoreLeaveAverageTests(unittest.TestCase):
 
         self.agent = SimpleNamespace(
             id=self.agent_user.id, role="agent",
-            agent_profile=SimpleNamespace(
-                assigned_port=None, agency_name="Test Agency", agency_logo_url=None,
-            ),
+            agent_profile=self.agent_profile,
         )
 
     def tearDown(self):
@@ -128,6 +134,9 @@ class ShoreLeaveAverageTests(unittest.TestCase):
             vehicle_type="ac", vehicle_name="Sedan",
             estimated_price=100, distance_km=5,
             status=BookingStatus.COMPLETED,
+            agency_id=self.agent_profile.id,
+            vessel_id=self.vessel.id,
+            context_resolution="vessel_id",
             created_at=created or started,
             trip_started_at=started, trip_completed_at=completed,
             crew_member_ids=passengers,

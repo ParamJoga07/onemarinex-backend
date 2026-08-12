@@ -25,6 +25,7 @@ from app.api.v1.routes_incidents import (
     delete_incident_timeline_entry,
     edit_incident_timeline_entry,
 )
+from app.db.models.agent_profile import AgentProfile
 from app.db.models.incident import (
     Incident,
     IncidentStatus,
@@ -64,6 +65,13 @@ class ManualTimelineEntryTests(unittest.TestCase):
         agent_user = User(email=_uniq("agent") + "@example.com", hashed_password="x", role="agent")
         self.db.add(agent_user)
         self.db.flush()
+        agent_profile = AgentProfile(
+            user_id=agent_user.id,
+            agency_name=_uniq("Agency"),
+            location="Test Port",
+        )
+        self.db.add(agent_profile)
+        self.db.flush()
         vessel = Vessel(agent_id=agent_user.id, name=_uniq("MV"), imo_number=_uniq("IMO"),
                         vessel_type="Bulk Carrier", status="Active")
         self.db.add(vessel)
@@ -72,10 +80,14 @@ class ManualTimelineEntryTests(unittest.TestCase):
             incident_id=_uniq("INC"), type=IncidentType.CREW,
             title="Abuse reported", description="Crew reported misbehaviour.",
             status=IncidentStatus.ACTIVE, vessel_id=vessel.id,
+            agency_id=agent_profile.id, context_resolution="vessel_id",
         )
         self.db.add(incident)
         self.db.flush()
-        agent = SimpleNamespace(id=agent_user.id, role="agent", name="Agent Desk")
+        agent = SimpleNamespace(
+            id=agent_user.id, role="agent", name="Agent Desk",
+            agent_profile=agent_profile,
+        )
         return agent, incident
 
     def add(self, label="Driver Contacted", event_type="update", agent=None, incident=None):
