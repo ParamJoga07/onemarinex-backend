@@ -195,6 +195,7 @@ def get_sos_timeline(
         ))
 
     from app.db.models.vessel import Vessel
+    from app.db.models.crew_assignment import CrewAssignment
     from app.db.models.vessel_call import VesselCall
     from app.services.historical_context import vessel_call_context
     from app.services.operations_context import booking_context, find_booking, vessel_context
@@ -210,6 +211,12 @@ def get_sos_timeline(
     if vessel_call is None and vessel is None and sos.vessel:
         vessel = db.query(Vessel).filter(Vessel.name == sos.vessel).first()
     booking = find_booking(db, sos.trip_id, booking_id=sos.cab_booking_id)
+    assignment = (
+        db.query(CrewAssignment).filter(
+            CrewAssignment.id == sos.crew_assignment_id
+        ).first()
+        if sos.crew_assignment_id else None
+    )
 
     persisted_timeline = (
         db.query(CrewSosTimelineEvent)
@@ -271,9 +278,15 @@ def get_sos_timeline(
             else vessel_context(vessel, port_name=sos.port_name)
         ),
         crew_details={
-            "name": sos.crew_profile.full_name if sos.crew_profile else None,
-            "rank": sos.crew_profile.rank if sos.crew_profile else None,
-            "nationality": sos.crew_profile.nationality if sos.crew_profile else None,
+            "name": assignment.crew_name if assignment else (
+                sos.crew_profile.full_name if sos.crew_profile else None
+            ),
+            "rank": assignment.rank if assignment else (
+                sos.crew_profile.rank if sos.crew_profile else None
+            ),
+            "nationality": assignment.nationality if assignment else (
+                sos.crew_profile.nationality if sos.crew_profile else None
+            ),
             "phone": sos.user.mobile_number if sos.user else None,
             "email": sos.crew_email or (sos.user.email if sos.user else None),
         },

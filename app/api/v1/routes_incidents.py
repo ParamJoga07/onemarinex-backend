@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 import uuid
 from app.db.session import get_db
 from app.db.models.incident import Incident, IncidentNote, IncidentStatus, IncidentType
+from app.db.models.crew_assignment import CrewAssignment
 from app.api.v1.routes_auth import get_current_user
 from pydantic import BaseModel
 
@@ -828,7 +829,26 @@ def agent_incident_detail(
     )
 
     reporter = None
-    if incident.reporter_id:
+    assignment = (
+        db.query(CrewAssignment).filter(
+            CrewAssignment.id == incident.crew_assignment_id
+        ).first()
+        if incident.crew_assignment_id else None
+    )
+    if assignment:
+        profile = assignment.crew_profile
+        phone = (
+            db.query(User.mobile_number).filter(User.id == profile.user_id).first()
+            if profile else None
+        )
+        reporter = {
+            "hpid": assignment.hpid,
+            "full_name": assignment.crew_name,
+            "rank": assignment.rank,
+            "nationality": assignment.nationality,
+            "phone": phone[0] if phone else None,
+        }
+    elif incident.reporter_id:
         cp = db.query(CrewProfile).filter(CrewProfile.hpid == incident.reporter_id).first()
         if cp:
             # The phone number lives on the user account, not the crew profile.
@@ -924,6 +944,87 @@ def agent_safety_report(
         "generated_at": datetime.now(timezone.utc),
         "payload": payload,
     }
+
+
+@router.post("/agent/report/{record_kind}/{record_id}/snapshots")
+def create_agent_safety_report_snapshot(
+    record_kind: str,
+    record_id: int,
+    db: Session = Depends(get_db),
+    current_user = Depends(get_current_user),
+):
+    """Freeze one generated safety report as an immutable audit artifact."""
+    if current_user.role != "agent":
+        raise HTTPException(status_code=403, detail="Only agents can generate report snapshots")
+
+    from app.db.models.agent_profile import AgentProfile
+    from app.db.models.crew_sos import CrewSos
+    from app.services.report_snapshots import (
+        create_report_snapshot,
+        serialize_report_snapshot,
+    )
+
+    report = agent_safety_report(
+        record_kind=record_kind,
+        record_id=record_id,
+        db=db,
+        current_user=current_user,
+    )
+    kind = report["record_kind"]
+    agency_id = db.query(AgentProfile.id).filter(
+        AgentProfile.user_id == current_user.id
+    ).scalar()
+    if agency_id is None:
+        raise HTTPException(status_code=403, detail="Agent profile not found")
+
+    if kind == "incident":
+        source = db.query(Incident).filter(Incident.id == record_id).one()
+        reference = source.incident_id
+    else:
+        source = db.query(CrewSos).filter(CrewSos.id == record_id).one()
+        reference = f"SOS-{source.id}"
+
+    snapshot = create_report_snapshot(
+        db,
+        report_kind=kind,
+        source_id=source.id,
+        source_reference=reference,
+        agency_id=agency_id,
+        vessel_call_id=source.vessel_call_id,
+        generated_by_user_id=current_user.id,
+        payload=report["payload"],
+    )
+    db.commit()
+    db.refresh(snapshot)
+    return serialize_report_snapshot(snapshot)
+
+
+@router.get("/agent/report-snapshots/{snapshot_id}")
+def get_agent_safety_report_snapshot(
+    snapshot_id: int,
+    db: Session = Depends(get_db),
+    current_user = Depends(get_current_user),
+):
+    """Read an artifact without rebuilding it from mutable current state."""
+    from app.db.models.agent_profile import AgentProfile
+    from app.db.models.report_snapshot import ReportSnapshot
+    from app.services.report_snapshots import serialize_report_snapshot
+
+    query = db.query(ReportSnapshot).filter(ReportSnapshot.id == snapshot_id)
+    if current_user.role == "agent":
+        agency_id = db.query(AgentProfile.id).filter(
+            AgentProfile.user_id == current_user.id
+        ).scalar()
+        if agency_id is None:
+            raise HTTPException(status_code=404, detail="Report snapshot not found")
+        query = query.filter(ReportSnapshot.agency_id == agency_id)
+    elif current_user.role != "superadmin":
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    snapshot = query.first()
+    if not snapshot:
+        raise HTTPException(status_code=404, detail="Report snapshot not found")
+    return serialize_report_snapshot(snapshot)
 
 
 @router.get("/{id:int}/timeline")

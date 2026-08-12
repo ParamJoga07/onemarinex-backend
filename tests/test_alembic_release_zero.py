@@ -17,7 +17,9 @@ def _script_directory() -> ScriptDirectory:
 
 
 def test_alembic_has_exactly_one_head():
-    assert _script_directory().get_heads() == ["m4n5o6p7q8r9"]
+    # Release 0 repaired the duplicate graph. Later releases may advance the
+    # head, but must never reintroduce branching or duplicate revision IDs.
+    assert len(_script_directory().get_heads()) == 1
 
 
 def test_release_zero_revisions_follow_the_deployed_head():
