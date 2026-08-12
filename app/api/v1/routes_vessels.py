@@ -538,7 +538,11 @@ def get_agent_vessel_call_history(
                 VesselCall.status.in_(["DEPARTED", "ARCHIVED", "REASSIGNED"]),
             ),
         )
-        .order_by(VesselCall.ended_at.desc(), VesselCall.id.desc())
+        .order_by(
+            VesselCall.ended_at.is_(None),
+            VesselCall.ended_at.desc(),
+            VesselCall.id.desc(),
+        )
         .offset(offset)
         .limit(limit)
         .all()

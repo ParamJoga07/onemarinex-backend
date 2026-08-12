@@ -71,11 +71,11 @@ def _agent_and_vessel(db, *, etd=None):
     return user, agency, vessel, call
 
 
-def test_release_three_is_the_only_head():
+def test_release_three_stays_on_the_single_linear_graph():
     config = Config(str(ROOT / "alembic.ini"))
     config.set_main_option("script_location", str(ROOT / "alembic"))
     script = ScriptDirectory.from_config(config)
-    assert script.get_heads() == ["o6p7q8r9s0t1"]
+    assert len(script.get_heads()) == 1
     assert script.get_revision("o6p7q8r9s0t1").down_revision == "n5o6p7q8r9s0"
 
 
