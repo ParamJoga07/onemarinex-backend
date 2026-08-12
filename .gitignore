@@ -23,6 +23,7 @@ scripts/*
 !scripts/audit_operational_data.py
 !scripts/repair_hpid_links.py
 !scripts/consolidate_ports.py
+!scripts/preflight_release_zero.py
 apply_port_id_migration.py
 migrations/
 seeds/

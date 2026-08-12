@@ -30,6 +30,39 @@ product, and dies with `UndefinedTable` against an empty database. `app.db.migra
 handles the baseline-then-delta path and takes a Postgres advisory lock so two
 instances starting together serialise instead of racing on DDL.
 
+## Release 0: repair the duplicate migration graph
+
+Production was stamped at `i0k1l2m3n4o5`, but two newer migrations reused the
+already-deployed revision IDs `a2c3d4e5f6g7` and `b3d4e5f6g7h8`. Release 0
+reissues only those newer changes as one linear, additive chain:
+
+```text
+i0k1l2m3n4o5
+  -> j1k2l3m4n5o6  cab_bookings.vessel_id
+  -> k2l3m4n5o6p7  agent_profiles.agency_rules
+```
+
+After deploying the Release 0 code, run these commands in the backend console:
+
+```bash
+PYTHONPATH=. python scripts/preflight_release_zero.py
+python -m app.db.migrate
+python -m alembic current
+python -m alembic heads
+```
+
+Do not run the migration if preflight reports orphaned
+`cab_bookings.vessel_id` values. Reconcile those bookings first. A successful
+deployment ends with both `current` and `heads` reporting only:
+
+```text
+k2l3m4n5o6p7 (head)
+```
+
+This release repairs the migration foundation only. Historical vessel-call and
+crew-assignment tables, event backfills, archival lifecycle changes, and report
+snapshots belong in subsequent releases.
+
 ## Before the first run, check the stamp
 
 ```sql
