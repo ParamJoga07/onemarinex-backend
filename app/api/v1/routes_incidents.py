@@ -61,66 +61,15 @@ class IncidentResponse(IncidentBase):
 
 # --- Crew Safety Center helpers -------------------------------------------
 
-def _agent_vessel_ids(db: Session, agent_user_id: int):
-    """Vessels this agent operates."""
-    from app.db.models.vessel import Vessel
-
-    return [v.id for v in db.query(Vessel.id).filter(Vessel.agent_id == agent_user_id).all()]
-
-
 def _agent_incident_filter(db: Session, agent_user_id: int):
-    """Which incidents belong to this agent.
-
-    Primarily the vessel: `incidents.vessel_id` is stamped at creation and does
-    not move. Matching on the reporter's HPID alone is fragile, because an HPID
-    is regenerated when a crew member is re-linked to a vessel or re-uploaded on
-    a manifest — and every incident raised under the old HPID then silently
-    disappeared from this list while the crew member was still aboard.
-
-    HPIDs are now immutable once issued. The HPID clause is kept only for older rows written before `vessel_id`
-    existed, which would otherwise vanish.
-    """
+    """Which incidents have immutable ownership by this agent's agency."""
     from app.db.models.agent_profile import AgentProfile
-    from sqlalchemy import and_, or_
-
-    vessel_ids = _agent_vessel_ids(db, agent_user_id)
-    hpids, _ = _agent_hpids_and_vessels(db, agent_user_id)
     agency_id = db.query(AgentProfile.id).filter(
         AgentProfile.user_id == agent_user_id
     ).scalar()
-    if agency_id is None and not vessel_ids and not hpids:
-        return None
-
-    clauses = []
-    if agency_id is not None:
-        clauses.append(Incident.agency_id == agency_id)
-    if vessel_ids:
-        clauses.append(and_(
-            Incident.agency_id.is_(None),
-            Incident.vessel_id.in_(vessel_ids),
-        ))
-    if hpids:
-        clauses.append(and_(
-            Incident.agency_id.is_(None),
-            Incident.vessel_id.is_(None),
-            Incident.reporter_id.in_(hpids),
-        ))
-    return or_(*clauses)
-
-
-def _agent_hpids_and_vessels(db: Session, agent_user_id: int):
-    """The HPIDs sailing on this agent's vessels, and a hpid -> vessel_id map."""
-    from app.db.models.vessel import Vessel
-    from app.db.models.vessel_crew import VesselCrew
-
-    vessel_ids = [v.id for v in db.query(Vessel).filter(Vessel.agent_id == agent_user_id).all()]
-    if not vessel_ids:
-        return [], {}
-    rows = db.query(VesselCrew.hp_id, VesselCrew.vessel_id).filter(
-        VesselCrew.vessel_id.in_(vessel_ids), VesselCrew.hp_id.isnot(None)
-    ).all()
-    hpid_to_vessel = {r[0]: r[1] for r in rows if r[0]}
-    return list(hpid_to_vessel.keys()), hpid_to_vessel
+    # No current-profile fallback: rows without an immutable agency remain
+    # superadmin-only until they are manually reconciled.
+    return Incident.agency_id == agency_id if agency_id is not None else None
 
 
 def _resolve_vessel_for_crew(db: Session, crew) -> Optional[int]:
@@ -130,7 +79,6 @@ def _resolve_vessel_for_crew(db: Session, crew) -> Optional[int]:
     primary link, with passport and current vessel name as compatibility paths
     for legacy rows affected by the historical IN/IND HPID mismatch.
     """
-    from app.db.models.vessel import Vessel
     from app.db.models.vessel_crew import VesselCrew
     from sqlalchemy import func, or_
 
@@ -582,32 +530,17 @@ def agent_safety_summary(
         raise HTTPException(status_code=403, detail="Only agents can view the safety summary")
 
     from app.db.models.crew_sos import CrewSos
-    from app.db.models.crew_profile import CrewProfile
-
-    hpids, _ = _agent_hpids_and_vessels(db, current_user.id)
     from app.services.port_time import agent_port_day
     today_start, today_end, _ = agent_port_day(db, current_user)
 
     active_sos = 0
     avg_response_seconds = None
     from app.db.models.agent_profile import AgentProfile
-    from sqlalchemy import and_, or_
     agency_id = db.query(AgentProfile.id).filter(
         AgentProfile.user_id == current_user.id
     ).scalar()
-    crew_ids = [
-        cp.id for cp in db.query(CrewProfile.id).filter(CrewProfile.hpid.in_(hpids)).all()
-    ] if hpids else []
-    sos_ownership = []
     if agency_id is not None:
-        sos_ownership.append(CrewSos.agency_id == agency_id)
-    if crew_ids:
-        sos_ownership.append(and_(
-            CrewSos.agency_id.is_(None),
-            CrewSos.crew_profile_id.in_(crew_ids),
-        ))
-    if sos_ownership:
-        owned_sos = db.query(CrewSos).filter(or_(*sos_ownership))
+        owned_sos = db.query(CrewSos).filter(CrewSos.agency_id == agency_id)
         active_sos = owned_sos.filter(
             CrewSos.closed_at.is_(None),
             CrewSos.cancelled_at.is_(None),
@@ -707,8 +640,6 @@ def _agent_sos_records(db: Session, agent_user_id: int, vessel_id: Optional[int]
     from app.db.models.crew_profile import CrewProfile
     from app.db.models.crew_sos import CrewSos
     from app.db.models.vessel import Vessel
-    from app.services import crew_linkage
-    from app.services.crew_linkage import vessel_crew_profile_ids
 
     agency_id = db.query(AgentProfile.id).filter(
         AgentProfile.user_id == agent_user_id
@@ -717,10 +648,6 @@ def _agent_sos_records(db: Session, agent_user_id: int, vessel_id: Optional[int]
     if vessel_id is not None:
         strong_query = strong_query.filter(CrewSos.vessel_id == vessel_id)
     strong_rows = strong_query.all() if agency_id is not None else []
-
-    vessels = db.query(Vessel).filter(Vessel.agent_id == agent_user_id)
-    if vessel_id is not None:
-        vessels = vessels.filter(Vessel.id == vessel_id)
 
     records: List[dict] = []
     seen = set()
@@ -766,21 +693,6 @@ def _agent_sos_records(db: Session, agent_user_id: int, vessel_id: Optional[int]
     for sos in strong_rows:
         append_record(sos, sos.vessel_id, sos.vessel)
 
-    # Compatibility path for pre-Release-1 rows that could not be backfilled.
-    # Strong rows never enter this branch, so current crew identity cannot move
-    # a stamped event between agencies.
-    for vessel in vessels.all():
-        crew_ids = vessel_crew_profile_ids(db, vessel)
-        if not crew_ids:
-            continue
-        sos_rows = db.query(CrewSos).filter(
-            CrewSos.agency_id.is_(None),
-            CrewSos.crew_profile_id.in_(crew_ids),
-        ).all()
-        for sos in crew_linkage.filter_records_for_vessel(
-            vessel, sos_rows, lambda row: row.vessel,
-        ):
-            append_record(sos, vessel.id, vessel.name)
     return records
 
 
@@ -795,7 +707,7 @@ def agent_safety_report_records(
         raise HTTPException(status_code=403, detail="Only agents can view reports")
     from app.db.models.crew_sos import CrewSos
     from app.db.models.vessel import Vessel
-    from app.services.crew_linkage import vessel_crew_profile_ids
+    from app.db.models.agent_profile import AgentProfile
 
     vessel = db.query(Vessel).filter(
         Vessel.id == vessel_id, Vessel.agent_id == current_user.id,
@@ -803,26 +715,19 @@ def agent_safety_report_records(
     if not vessel:
         raise HTTPException(status_code=404, detail="Vessel not found")
 
-    incidents = db.query(Incident).filter(Incident.vessel_id == vessel.id).all()
-    # Matching the manifest on HPID alone dropped crew whose registration
-    # spelled their nationality differently, so their SOS never reached this
-    # feed — and the only trace of the emergency was the Incident the SOS used
-    # to mirror, which is why the vessel page labelled it "Incident".
-    crew_ids = vessel_crew_profile_ids(db, vessel)
-    sos_rows = db.query(CrewSos).filter(CrewSos.vessel_id == vessel.id).all()
-    legacy_sos = db.query(CrewSos).filter(
-        CrewSos.agency_id.is_(None),
-        CrewSos.vessel_id.is_(None),
-        CrewSos.crew_profile_id.in_(crew_ids),
-    ).all() if crew_ids else []
-    # Honour the vessel each SOS was raised on, so a crew member joining a new
-    # ship does not drag their previous ship's emergencies onto this report.
-    from app.services import crew_linkage as _linkage
-    sos_rows.extend(
-        _linkage.filter_records_for_vessel(
-            vessel, legacy_sos, lambda row: row.vessel
-        )
-    )
+    agency_id = db.query(AgentProfile.id).filter(
+        AgentProfile.user_id == current_user.id
+    ).scalar()
+    if agency_id is None:
+        raise HTTPException(status_code=403, detail="Agent profile not found")
+    incidents = db.query(Incident).filter(
+        Incident.vessel_id == vessel.id,
+        Incident.agency_id == agency_id,
+    ).all()
+    sos_rows = db.query(CrewSos).filter(
+        CrewSos.vessel_id == vessel.id,
+        CrewSos.agency_id == agency_id,
+    ).all()
 
     records = [{
         "kind": "incident", "id": item.id, "reference": item.incident_id,

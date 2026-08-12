@@ -18,6 +18,7 @@ import app.db.base  # noqa: F401 — registers every model on Base
 from sqlalchemy.orm import Session
 
 from app.api.v1.routes_agents import _agent_scope, get_dashboard_data
+from app.db.models.agent_profile import AgentProfile
 from app.db.models.cab_booking import BookingStatus, CabBooking
 from app.db.models.crew_profile import CrewProfile
 from app.db.models.incident import Incident, IncidentStatus, IncidentType
@@ -48,6 +49,11 @@ class AgentDashboardScopingTests(unittest.TestCase):
         agent = User(email=_uniq("agent") + "@example.com", hashed_password="x", role="agent")
         crew_user = User(email=_uniq("crew") + "@example.com", hashed_password="x", role="crew")
         self.db.add_all([agent, crew_user])
+        self.db.flush()
+        agent_profile = AgentProfile(
+            user_id=agent.id, agency_name=_uniq("Agency"), location="Test Port"
+        )
+        self.db.add(agent_profile)
         self.db.flush()
 
         hpid = _uniq("HP")
@@ -95,7 +101,7 @@ class AgentDashboardScopingTests(unittest.TestCase):
             )
 
         self.db.flush()
-        return SimpleNamespace(id=agent.id, role="agent", agent_profile=None), vessel
+        return SimpleNamespace(id=agent.id, role="agent", agent_profile=agent_profile), vessel
 
     def dashboard(self, agent_user):
         return get_dashboard_data(db=self.db, current_user=agent_user)
@@ -169,6 +175,9 @@ class AgentDashboardScopingTests(unittest.TestCase):
 
     def test_per_vessel_and_headline_incidents_use_canonical_vessel_link(self):
         agent, vessel = self.make_agent(live_trips=0, crew_ashore=0)
+        agent_profile = self.db.query(AgentProfile).filter(
+            AgentProfile.user_id == agent.id
+        ).one()
         self.db.add(Incident(
             incident_id=_uniq("INC"),
             type=IncidentType.CREW,
@@ -177,6 +186,8 @@ class AgentDashboardScopingTests(unittest.TestCase):
             status=IncidentStatus.ACTIVE,
             reporter_id="HP-NOT-IN-CURRENT-MANIFEST",
             vessel_id=vessel.id,
+            agency_id=agent_profile.id,
+            context_resolution="vessel_id",
         ))
         self.db.flush()
 

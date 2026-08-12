@@ -25,6 +25,7 @@ from app.api.v1.routes_sos import (
     list_sos_requests,
     update_sos_status,
 )
+from app.db.models.agent_profile import AgentProfile
 from app.db.models.crew_profile import CrewProfile
 from app.db.models.crew_sos import CrewSos, CrewSosTimelineEvent
 from app.db.models.user import User
@@ -59,6 +60,15 @@ class SosVesselScopingTests(unittest.TestCase):
         self.db.add_all([agent_user, crew_user])
         self.db.flush()
 
+        agent_profile = AgentProfile(
+            user_id=agent_user.id,
+            agency_name=_uniq("Agency"),
+            location="Shared Harbour",
+            assigned_port=self.PORT,
+        )
+        self.db.add(agent_profile)
+        self.db.flush()
+
         hpid = _uniq("HP")
         crew = CrewProfile(user_id=crew_user.id, full_name="Crew", rank="able_seaman",
                            nationality="IN", hpid=hpid, current_port=self.PORT)
@@ -69,15 +79,28 @@ class SosVesselScopingTests(unittest.TestCase):
         self.db.add(VesselCrew(vessel_id=vessel.id, name="Crew", rank="able_seaman", hp_id=hpid))
 
         sos = CrewSos(user_id=crew_user.id, crew_profile_id=crew.id,
-                      port_name=self.PORT, vessel=vessel.name, status="ACTIVE")
+                      port_name=self.PORT, vessel=vessel.name, status="ACTIVE",
+                      agency_id=agent_profile.id, vessel_id=vessel.id,
+                      context_resolution="vessel_id")
         self.db.add(sos)
         self.db.flush()
 
         agent = SimpleNamespace(
             id=agent_user.id, role="agent",
-            agent_profile=SimpleNamespace(assigned_port=self.PORT),
+            agent_profile=agent_profile,
         )
         return agent, sos
+
+    def test_unresolved_alert_is_superadmin_only(self):
+        self.sos_a.agency_id = None
+        self.sos_a.vessel_id = None
+        self.sos_a.context_resolution = "unresolved"
+        self.db.flush()
+
+        self.assertEqual(list_sos_requests(db=self.db, current_user=self.agent_a), [])
+        superadmin = SimpleNamespace(id=0, role="superadmin", agent_profile=None)
+        ids = {item["id"] for item in list_sos_requests(db=self.db, current_user=superadmin)}
+        self.assertIn(self.sos_a.id, ids)
 
     def test_agent_lists_only_their_own_crews_alerts(self):
         listed = list_sos_requests(db=self.db, current_user=self.agent_a)

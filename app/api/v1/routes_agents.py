@@ -359,20 +359,13 @@ def get_dashboard_data(
             CabBooking.status.in_(LIVE_TRIP_STATUSES)
         ).order_by(CabBooking.created_at.desc(), CabBooking.id.desc()).limit(5).all()
 
-    # Incidents raised by this agent's crew. Filtering by port would include
-    # every other agency berthed at the same port.
-    agent_hp_ids = [
-        c.hp_id
-        for c in db.query(VesselCrew.hp_id).filter(VesselCrew.vessel_id.in_(vessel_ids)).all()
-        if c.hp_id
-    ] if vessel_ids else []
-
+    # Safety records are historical events. Never infer ownership from whoever
+    # the crew member is assigned to now: unresolved legacy rows stay available
+    # to superadmins for reconciliation, but are not exposed to an agent.
     open_incidents = investigating_incidents = closed_incidents = 0
-    incident_scope = _current_event_scope(
-        Incident,
-        legacy_identity_clause=(
-            Incident.reporter_id.in_(agent_hp_ids) if agent_hp_ids else None
-        ),
+    incident_scope = (
+        and_(Incident.agency_id == agency_profile_id, Incident.vessel_id.in_(vessel_ids))
+        if agency_profile_id is not None and vessel_ids else None
     )
     if incident_scope is not None:
         agent_incidents = db.query(Incident).filter(incident_scope)
@@ -384,14 +377,12 @@ def get_dashboard_data(
             Incident.status == IncidentStatus.RESOLVED
         ).count()
 
-    # The tile is labelled "Open SOS/Incidents", so unresolved SOS alerts from
-    # this agent's crew belong in it too. They were not counted at all before.
+    # The tile is labelled "Open SOS/Incidents", so owned open SOS alerts are
+    # included beside incidents. Unresolved legacy alerts stay superadmin-only.
     open_sos = 0
-    sos_scope = _current_event_scope(
-        CrewSos,
-        legacy_identity_clause=(
-            CrewSos.crew_profile_id.in_(crew_profile_ids) if crew_profile_ids else None
-        ),
+    sos_scope = (
+        and_(CrewSos.agency_id == agency_profile_id, CrewSos.vessel_id.in_(vessel_ids))
+        if agency_profile_id is not None and vessel_ids else None
     )
     if sos_scope is not None:
         open_sos = db.query(CrewSos).filter(
@@ -461,41 +452,15 @@ def get_dashboard_data(
 
         # 3. SOS/Incidents of ship — the card says "SOS/Incidents", so count both.
         incidents = 0
-        incident_scope = [
-            Incident.vessel_call_id == current_call_id
-            if current_call_id is not None else False,
-            and_(
-                Incident.vessel_call_id.is_(None),
+        if agency_profile_id is not None:
+            incidents = db.query(Incident).filter(
+                Incident.agency_id == agency_profile_id,
                 Incident.vessel_id == v.id,
-            ),
-        ]
-        if crew_hpids:
-            incident_scope.append(and_(
-                Incident.vessel_call_id.is_(None),
-                Incident.vessel_id.is_(None),
-                Incident.reporter_id.in_(crew_hpids),
-            ))
-        incidents = db.query(Incident).filter(
-            or_(*incident_scope),
-            Incident.status.in_([IncidentStatus.ACTIVE, IncidentStatus.INVESTIGATING])
-        ).count()
-        if current_call_id is not None or vessel_crew_ids:
-            sos_scope = or_(
-                CrewSos.vessel_call_id == current_call_id
-                if current_call_id is not None else False,
-                and_(
-                    CrewSos.vessel_call_id.is_(None),
-                    or_(
-                        CrewSos.vessel_id == v.id,
-                        and_(
-                            CrewSos.vessel_id.is_(None),
-                            CrewSos.crew_profile_id.in_(vessel_crew_ids),
-                        ) if vessel_crew_ids else False,
-                    ),
-                ),
-            )
+                Incident.status.in_([IncidentStatus.ACTIVE, IncidentStatus.INVESTIGATING]),
+            ).count()
             incidents += db.query(CrewSos).filter(
-                sos_scope,
+                CrewSos.agency_id == agency_profile_id,
+                CrewSos.vessel_id == v.id,
                 CrewSos.closed_at.is_(None),
                 CrewSos.cancelled_at.is_(None),
             ).count()
@@ -1013,6 +978,11 @@ def shore_leave_report(
     ).first()
     if not vessel:
         raise HTTPException(status_code=404, detail="Vessel not found")
+    agent_profile = db.query(AgentProfile).filter(
+        AgentProfile.user_id == current_user.id
+    ).first()
+    if not agent_profile:
+        raise HTTPException(status_code=403, detail="Agent profile not found")
 
     # The reporting day is the port's calendar day. report_date arrives as the
     # agent typed it, on their calendar — not UTC's. The window is returned as
@@ -1024,7 +994,6 @@ def shore_leave_report(
         raise HTTPException(status_code=400, detail="report_date must be YYYY-MM-DD")
 
     manifest = db.query(VesselCrew).filter(VesselCrew.vessel_id == vessel.id).all()
-    hp_ids = [c.hp_id for c in manifest if c.hp_id]
     # The manifest decides who is aboard; an account is only how their own
     # records are found. Counting by crew profile alone dropped anyone who had
     # never registered — so a cab booked for three read as one person ashore.
@@ -1205,26 +1174,16 @@ def shore_leave_report(
         sum(person_minutes) / len(person_minutes) if person_minutes else None
     )
 
-    sos_scope = [CrewSos.vessel_id == vessel.id]
-    if crew_profile_ids:
-        sos_scope.append(and_(
-            CrewSos.vessel_id.is_(None),
-            CrewSos.crew_profile_id.in_(crew_profile_ids),
-        ))
     day_sos = db.query(CrewSos).filter(
-        or_(*sos_scope),
+        CrewSos.agency_id == agent_profile.id,
+        CrewSos.vessel_id == vessel.id,
         CrewSos.created_at >= day_start,
         CrewSos.created_at < day_end,
     ).all()
 
-    incident_scope = [Incident.vessel_id == vessel.id]
-    if hp_ids:
-        incident_scope.append(and_(
-            Incident.vessel_id.is_(None),
-            Incident.reporter_id.in_(hp_ids),
-        ))
     day_incidents = db.query(Incident).filter(
-        or_(*incident_scope),
+        Incident.agency_id == agent_profile.id,
+        Incident.vessel_id == vessel.id,
         Incident.created_at >= day_start,
         Incident.created_at < day_end,
     ).all()
@@ -1232,7 +1191,6 @@ def shore_leave_report(
 
     from app.services import incident_taxonomy as tax
 
-    agent_profile = current_user.agent_profile
     still_ashore = len(still_ashore_crew)
     resolved_incidents = sum(
         1 for incident in day_incidents
