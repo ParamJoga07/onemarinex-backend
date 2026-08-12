@@ -1240,3 +1240,48 @@ def shore_leave_report(
             for i in day_incidents
         ],
     )
+
+
+@router.post("/reports/shore-leave/{vessel_id}/snapshots")
+def create_shore_leave_report_snapshot(
+    vessel_id: int,
+    report_date: Optional[str] = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Freeze one shore-leave report without changing its source records."""
+    if current_user.role != "agent":
+        raise HTTPException(status_code=403, detail="Only agents can generate report snapshots")
+
+    report = shore_leave_report(
+        vessel_id=vessel_id,
+        report_date=report_date,
+        db=db,
+        current_user=current_user,
+    )
+    agent_profile = db.query(AgentProfile).filter(
+        AgentProfile.user_id == current_user.id
+    ).one()
+    vessel_call_id = db.query(VesselCall.id).filter(
+        VesselCall.vessel_id == vessel_id,
+        VesselCall.agency_id == agent_profile.id,
+    ).order_by(VesselCall.id.desc()).limit(1).scalar()
+
+    from app.services.report_snapshots import (
+        create_report_snapshot,
+        serialize_report_snapshot,
+    )
+
+    snapshot = create_report_snapshot(
+        db,
+        report_kind="shore_leave",
+        source_id=vessel_id,
+        source_reference=f"shore-leave:{vessel_id}:{report.report_date}",
+        agency_id=agent_profile.id,
+        vessel_call_id=vessel_call_id,
+        generated_by_user_id=current_user.id,
+        payload=report,
+    )
+    db.commit()
+    db.refresh(snapshot)
+    return serialize_report_snapshot(snapshot)

@@ -16,6 +16,7 @@ from app.db.models import vessel          # noqa: F401
 from app.db.models import vessel_crew     # noqa: F401
 from app.db.models import vessel_call     # noqa: F401
 from app.db.models import crew_assignment # noqa: F401
+from app.db.models import report_snapshot  # noqa: F401
 from app.db.models import rfq             # noqa: F401
 from app.db.models import rfq_quote       # noqa: F401
 from app.db.models import shore_pass      # noqa: F401

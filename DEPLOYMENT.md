@@ -106,6 +106,47 @@ and are not exposed to an agent by current-crew inference. Never "repair" them
 by assigning the crew member's present vessel. Release 1 has no destructive
 downgrade; roll the application back while leaving this additive schema intact.
 
+## Release 2: immutable report artifacts
+
+Release 2 starts only from the verified Release 1 head and adds one revision:
+
+```text
+m4n5o6p7q8r9
+  -> n5o6p7q8r9s0  immutable, checksummed report snapshots
+```
+
+Every Incident, SOS, and Shore Leave PDF download first writes the exact
+server-generated report payload to `report_snapshots`. Later changes to a crew
+profile, vessel assignment, timeline, or report calculation cannot rewrite an
+existing artifact. Generating the report again creates a new version instead
+of overwriting the earlier one. Agent reads remain agency-scoped; superadmins
+can retrieve snapshots that require reconciliation.
+
+After deploying the Release 2 backend code, run in the backend console:
+
+```bash
+python -m alembic current
+python -m alembic heads
+PYTHONPATH=. python scripts/preflight_release_two.py
+python -m app.db.migrate
+echo "migration_exit=$?"
+python -m alembic current
+python -m alembic heads
+PYTHONPATH=. python scripts/preflight_release_two.py
+```
+
+Before migration, `current` must be `m4n5o6p7q8r9 (head)` and `heads` must show
+only `n5o6p7q8r9s0 (head)`. Do not continue if preflight prints `BLOCKED`.
+After migration, both `current` and `heads` must show only:
+
+```text
+n5o6p7q8r9s0 (head)
+```
+
+This release is additive and does not rewrite existing operational records.
+It deliberately has no destructive downgrade, because generated report
+artifacts are audit records and must survive an application rollback.
+
 ## Before the first run, check the stamp
 
 ```sql
