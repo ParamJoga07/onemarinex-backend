@@ -109,6 +109,21 @@ def main() -> int:
                 FROM {table}
             """)).mappings().one()
             print(f"{table}_context:", dict(counts))
+            if counts["unresolved"]:
+                id_column = "booking_id" if table == "cab_bookings" else (
+                    "trip_id" if table == "crew_sos_requests" else "incident_id"
+                )
+                unresolved = connection.execute(text(f"""
+                    SELECT id, {id_column} AS reference, context_resolution
+                    FROM {table}
+                    WHERE vessel_call_id IS NULL
+                    ORDER BY id
+                    LIMIT 25
+                """)).mappings().all()
+                print(
+                    f"{table}_manual_reconciliation:",
+                    [dict(row) for row in unresolved],
+                )
 
         if "crew_assignments" in tables:
             ambiguous_assignments = connection.execute(text("""
