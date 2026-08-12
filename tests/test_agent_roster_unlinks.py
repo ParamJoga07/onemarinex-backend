@@ -131,6 +131,7 @@ class AgentRosterUnlinkTests(unittest.TestCase):
         self.assertEqual(result.action, "vessel_unlinked")
         canonical = self.db.query(Vessel).filter(Vessel.id == vessel_id).one()
         self.assertIsNone(canonical.agent_id)
+        self.assertEqual(canonical.status, "Archived")
         self.assertIsNotNone(
             self.db.query(Incident).filter(Incident.id == self.incident.id).first()
         )

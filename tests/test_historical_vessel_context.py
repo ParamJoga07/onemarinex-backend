@@ -4,18 +4,28 @@ import uuid
 from types import SimpleNamespace
 
 import pytest
+from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
 import app.db.base  # noqa: F401
 from app.api.v1.routes_sos import get_sos_timeline, list_sos_requests
-from app.api.v1.routes_incidents import agent_incident_detail, agent_incident_list
+from app.api.v1.routes_incidents import (
+    agent_incident_detail,
+    agent_incident_list,
+    agent_safety_report_records,
+)
 from app.api.v1.routes_agents import get_dashboard_data
-from app.api.v1.routes_superadmin import delete_vessel_superadmin
+from app.api.v1.routes_vessels import get_agent_vessel_call_history
+from app.api.v1.routes_superadmin import (
+    archive_vessel_superadmin,
+    delete_vessel_superadmin,
+)
 from app.db.models.agent_profile import AgentProfile
 from app.db.models.cab_booking import BookingStatus, CabBooking
 from app.db.models.crew_profile import CrewProfile
 from app.db.models.crew_sos import CrewSos
 from app.db.models.incident import Incident, IncidentStatus, IncidentType
+from app.db.models.report_snapshot import ReportSnapshot
 from app.db.models.user import User
 from app.db.models.vessel import Vessel
 from app.db.models.vessel_crew import VesselCrew
@@ -215,6 +225,13 @@ def test_same_crew_two_agencies_keeps_each_sos_with_its_original_call(db):
     listed_b = list_sos_requests(db=db, current_user=agent_b)
     assert [row["id"] for row in listed_a] == [old_sos.id]
     assert [row["id"] for row in listed_b] == [new_sos.id]
+    with pytest.raises(HTTPException) as denied_history:
+        agent_safety_report_records(
+            vessel_call_id=old_context["vessel_call"].id,
+            db=db,
+            current_user=agent_b,
+        )
+    assert denied_history.value.status_code == 404
 
     # Historical lists retain the old call, while the live dashboard is scoped
     # to vessels the agency is operating now.
@@ -290,9 +307,24 @@ def test_superadmin_remove_archives_vessel_and_preserves_sos(db):
     db.add(crew)
     db.flush()
     vessel, _, _ = _vessel_assignment(db, agent, agency, crew, "MV ARCHIVE")
-    sos = _sos(db, crew_user, crew, event_context(db, profile=crew, vessel=vessel))
+    context = event_context(db, profile=crew, vessel=vessel)
+    sos = _sos(db, crew_user, crew, context)
+    incident = _incident(db, crew, context)
+    booking = _booking(db, crew, context)
+    snapshot = ReportSnapshot(
+        report_kind="incident",
+        source_id=incident.id,
+        source_reference=incident.incident_id,
+        agency_id=agency.id,
+        vessel_call_id=context["vessel_call"].id,
+        generated_by_user_id=agent.id,
+        payload={"vessel": {"name": vessel.name}},
+        payload_sha256="0" * 64,
+    )
+    db.add(snapshot)
+    db.flush()
 
-    delete_vessel_superadmin(
+    archive_vessel_superadmin(
         vessel_id=vessel.id,
         db=db,
         current_user=SimpleNamespace(role="superadmin"),
@@ -302,7 +334,66 @@ def test_superadmin_remove_archives_vessel_and_preserves_sos(db):
     assert vessel.agent_id is None
     assert vessel.status == "Archived"
     assert db.query(CrewSos).filter(CrewSos.id == sos.id).one().vessel_call_id
+    assert db.query(Incident).filter(Incident.id == incident.id).one().vessel_call_id
+    assert db.query(CabBooking).filter(CabBooking.id == booking.id).one().vessel_call_id
+    assert db.query(ReportSnapshot).filter(ReportSnapshot.id == snapshot.id).one()
     assert sos.vessel_call.ended_at is not None
+    history = get_agent_vessel_call_history(current_user=agent, db=db)
+    archived = next(
+        row for row in history if row["vessel_call_id"] == context["vessel_call"].id
+    )
+    assert archived["status"] == "ARCHIVED"
+    assert archived["trip_count"] == 1
+    assert archived["incident_count"] == 1
+    assert archived["sos_count"] == 1
+    assert archived["report_count"] == 1
+    safety_reports = agent_safety_report_records(
+        vessel_call_id=context["vessel_call"].id,
+        db=db,
+        current_user=agent,
+    )
+    assert safety_reports["vessel"]["name"] == vessel.name
+    assert {row["reference"] for row in safety_reports["records"]} == {
+        incident.incident_id,
+        f"SOS-{sos.id}",
+    }
+
+
+def test_superadmin_hard_delete_is_rejected_and_history_is_unchanged(db):
+    agent, agency = _agent(db, "Delete Guard Agency")
+    crew_user = User(
+        email=f"{_uniq('crew')}@example.com",
+        hashed_password="x",
+        role="crew",
+    )
+    db.add(crew_user)
+    db.flush()
+    crew = CrewProfile(
+        user_id=crew_user.id,
+        full_name="Delete Guard Crew",
+        rank="officer",
+        nationality="IN",
+        hpid=_uniq("HP"),
+    )
+    db.add(crew)
+    db.flush()
+    vessel, _manifest, assignment = _vessel_assignment(
+        db, agent, agency, crew, "MV DELETE GUARD"
+    )
+    call = assignment.vessel_call
+    sos = _sos(db, crew_user, crew, event_context(db, profile=crew, vessel=vessel))
+
+    with pytest.raises(HTTPException) as error:
+        delete_vessel_superadmin(
+            vessel_id=vessel.id,
+            db=db,
+            current_user=SimpleNamespace(role="superadmin"),
+        )
+
+    assert error.value.status_code == 409
+    assert db.query(Vessel).filter(Vessel.id == vessel.id).one()
+    assert db.query(CrewSos).filter(CrewSos.id == sos.id).one()
+    assert call.ended_at is None
 
 
 def test_deleting_crew_profile_does_not_delete_safety_history(db):

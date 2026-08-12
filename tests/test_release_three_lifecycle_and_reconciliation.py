@@ -18,7 +18,12 @@ from app.api.v1.routes_superadmin import (
     reconcile_historical_context,
 )
 from app.db.models.crew_assignment import CrewAssignment
-from app.api.v1.routes_vessels import VesselIn, get_agent_vessel_call_history
+from app.api.v1.routes_vessels import (
+    VesselIn,
+    get_agent_vessel_call_history,
+    get_public_vessels,
+    get_vessels,
+)
 from app.db.models.agent_profile import AgentProfile
 from app.db.models.event_context_reconciliation import EventContextReconciliation
 from app.db.models.incident import Incident, IncidentStatus, IncidentType
@@ -107,6 +112,29 @@ def test_departure_finishes_call_at_etd_and_history_remains_agent_visible(db):
     assert row["vessel_name"] == vessel.name
     assert row["status"] == "DEPARTED"
     assert agency.id == call.agency_id
+
+
+def test_read_models_use_server_time_without_mutating_the_database(db):
+    now = datetime.now(timezone.utc)
+    agent, _agency, vessel, call = _agent_and_vessel(
+        db, etd=now - timedelta(minutes=5)
+    )
+    db.flush()
+
+    agent_rows = get_vessels(current_user=agent, db=db)
+    superadmin_rows = list_all_vessels_superadmin(
+        current_user=type("Superadmin", (), {"role": "superadmin"})(),
+        db=db,
+    )
+    public_rows = get_public_vessels(current_user=agent, db=db)
+    history = get_agent_vessel_call_history(current_user=agent, db=db)
+
+    assert next(row for row in agent_rows if row.id == vessel.id).status == "Departed"
+    assert next(row for row in superadmin_rows if row.id == vessel.id).status == "Departed"
+    assert vessel.id not in {row.id for row in public_rows}
+    assert next(row for row in history if row["vessel_call_id"] == call.id)["status"] == "DEPARTED"
+    assert db.query(Vessel.status).filter(Vessel.id == vessel.id).scalar() == "Active"
+    assert call.ended_at is None
 
 
 def test_agent_history_does_not_expose_another_agencys_call(db):

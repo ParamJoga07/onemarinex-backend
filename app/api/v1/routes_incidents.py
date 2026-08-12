@@ -699,36 +699,80 @@ def _agent_sos_records(db: Session, agent_user_id: int, vessel_id: Optional[int]
 
 @router.get("/agent/reports")
 def agent_safety_report_records(
-    vessel_id: int,
+    vessel_id: Optional[int] = None,
+    vessel_call_id: Optional[int] = None,
     db: Session = Depends(get_db),
     current_user = Depends(get_current_user),
 ):
-    """Newest-first Incident/SOS report index for one owned vessel."""
+    """Newest-first safety records for a current vessel or historical call."""
     if current_user.role != "agent":
         raise HTTPException(status_code=403, detail="Only agents can view reports")
     from app.db.models.crew_sos import CrewSos
     from app.db.models.vessel import Vessel
+    from app.db.models.vessel_call import VesselCall
     from app.db.models.agent_profile import AgentProfile
 
-    vessel = db.query(Vessel).filter(
-        Vessel.id == vessel_id, Vessel.agent_id == current_user.id,
-    ).first()
-    if not vessel:
-        raise HTTPException(status_code=404, detail="Vessel not found")
+    vessel = None
+    if vessel_call_id is None:
+        if vessel_id is None:
+            raise HTTPException(status_code=422, detail="Choose a vessel or historical call")
+        vessel = db.query(Vessel).filter(
+            Vessel.id == vessel_id, Vessel.agent_id == current_user.id,
+        ).first()
+        if not vessel:
+            raise HTTPException(status_code=404, detail="Vessel not found")
 
     agency_id = db.query(AgentProfile.id).filter(
         AgentProfile.user_id == current_user.id
     ).scalar()
     if agency_id is None:
         raise HTTPException(status_code=403, detail="Agent profile not found")
-    incidents = db.query(Incident).filter(
-        Incident.vessel_id == vessel.id,
-        Incident.agency_id == agency_id,
-    ).all()
-    sos_rows = db.query(CrewSos).filter(
-        CrewSos.vessel_id == vessel.id,
-        CrewSos.agency_id == agency_id,
-    ).all()
+
+    if vessel_call_id is not None:
+        call = db.query(VesselCall).filter(
+            VesselCall.id == vessel_call_id,
+            VesselCall.agency_id == agency_id,
+        ).first()
+        if not call:
+            raise HTTPException(status_code=404, detail="Vessel call not found")
+        incidents = db.query(Incident).filter(
+            Incident.vessel_call_id == call.id,
+            Incident.agency_id == agency_id,
+        ).all()
+        sos_rows = db.query(CrewSos).filter(
+            CrewSos.vessel_call_id == call.id,
+            CrewSos.agency_id == agency_id,
+        ).all()
+        vessel_payload = {
+            "id": call.vessel_id,
+            "vessel_call_id": call.id,
+            "name": call.vessel_name,
+            "imo_number": call.imo_number,
+            "flag": call.flag,
+            "eta": call.eta,
+            "etd": call.etd,
+            "berth": None,
+            "port_name": call.port_name,
+        }
+    else:
+        assert vessel is not None
+        incidents = db.query(Incident).filter(
+            Incident.vessel_id == vessel.id,
+            Incident.agency_id == agency_id,
+        ).all()
+        sos_rows = db.query(CrewSos).filter(
+            CrewSos.vessel_id == vessel.id,
+            CrewSos.agency_id == agency_id,
+        ).all()
+        vessel_payload = {
+            "id": vessel.id,
+            "name": vessel.name,
+            "imo_number": vessel.imo_number,
+            "flag": vessel.flag,
+            "eta": vessel.eta,
+            "etd": vessel.etd,
+            "berth": vessel.berth_assignment,
+        }
 
     records = [{
         "kind": "incident", "id": item.id, "reference": item.incident_id,
@@ -762,11 +806,7 @@ def agent_safety_report_records(
         # Report generation time must be server-authoritative; a changed device
         # clock must not produce a misleading operational record.
         "generated_at": datetime.utcnow(),
-        "vessel": {
-            "id": vessel.id, "name": vessel.name, "imo_number": vessel.imo_number,
-            "flag": vessel.flag, "eta": vessel.eta, "etd": vessel.etd,
-            "berth": vessel.berth_assignment,
-        },
+        "vessel": vessel_payload,
         "records": records,
     }
 

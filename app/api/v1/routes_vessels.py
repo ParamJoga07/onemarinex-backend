@@ -364,6 +364,22 @@ class VesselOut(BaseModel):
     class Config:
         from_attributes = True
 
+
+def vessel_out(vessel: Vessel) -> VesselOut:
+    """Serialize lifecycle state from server time without writing during GET."""
+    from app.services.vessel_lifecycle import effective_vessel_status
+
+    output = VesselOut.model_validate(vessel)
+    agency_name = output.agency_name
+    if not agency_name and vessel.agent and getattr(vessel.agent, "agent_profile", None):
+        agency_name = vessel.agent.agent_profile.agency_name
+    return output.model_copy(
+        update={
+            "agency_name": agency_name,
+            "status": effective_vessel_status(vessel),
+        }
+    )
+
 class VesselPublicOut(BaseModel):
     id: int
     name: str
@@ -469,14 +485,7 @@ def get_vessels(current_user: User = Depends(get_current_user), db: Session = De
         raise HTTPException(status_code=403, detail="Only agents can access their vessels")
     
     vessels = db.query(Vessel).filter(Vessel.agent_id == current_user.id).all()
-    from app.services.vessel_lifecycle import synchronize_vessel_lifecycle
-
-    if synchronize_vessel_lifecycle(db, vessels):
-        db.commit()
-    for v in vessels:
-        if not v.agency_name and v.agent and hasattr(v.agent, "agent_profile") and v.agent.agent_profile:
-            v.agency_name = v.agent.agent_profile.agency_name
-    return vessels
+    return [vessel_out(vessel) for vessel in vessels]
 
 @router.get("/public", response_model=List[VesselPublicOut])
 def get_public_vessels(
@@ -484,9 +493,13 @@ def get_public_vessels(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    vessels = db.query(Vessel).all()
+    from app.services.vessel_lifecycle import effective_vessel_status
+
+    vessels = db.query(Vessel).filter(Vessel.agent_id.isnot(None)).all()
     out = []
     for v in vessels:
+        if effective_vessel_status(v) not in {"Active", "Departing"}:
+            continue
         agency = v.agency_name
         if not agency and v.agent and hasattr(v.agent, "agent_profile") and v.agent.agent_profile:
             agency = v.agent.agent_profile.agency_name
@@ -522,6 +535,7 @@ def get_agent_vessel_call_history(
     from app.db.models.incident import Incident
     from app.db.models.report_snapshot import ReportSnapshot
     from app.db.models.vessel_call import VesselCall
+    from app.services.vessel_lifecycle import effective_vessel_status
 
     agency_id = db.query(AgentProfile.id).filter(
         AgentProfile.user_id == current_user.id
@@ -531,11 +545,13 @@ def get_agent_vessel_call_history(
 
     calls = (
         db.query(VesselCall)
+        .outerjoin(Vessel, VesselCall.vessel_id == Vessel.id)
         .filter(
             VesselCall.agency_id == agency_id,
             or_(
                 VesselCall.ended_at.isnot(None),
                 VesselCall.status.in_(["DEPARTED", "ARCHIVED", "REASSIGNED"]),
+                Vessel.etd <= func.now(),
             ),
         )
         .order_by(
@@ -565,6 +581,13 @@ def get_agent_vessel_call_history(
     report_counts = _counts(ReportSnapshot)
     output = []
     for call in calls:
+        call_status = call.status
+        if (
+            call.ended_at is None
+            and call.vessel is not None
+            and effective_vessel_status(call.vessel) == "Departed"
+        ):
+            call_status = "DEPARTED"
         output.append({
             "vessel_call_id": call.id,
             "vessel_id": call.vessel_id,
@@ -576,7 +599,7 @@ def get_agent_vessel_call_history(
             "etd": call.etd,
             "started_at": call.started_at,
             "ended_at": call.ended_at,
-            "status": call.status,
+            "status": call_status,
             "trip_count": trip_counts.get(call.id, 0),
             "incident_count": incident_counts.get(call.id, 0),
             "sos_count": sos_counts.get(call.id, 0),
@@ -852,6 +875,7 @@ def unlink_vessel_from_agent(
     ))
     finish_vessel_call(db, vessel, status="ARCHIVED")
     vessel.agent_id = None
+    vessel.status = "Archived"
     db.commit()
     return RosterUnlinkOut(action="vessel_unlinked", vessel_id=vessel.id)
 

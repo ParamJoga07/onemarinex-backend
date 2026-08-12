@@ -1316,7 +1316,7 @@ class SuperAdminVesselCreate(BaseModel):
     etd: Optional[datetime] = None
     status: Literal["Active"] = "Active"
 
-from app.api.v1.routes_vessels import VesselOut, is_partnered_agency
+from app.api.v1.routes_vessels import VesselOut, is_partnered_agency, vessel_out
 
 @router.get("/vessels", response_model=List[VesselOut])
 def list_all_vessels_superadmin(
@@ -1324,13 +1324,14 @@ def list_all_vessels_superadmin(
     current_user: User = Depends(get_current_user)
 ):
     verify_superadmin(current_user)
-    vessels = db.query(Vessel).all()
-    for v in vessels:
-        if not v.agency_name and v.agent and hasattr(v.agent, "agent_profile") and v.agent.agent_profile:
-            v.agency_name = v.agent.agent_profile.agency_name
-        elif not v.agency_name:
-            v.agency_name = "Other"
-    return vessels
+    vessels = db.query(Vessel).order_by(Vessel.id.desc()).all()
+    output = []
+    for vessel in vessels:
+        serialized = vessel_out(vessel)
+        if not serialized.agency_name:
+            serialized = serialized.model_copy(update={"agency_name": "Other"})
+        output.append(serialized)
+    return output
 
 @router.post("/vessels", response_model=VesselOut, status_code=status.HTTP_201_CREATED)
 def create_vessel_superadmin(
@@ -1442,8 +1443,20 @@ def update_vessel_superadmin(
 
     return vessel
 
-@router.delete("/vessels/{vessel_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_vessel_superadmin(
+def _archive_vessel(db: Session, vessel: Vessel) -> VesselOut:
+    """Remove a vessel from current operations without destroying history."""
+    from app.services.historical_context import finish_vessel_call
+
+    finish_vessel_call(db, vessel, status="ARCHIVED")
+    vessel.agent_id = None
+    vessel.status = "Archived"
+    db.commit()
+    db.refresh(vessel)
+    return vessel_out(vessel)
+
+
+@router.post("/vessels/{vessel_id}/archive", response_model=VesselOut)
+def archive_vessel_superadmin(
     vessel_id: int,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
@@ -1453,16 +1466,24 @@ def delete_vessel_superadmin(
     if not vessel:
         raise HTTPException(status_code=404, detail="Vessel not found")
 
-    # Removing a ship from the operational roster is an archive action. The
-    # canonical vessel and its call history remain for SOS/incident/report
-    # audit; a destructive delete is not exposed through the ordinary UI.
-    from app.services.historical_context import finish_vessel_call
+    return _archive_vessel(db, vessel)
 
-    finish_vessel_call(db, vessel, status="ARCHIVED")
-    vessel.agent_id = None
-    vessel.status = "Archived"
-    db.commit()
-    return None
+
+@router.delete("/vessels/{vessel_id}", status_code=status.HTTP_409_CONFLICT)
+def delete_vessel_superadmin(
+    vessel_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """Reject destructive deletion; the archive endpoint is the safe lifecycle action."""
+    verify_superadmin(current_user)
+    vessel = db.query(Vessel).filter(Vessel.id == vessel_id).first()
+    if not vessel:
+        raise HTTPException(status_code=404, detail="Vessel not found")
+    raise HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail="Vessel hard deletion is disabled. Archive the vessel to preserve operational history.",
+    )
 
 @router.post("/agents/{agent_id}/vessels", response_model=VesselOut, status_code=status.HTTP_201_CREATED)
 def create_vessel_under_agent(
