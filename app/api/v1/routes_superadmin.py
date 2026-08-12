@@ -4,7 +4,7 @@ import os
 import shutil
 import uuid
 from sqlalchemy.orm import Session
-from sqlalchemy import func, or_, cast, String
+from sqlalchemy import String, cast, func, literal, or_, select, union_all
 from typing import List, Optional, Dict, Any
 from datetime import datetime
 from pydantic import BaseModel, Field
@@ -1317,10 +1317,6 @@ def list_all_vessels_superadmin(
 ):
     verify_superadmin(current_user)
     vessels = db.query(Vessel).all()
-    from app.services.vessel_lifecycle import synchronize_vessel_lifecycle
-
-    if synchronize_vessel_lifecycle(db, vessels):
-        db.commit()
     for v in vessels:
         if not v.agency_name and v.agent and hasattr(v.agent, "agent_profile") and v.agent.agent_profile:
             v.agency_name = v.agent.agent_profile.agency_name
@@ -1845,9 +1841,56 @@ def _needs_context_reconciliation(record, call) -> bool:
     return record.vessel_id != call.vessel_id or record.agency_id != call.agency_id
 
 
+def _unresolved_context_filter(model, vessel_call_model):
+    return or_(
+        model.vessel_call_id.is_(None),
+        model.vessel_id.is_(None),
+        model.agency_id.is_(None),
+        vessel_call_model.id.is_(None),
+        vessel_call_model.vessel_id.is_(None),
+        vessel_call_model.agency_id.is_(None),
+        model.vessel_id != vessel_call_model.vessel_id,
+        model.agency_id != vessel_call_model.agency_id,
+    )
+
+
+def _unresolved_context_select(model, vessel_call_model, *, kind: str):
+    reference = (
+        model.incident_id
+        if kind == "incident"
+        else literal("SOS-") + cast(model.id, String)
+    )
+    title = model.title if kind == "incident" else literal("Crew SOS alert")
+    reporter = model.reporter_id if kind == "incident" else model.crew_email
+    return (
+        select(
+            literal(kind).label("record_kind"),
+            model.id.label("record_id"),
+            reference.label("reference"),
+            model.created_at.label("created_at"),
+            title.label("title"),
+            model.trip_id.label("trip_id"),
+            reporter.label("reporter_reference"),
+            model.port_name.label("port_name"),
+            model.vessel_id.label("vessel_id"),
+            model.vessel_call_id.label("vessel_call_id"),
+            model.agency_id.label("agency_id"),
+            model.crew_assignment_id.label("crew_assignment_id"),
+            model.port_id.label("port_id"),
+            model.context_resolution.label("context_resolution"),
+        )
+        .outerjoin(vessel_call_model, vessel_call_model.id == model.vessel_call_id)
+        .where(_unresolved_context_filter(model, vessel_call_model))
+    )
+
+
 @router.get("/historical-context/unresolved")
 def list_unresolved_historical_context(
     record_kind: Optional[str] = None,
+    record_limit: int = 100,
+    record_offset: int = 0,
+    vessel_call_limit: int = 500,
+    vessel_call_offset: int = 0,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -1861,56 +1904,67 @@ def list_unresolved_historical_context(
     if kind and kind not in {"incident", "sos"}:
         raise HTTPException(status_code=400, detail="record_kind must be incident or sos")
 
-    calls = db.query(VesselCall).order_by(
-        VesselCall.started_at.desc(), VesselCall.id.desc()
-    ).all()
-    call_by_id = {call.id: call for call in calls}
-    records = []
+    if not 1 <= record_limit <= 500 or record_offset < 0:
+        raise HTTPException(status_code=422, detail="Invalid record pagination")
+    if not 1 <= vessel_call_limit <= 500 or vessel_call_offset < 0:
+        raise HTTPException(status_code=422, detail="Invalid vessel-call pagination")
 
+    record_selects = []
     if kind in {"", "incident"}:
-        for item in db.query(Incident).order_by(Incident.created_at.desc(), Incident.id.desc()).all():
-            call = call_by_id.get(item.vessel_call_id)
-            if _needs_context_reconciliation(item, call):
-                records.append({
-                    "record_kind": "incident",
-                    "record_id": item.id,
-                    "reference": item.incident_id,
-                    "created_at": item.created_at,
-                    "title": item.title,
-                    "trip_id": item.trip_id,
-                    "reporter_reference": item.reporter_id,
-                    "port_name": item.port_name,
-                    "current_context": _context_dict(item),
-                })
-
+        record_selects.append(_unresolved_context_select(Incident, VesselCall, kind="incident"))
     if kind in {"", "sos"}:
-        for item in db.query(CrewSos).order_by(CrewSos.created_at.desc(), CrewSos.id.desc()).all():
-            call = call_by_id.get(item.vessel_call_id)
-            if _needs_context_reconciliation(item, call):
-                records.append({
-                    "record_kind": "sos",
-                    "record_id": item.id,
-                    "reference": f"SOS-{item.id}",
-                    "created_at": item.created_at,
-                    "title": "Crew SOS alert",
-                    "trip_id": item.trip_id,
-                    "reporter_reference": item.crew_email,
-                    "port_name": item.port_name,
-                    "current_context": _context_dict(item),
-                })
+        record_selects.append(_unresolved_context_select(CrewSos, VesselCall, kind="sos"))
+
+    unresolved = (
+        union_all(*record_selects).subquery()
+        if len(record_selects) > 1
+        else record_selects[0].subquery()
+    )
+    record_total = db.execute(select(func.count()).select_from(unresolved)).scalar_one()
+    record_rows = db.execute(
+        select(unresolved)
+        .order_by(
+            unresolved.c.created_at.is_(None),
+            unresolved.c.created_at.desc(),
+            unresolved.c.record_id.desc(),
+        )
+        .offset(record_offset)
+        .limit(record_limit)
+    ).mappings().all()
+
+    calls_query = db.query(VesselCall).filter(
+        VesselCall.vessel_id.isnot(None),
+        VesselCall.agency_id.isnot(None),
+    ).order_by(VesselCall.started_at.desc(), VesselCall.id.desc())
+    vessel_call_total = calls_query.count()
+    calls = calls_query.offset(vessel_call_offset).limit(vessel_call_limit).all()
 
     agencies = {
         row.id: row.agency_name for row in db.query(AgentProfile.id, AgentProfile.agency_name).all()
     }
     return {
-        "records": sorted(
-            records,
-            key=lambda item: (
-                item["created_at"].timestamp() if item["created_at"] else 0,
-                item["record_id"],
-            ),
-            reverse=True,
-        ),
+        "records": [
+            {
+                "record_kind": row["record_kind"],
+                "record_id": row["record_id"],
+                "reference": row["reference"],
+                "created_at": row["created_at"],
+                "title": row["title"],
+                "trip_id": row["trip_id"],
+                "reporter_reference": row["reporter_reference"],
+                "port_name": row["port_name"],
+                "current_context": {
+                    "vessel_id": row["vessel_id"],
+                    "vessel_call_id": row["vessel_call_id"],
+                    "agency_id": row["agency_id"],
+                    "crew_assignment_id": row["crew_assignment_id"],
+                    "port_id": row["port_id"],
+                    "context_resolution": row["context_resolution"],
+                },
+            }
+            for row in record_rows
+        ],
+        "record_total": record_total,
         "vessel_calls": [
             {
                 "id": call.id,
@@ -1925,8 +1979,8 @@ def list_unresolved_historical_context(
                 "status": call.status,
             }
             for call in calls
-            if call.vessel_id is not None and call.agency_id is not None
         ],
+        "vessel_call_total": vessel_call_total,
     }
 
 
@@ -1990,6 +2044,11 @@ def reconcile_historical_context(
             CrewAssignment.id == record.crew_assignment_id,
             CrewAssignment.vessel_call_id == call.id,
         ).first()
+        if assignment is None:
+            raise HTTPException(
+                status_code=409,
+                detail="Record crew assignment belongs to a different vessel call",
+            )
 
     record.vessel_id = call.vessel_id
     record.vessel_call_id = call.id

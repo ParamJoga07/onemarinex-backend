@@ -2,7 +2,7 @@ from datetime import datetime
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File
 from pydantic import BaseModel
-from sqlalchemy import or_
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 from app.db.session import get_db
 from app.db.models.vessel import Vessel
@@ -505,12 +505,16 @@ def get_public_vessels(
 
 @router.get("/history/calls")
 def get_agent_vessel_call_history(
+    limit: int = 100,
+    offset: int = 0,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     """Departed/archived calls remain visible after a vessel leaves the roster."""
     if current_user.role != "agent":
         raise HTTPException(status_code=403, detail="Only agents can access vessel history")
+    if not 1 <= limit <= 500 or offset < 0:
+        raise HTTPException(status_code=422, detail="Invalid history pagination")
 
     from app.db.models.agent_profile import AgentProfile
     from app.db.models.cab_booking import CabBooking
@@ -535,8 +539,26 @@ def get_agent_vessel_call_history(
             ),
         )
         .order_by(VesselCall.ended_at.desc(), VesselCall.id.desc())
+        .offset(offset)
+        .limit(limit)
         .all()
     )
+    call_ids = [call.id for call in calls]
+
+    def _counts(model):
+        if not call_ids:
+            return {}
+        return dict(
+            db.query(model.vessel_call_id, func.count(model.id))
+            .filter(model.vessel_call_id.in_(call_ids))
+            .group_by(model.vessel_call_id)
+            .all()
+        )
+
+    trip_counts = _counts(CabBooking)
+    incident_counts = _counts(Incident)
+    sos_counts = _counts(CrewSos)
+    report_counts = _counts(ReportSnapshot)
     output = []
     for call in calls:
         output.append({
@@ -551,18 +573,10 @@ def get_agent_vessel_call_history(
             "started_at": call.started_at,
             "ended_at": call.ended_at,
             "status": call.status,
-            "trip_count": db.query(CabBooking).filter(
-                CabBooking.vessel_call_id == call.id
-            ).count(),
-            "incident_count": db.query(Incident).filter(
-                Incident.vessel_call_id == call.id
-            ).count(),
-            "sos_count": db.query(CrewSos).filter(
-                CrewSos.vessel_call_id == call.id
-            ).count(),
-            "report_count": db.query(ReportSnapshot).filter(
-                ReportSnapshot.vessel_call_id == call.id
-            ).count(),
+            "trip_count": trip_counts.get(call.id, 0),
+            "incident_count": incident_counts.get(call.id, 0),
+            "sos_count": sos_counts.get(call.id, 0),
+            "report_count": report_counts.get(call.id, 0),
         })
     return output
 

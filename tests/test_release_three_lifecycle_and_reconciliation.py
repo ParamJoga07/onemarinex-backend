@@ -12,8 +12,11 @@ from sqlalchemy.orm import Session
 import app.db.base  # noqa: F401
 from app.api.v1.routes_superadmin import (
     HistoricalContextResolutionIn,
+    list_all_vessels_superadmin,
+    list_unresolved_historical_context,
     reconcile_historical_context,
 )
+from app.db.models.crew_assignment import CrewAssignment
 from app.api.v1.routes_vessels import get_agent_vessel_call_history
 from app.db.models.agent_profile import AgentProfile
 from app.db.models.event_context_reconciliation import EventContextReconciliation
@@ -119,6 +122,44 @@ def test_agent_history_does_not_expose_another_agencys_call(db):
     assert other_agent.id != agent.id
 
 
+def test_agent_history_is_bounded_and_paginated(db):
+    agent, _agency, vessel, first_call = _agent_and_vessel(db)
+    finish_vessel_call(db, vessel, status="DEPARTED")
+    second_call = active_vessel_call(db, vessel)
+    finish_vessel_call(db, vessel, status="DEPARTED")
+    db.flush()
+
+    first_page = get_agent_vessel_call_history(
+        limit=1,
+        offset=0,
+        current_user=agent,
+        db=db,
+    )
+    second_page = get_agent_vessel_call_history(
+        limit=1,
+        offset=1,
+        current_user=agent,
+        db=db,
+    )
+    assert [item["vessel_call_id"] for item in first_page] == [second_call.id]
+    assert [item["vessel_call_id"] for item in second_page] == [first_call.id]
+
+
+def test_superadmin_vessel_list_does_not_write_lifecycle(db):
+    now = datetime.now(timezone.utc)
+    _agent, _agency, vessel, call = _agent_and_vessel(
+        db,
+        etd=now - timedelta(minutes=5),
+    )
+    admin = User(email=f"{_uniq('admin')}@example.com", hashed_password="x", role="superadmin")
+    db.add(admin)
+    db.flush()
+
+    list_all_vessels_superadmin(db=db, current_user=admin)
+    assert vessel.status == "Active"
+    assert call.ended_at is None
+
+
 def test_manual_reconciliation_updates_context_and_writes_audit(db):
     _agent, agency, vessel, call = _agent_and_vessel(db)
     incident = Incident(
@@ -156,6 +197,78 @@ def test_manual_reconciliation_updates_context_and_writes_audit(db):
     assert audit.reconciled_by_user_id == admin.id
 
 
+def test_reconciliation_queue_filters_and_paginates_in_database(db):
+    _agent, _agency, _vessel, _call = _agent_and_vessel(db)
+    admin = User(email=f"{_uniq('admin')}@example.com", hashed_password="x", role="superadmin")
+    incidents = [
+        Incident(
+            incident_id=_uniq("INC"),
+            type=IncidentType.CREW,
+            title=f"Legacy event {index}",
+            description="Needs reviewed historical ownership.",
+            status=IncidentStatus.ACTIVE,
+            context_resolution="unresolved",
+            created_at=datetime(2099, 1, index + 1, tzinfo=timezone.utc),
+        )
+        for index in range(3)
+    ]
+    db.add_all([admin, *incidents])
+    db.flush()
+
+    page = list_unresolved_historical_context(
+        record_kind="incident",
+        record_limit=2,
+        record_offset=0,
+        vessel_call_limit=1,
+        vessel_call_offset=0,
+        db=db,
+        current_user=admin,
+    )
+    assert [row["record_id"] for row in page["records"]] == [incidents[2].id, incidents[1].id]
+    assert page["record_total"] >= 3
+    assert len(page["vessel_calls"]) <= 1
+    assert page["vessel_call_total"] >= len(page["vessel_calls"])
+
+
+def test_reconciliation_rejects_conflicting_crew_assignment(db):
+    _agent, _agency, _vessel, selected_call = _agent_and_vessel(db)
+    _other_agent, _other_agency, _other_vessel, assignment_call = _agent_and_vessel(db)
+    assignment = CrewAssignment(
+        vessel_call_id=assignment_call.id,
+        crew_name="Historical Crew",
+    )
+    incident = Incident(
+        incident_id=_uniq("INC"),
+        type=IncidentType.CREW,
+        title="Contradictory legacy event",
+        description="The assignment must be reviewed separately.",
+        status=IncidentStatus.ACTIVE,
+        crew_assignment_id=None,
+        context_resolution="unresolved",
+    )
+    admin = User(email=f"{_uniq('admin')}@example.com", hashed_password="x", role="superadmin")
+    db.add_all([assignment, incident, admin])
+    db.flush()
+    incident.crew_assignment_id = assignment.id
+    db.flush()
+
+    with pytest.raises(HTTPException) as conflict:
+        reconcile_historical_context(
+            record_kind="incident",
+            record_id=incident.id,
+            body=HistoricalContextResolutionIn(
+                vessel_call_id=selected_call.id,
+                evidence_type="agency_confirmation",
+                notes="Agency evidence conflicts with the stored crew assignment.",
+            ),
+            db=db,
+            current_user=admin,
+        )
+    assert conflict.value.status_code == 409
+    assert incident.vessel_call_id is None
+    assert incident.crew_assignment_id == assignment.id
+
+
 def test_agent_cannot_reconcile_historical_context(db):
     agent, _agency, _vessel, call = _agent_and_vessel(db)
     incident = Incident(
@@ -188,3 +301,11 @@ def test_reconciliation_migration_preserves_audit_on_rollback():
     assert '"event_context_reconciliations"' in source
     assert "ondelete=\"SET NULL\"" in source
     assert "pass" in source.split("def downgrade():", 1)[1]
+
+
+def test_lifecycle_script_uses_one_clock_and_rolls_back_dry_runs():
+    source = (ROOT / "scripts/sync_vessel_lifecycle.py").read_text()
+    assert "now = datetime.now(timezone.utc)" in source
+    assert "effective_vessel_status(vessel, now=now)" in source
+    assert "synchronize_vessel_lifecycle(db, vessels, now=now)" in source
+    assert source.count("db.rollback()") >= 3
