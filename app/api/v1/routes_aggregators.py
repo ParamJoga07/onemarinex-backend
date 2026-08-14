@@ -11,6 +11,7 @@ from app.db.models.cab_booking import CabBooking, BookingStatus, RideType
 from app.db.models.driver_magic_link import DriverMagicLink
 from app.db.models.driver import Driver
 from app.db.models.crew_profile import CrewProfile
+from app.db.models.vessel_call import VesselCall
 from app.db.models.pricing_controls import PricingDuration, PricingRideType, PricingRule, PricingVehicleCategory
 from app.db.models.booking_timeline import BookingTimeline, TimelineEventType
 from app.api.v1.routes_auth import get_current_user
@@ -287,10 +288,11 @@ def get_aggregator_dashboard(
             DriverMagicLink.token.label("magic_token"),
             CrewProfile.full_name.label("crew_name"),
             CrewProfile.hpid.label("crew_hpid"),
-            CrewProfile.vessel.label("crew_vessel"),
+            VesselCall.vessel_name.label("crew_vessel"),
         )
         .outerjoin(DriverMagicLink, DriverMagicLink.booking_id == CabBooking.id)
         .outerjoin(CrewProfile, CabBooking.crew_id == CrewProfile.id)
+        .outerjoin(VesselCall, CabBooking.vessel_call_id == VesselCall.id)
         .filter(
             or_(
                 CabBooking.provider_id == agg_profile.id,

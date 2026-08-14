@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Float, DateTime, JSON, ForeignKey, Enum as SQLEnum, Numeric
+from sqlalchemy import Column, Integer, String, Float, DateTime, JSON, ForeignKey, Enum as SQLEnum, Numeric, Index, text
 from sqlalchemy.orm import relationship
 from datetime import datetime
 import enum
@@ -36,6 +36,15 @@ class VehicleType(str, enum.Enum):
 
 class CabBooking(Base):
     __tablename__ = "cab_bookings"
+    __table_args__ = (
+        Index(
+            "uq_cab_bookings_crew_idempotency_key",
+            "crew_id",
+            "client_idempotency_key",
+            unique=True,
+            postgresql_where=text("client_idempotency_key IS NOT NULL"),
+        ),
+    )
 
     id = Column(Integer, primary_key=True, index=True)
     booking_id = Column(String, unique=True, index=True, nullable=False)
@@ -64,6 +73,8 @@ class CabBooking(Base):
         nullable=True,
         index=True,
     )
+    vessel_call = relationship("VesselCall")
+    crew_assignment = relationship("CrewAssignment")
     agency_id = Column(
         Integer, ForeignKey("agent_profiles.id", ondelete="SET NULL"), nullable=True, index=True
     )
@@ -71,6 +82,11 @@ class CabBooking(Base):
         Integer, ForeignKey("ports.id", ondelete="SET NULL"), nullable=True, index=True
     )
     context_resolution = Column(String(32), nullable=True)
+    # A retry of the same client action must return this booking instead of
+    # creating another provider broadcast. The payload fingerprint prevents a
+    # caller from accidentally reusing the key for a different journey.
+    client_idempotency_key = Column(String(64), nullable=True, index=True)
+    request_fingerprint = Column(String(64), nullable=True)
 
     pickup_address = Column(String, nullable=False)
     pickup_lat = Column(Float, nullable=False)

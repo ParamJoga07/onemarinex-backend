@@ -142,28 +142,53 @@ def create_or_refresh_magic_link(
     aggregator_id: Optional[int],
     itinerary_stops: Optional[List[Dict[str, Any]]] = None,
 ) -> DriverMagicLink:
-    token = secrets.token_urlsafe(24)
     stops = _normalize_itinerary_stops(booking, itinerary_stops)
 
-    magic_link = db.query(DriverMagicLink).filter(DriverMagicLink.booking_id == booking.id).first()
+    # Serialize creation per booking before generating/resetting anything. The
+    # unique constraint remains the final boundary for old/non-Postgres DBs.
+    bind = db.get_bind()
+    if bind is not None and bind.dialect.name == "postgresql":
+        from sqlalchemy import text
+
+        db.execute(
+            text("SELECT pg_advisory_xact_lock(:lock_key)"),
+            {"lock_key": int(booking.id)},
+        )
+    magic_link = (
+        db.query(DriverMagicLink)
+        .filter(DriverMagicLink.booking_id == booking.id)
+        .first()
+    )
     if magic_link:
-        magic_link.token = token
-        magic_link.created_by_aggregator_id = aggregator_id
+        # Idempotent retries return the original URL. Rotating its token would
+        # invalidate a link the driver may already have open.
+        if magic_link.created_by_aggregator_id is None:
+            magic_link.created_by_aggregator_id = aggregator_id
         magic_link.itinerary_stops = stops
-        magic_link.otp_verified_at = None
-        magic_link.otp_failed_attempts = 0
-        magic_link.otp_last_attempt_at = None
-        magic_link.otp_locked_until = None
     else:
         magic_link = DriverMagicLink(
             booking_id=booking.id,
-            token=token,
+            token=secrets.token_urlsafe(24),
             created_by_aggregator_id=aggregator_id,
             itinerary_stops=stops,
         )
         db.add(magic_link)
 
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        magic_link = (
+            db.query(DriverMagicLink)
+            .filter(DriverMagicLink.booking_id == booking.id)
+            .first()
+        )
+        if magic_link is None:
+            raise exc
+        magic_link.itinerary_stops = stops
+        if magic_link.created_by_aggregator_id is None:
+            magic_link.created_by_aggregator_id = aggregator_id
+        db.commit()
     db.refresh(magic_link)
     return magic_link
 
@@ -255,7 +280,9 @@ def serialize_magic_link_public_payload(magic_link: DriverMagicLink) -> Dict[str
         "crew": {
             "name": booking.crew.full_name if booking.crew else None,
             "hp_id": booking.crew.hpid if booking.crew else None,
-            "vessel": booking.crew.vessel if booking.crew else None,
+            "vessel": (
+                booking.vessel_call.vessel_name if booking.vessel_call else None
+            ),
         },
         "aggregator": {
             "name": booking.aggregator_name,

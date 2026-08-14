@@ -29,6 +29,7 @@ from app.db.models.user import User
 from app.db.models.vessel import Vessel
 from app.db.models.vessel_crew import VesselCrew
 from app.db.session import engine
+from app.services.historical_context import assignment_for_manifest
 
 
 def _uniq(prefix):
@@ -36,7 +37,7 @@ def _uniq(prefix):
 
 
 def run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+    return asyncio.run(coro)
 
 
 class SafetyCenterTests(unittest.TestCase):
@@ -75,9 +76,15 @@ class SafetyCenterTests(unittest.TestCase):
                         vessel_type="Bulk Carrier", status="Active")
         self.db.add_all([crew, vessel])
         self.db.flush()
-        self.db.add(VesselCrew(vessel_id=vessel.id, name="Test Crew",
-                               rank="third_officer", hp_id=hpid))
+        manifest = VesselCrew(
+            vessel_id=vessel.id,
+            name="Test Crew",
+            rank="third_officer",
+            hp_id=hpid,
+        )
+        self.db.add(manifest)
         self.db.flush()
+        assignment_for_manifest(self.db, vessel, manifest, profile=crew)
 
         agent = SimpleNamespace(
             id=agent_user.id, role="agent", name="Agent", agent_profile=agent_profile
@@ -104,6 +111,33 @@ class SafetyCenterTests(unittest.TestCase):
             estimated_price=500, distance_km=8, num_passengers=1,
         )
         self.db.add(booking)
+        self.db.flush()
+        return booking
+
+    def make_assignment_scoped_trip(self, crew_actor, suffix="scoped-trip"):
+        booking = self.make_trip(crew_actor, suffix)
+        crew = self.db.query(CrewProfile).filter(
+            CrewProfile.user_id == crew_actor.id
+        ).one()
+        manifest = self.db.query(VesselCrew).filter(
+            VesselCrew.hp_id == crew.hpid
+        ).one()
+        vessel = self.db.query(Vessel).filter(Vessel.id == manifest.vessel_id).one()
+        from app.services.historical_context import (
+            active_vessel_call,
+            assignment_for_manifest,
+        )
+
+        call = active_vessel_call(self.db, vessel)
+        assignment = assignment_for_manifest(
+            self.db, vessel, manifest, profile=crew
+        )
+        booking.crew_assignment_id = assignment.id
+        booking.vessel_call_id = call.id
+        booking.vessel_id = call.vessel_id
+        booking.agency_id = call.agency_id
+        booking.port_id = call.port_id
+        booking.context_resolution = "assignment"
         self.db.flush()
         return booking
 
@@ -164,12 +198,40 @@ class SafetyCenterTests(unittest.TestCase):
         self.assertIsNone(incident.aggregator_id)
         self.assertEqual(incident.vessel_id, self.vessel_a.id)
 
-    def test_crew_can_explicitly_attach_own_trip(self):
+    def test_superadmin_can_manage_detail_without_weakening_agent_scope(self):
+        created = self.raise_incident(
+            self.crew_a, category="general_support"
+        )
+        superadmin = SimpleNamespace(
+            id=999999, role="superadmin", name="Super Admin"
+        )
+
+        detail = ri.agent_incident_detail(
+            created["id"], db=self.db, current_user=superadmin
+        )
+        self.assertEqual(detail["incident"]["id"], created["id"])
+        with self.assertRaises(HTTPException) as hidden:
+            ri.agent_incident_detail(
+                created["id"], db=self.db, current_user=self.agent_b
+            )
+        self.assertEqual(hidden.exception.status_code, 404)
+
+    def test_legacy_trip_without_assignment_context_is_rejected(self):
         booking = self.make_trip(self.crew_a)
+        with self.assertRaises(HTTPException) as ctx:
+            self.raise_incident(
+                self.crew_a, category="general_support", trip_id=booking.booking_id
+            )
+        self.assertEqual(ctx.exception.status_code, 409)
+
+    def test_crew_can_explicitly_attach_own_assignment_scoped_trip(self):
+        booking = self.make_assignment_scoped_trip(self.crew_a)
         result = self.raise_incident(
             self.crew_a, category="general_support", trip_id=booking.booking_id
         )
         self.assertEqual(result["trip_id"], booking.booking_id)
+        incident = self.db.query(Incident).filter(Incident.id == result["id"]).one()
+        self.assertEqual(incident.crew_assignment_id, booking.crew_assignment_id)
 
     def test_crew_cannot_attach_another_crews_trip(self):
         other_trip = self.make_trip(self.crew_b)
@@ -214,12 +276,9 @@ class SafetyCenterTests(unittest.TestCase):
         self.vessel_a.agent_id = None
         self.db.flush()
 
-        result = self.raise_incident(self.crew_a, category="general_support")
-
-        self.assertEqual(result["vessel_id"], self.vessel_a.id)
-        self.assertEqual(result["routing_status"], "superadmin_follow_up")
-        self.assertIn("retained", result["routing_message"].lower())
-        self.assertIsNotNone(self.db.get(Incident, result["id"]))
+        with self.assertRaises(HTTPException) as ctx:
+            self.raise_incident(self.crew_a, category="general_support")
+        self.assertEqual(ctx.exception.status_code, 409)
 
     # -- timeline ---------------------------------------------------------
 

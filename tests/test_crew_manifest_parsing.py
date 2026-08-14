@@ -321,6 +321,180 @@ class ManifestSaveTests(unittest.TestCase):
         self.assertIn("Someone", ctx.exception.detail)
         self.assertIn("Atlantean", ctx.exception.detail)
 
+    def test_bulk_manifest_is_idempotent_and_scopes_pass_to_assignment(self):
+        from app.db.models.crew_assignment import CrewAssignment
+        from app.db.models.crew_profile import CrewProfile
+        from app.db.models.shore_pass import ShorePass
+        from app.db.models.user import User
+        from app.db.models.vessel_crew import VesselCrew
+
+        self.vessel.agency_name = "Partner Shipping"
+        suffix = uuid.uuid4().hex[:10]
+        user = User(
+            email=f"crew-{suffix}@example.com",
+            hashed_password="x",
+            role="crew",
+        )
+        self.db.add(user)
+        self.db.flush()
+        profile = CrewProfile(
+            user_id=user.id,
+            full_name="Verified Crew",
+            rank="able_seaman",
+            nationality="IN",
+            passport_number="IDEMP123",
+            hpid=f"HP-STABLE-{suffix}",
+        )
+        self.db.add(profile)
+        self.db.flush()
+        rows = [
+            cm.ParsedCrewRow(
+                name="Verified Crew",
+                rank="AB",
+                nationality="INDIAN",
+                passport_number=" idemp 123 ",
+                shore_pass_eligible=True,
+            )
+        ]
+
+        self.assertEqual(self.save(rows), 1)
+        self.assertEqual(self.save(rows), 1)
+
+        manifests = self.db.query(VesselCrew).filter(
+            VesselCrew.vessel_id == self.vessel.id
+        ).all()
+        self.assertEqual(len(manifests), 1)
+        self.assertEqual(manifests[0].hp_id, profile.hpid)
+        self.assertEqual(manifests[0].status, "Mapped")
+        assignments = self.db.query(CrewAssignment).filter(
+            CrewAssignment.vessel_crew_id == manifests[0].id,
+            CrewAssignment.ended_at.is_(None),
+        ).all()
+        self.assertEqual(len(assignments), 1)
+        self.assertEqual(assignments[0].crew_profile_id, profile.id)
+        passes = self.db.query(ShorePass).filter(
+            ShorePass.crew_profile_id == profile.id
+        ).all()
+        self.assertEqual(len(passes), 1)
+        self.assertEqual(passes[0].crew_assignment_id, assignments[0].id)
+        self.assertEqual(passes[0].vessel_call_id, assignments[0].vessel_call_id)
+
+    def test_bulk_manifest_refuses_a_passport_shared_by_profiles(self):
+        from fastapi import HTTPException
+        from app.db.models.crew_profile import CrewProfile
+        from app.db.models.user import User
+        from app.db.models.vessel_crew import VesselCrew
+
+        suffix = uuid.uuid4().hex[:10]
+        users = [
+            User(
+                email=f"conflict-{index}-{suffix}@example.com",
+                hashed_password="x",
+                role="crew",
+            )
+            for index in range(2)
+        ]
+        self.db.add_all(users)
+        self.db.flush()
+        self.db.add_all([
+            CrewProfile(
+                user_id=users[0].id,
+                full_name="First Person",
+                rank="master",
+                nationality="IN",
+                passport_number="SHARED999",
+                hpid=f"HP-FIRST-{suffix}",
+            ),
+            CrewProfile(
+                user_id=users[1].id,
+                full_name="Second Person",
+                rank="master",
+                nationality="PH",
+                passport_number="SHARED999",
+                hpid=f"HP-SECOND-{suffix}",
+            ),
+        ])
+        self.db.flush()
+
+        with self.assertRaises(HTTPException) as conflict:
+            self.save([
+                cm.ParsedCrewRow(
+                    name="First Person",
+                    rank="MASTER",
+                    nationality="INDIAN",
+                    passport_number="SHARED999",
+                )
+            ])
+
+        self.assertEqual(conflict.exception.status_code, 409)
+        self.assertIn("identity reconciliation", conflict.exception.detail["message"])
+        self.assertEqual(conflict.exception.detail["status"], "OPEN")
+        self.assertEqual(
+            self.db.query(VesselCrew).filter(
+                VesselCrew.vessel_id == self.vessel.id
+            ).count(),
+            0,
+        )
+
+    def test_late_bulk_conflict_does_not_commit_an_earlier_valid_row(self):
+        from fastapi import HTTPException
+        from app.db.models.crew_identity_conflict import CrewIdentityConflictRecord
+        from app.db.models.crew_profile import CrewProfile
+        from app.db.models.user import User
+        from app.db.models.vessel_crew import VesselCrew
+
+        suffix = uuid.uuid4().hex[:10]
+        users = [
+            User(
+                email=f"late-conflict-{index}-{suffix}@example.com",
+                hashed_password="x",
+                role="crew",
+            )
+            for index in range(2)
+        ]
+        self.db.add_all(users)
+        self.db.flush()
+        self.db.add_all([
+            CrewProfile(
+                user_id=users[0].id, full_name="First Candidate", rank="master",
+                nationality="IN", passport_number="LATE999",
+                hpid=f"HP-LATE-A-{suffix}",
+            ),
+            CrewProfile(
+                user_id=users[1].id, full_name="Second Candidate", rank="master",
+                nationality="PH", passport_number="LATE999",
+                hpid=f"HP-LATE-B-{suffix}",
+            ),
+        ])
+        self.db.flush()
+
+        with self.assertRaises(HTTPException) as conflict:
+            self.save([
+                cm.ParsedCrewRow(
+                    name="Valid First Row", rank="AB", nationality="INDIAN",
+                    passport_number=f"VALID-{suffix}",
+                ),
+                cm.ParsedCrewRow(
+                    name="First Candidate", rank="MASTER", nationality="INDIAN",
+                    passport_number="LATE999",
+                ),
+            ])
+
+        self.assertEqual(conflict.exception.status_code, 409)
+        self.assertEqual(
+            self.db.query(VesselCrew).filter(
+                VesselCrew.vessel_id == self.vessel.id
+            ).count(),
+            0,
+        )
+        self.assertEqual(
+            self.db.query(CrewIdentityConflictRecord).filter(
+                CrewIdentityConflictRecord.id
+                == conflict.exception.detail["identity_conflict_id"]
+            ).count(),
+            1,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

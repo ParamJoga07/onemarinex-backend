@@ -747,7 +747,7 @@ def get_agent_bookings(
         CrewProfile.id.label("crew_id"),
         func.coalesce(CrewAssignment.crew_name, CrewProfile.full_name).label("crew_name"),
         func.coalesce(CrewAssignment.hpid, CrewProfile.hpid).label("crew_hpid"),
-        func.coalesce(VesselCall.vessel_name, CrewProfile.vessel).label("crew_vessel"),
+        VesselCall.vessel_name.label("crew_vessel"),
         AggregatorProfile.company_name.label("provider_company_name"),
         AggregatorProfile.provider_type.label("provider_type"),
         Driver.name.label("assigned_driver_name"),
@@ -871,30 +871,53 @@ class AgentCrewDetailOut(BaseModel):
 @router.get("/crew/{hp_id}", response_model=AgentCrewDetailOut)
 def get_agent_crew_detail(
     hp_id: str,
+    vessel_id: Optional[int] = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     if current_user.role != "agent":
         raise HTTPException(status_code=403, detail="Only agents can access this")
 
-    # Find the VesselCrew record for this HPID on one of the agent's vessels
-    vessel_crew = db.query(VesselCrew).filter(VesselCrew.hp_id == hp_id).first()
-    vessel = None
-    if vessel_crew:
-        vessel = db.query(Vessel).filter(
-            Vessel.id == vessel_crew.vessel_id,
-            Vessel.agent_id == current_user.id
-        ).first()
-    if not vessel_crew or not vessel:
+    query = (
+        db.query(VesselCrew, Vessel)
+        .join(Vessel, Vessel.id == VesselCrew.vessel_id)
+        .filter(
+            func.upper(func.trim(VesselCrew.hp_id)) == hp_id.strip().upper(),
+            Vessel.agent_id == current_user.id,
+        )
+    )
+    if vessel_id is not None:
+        query = query.filter(Vessel.id == vessel_id)
+    matches = query.order_by(VesselCrew.id.desc()).all()
+    if not matches:
         raise HTTPException(status_code=404, detail="Crew not found in your vessels")
+    if len({vessel.id for _, vessel in matches}) > 1:
+        raise HTTPException(
+            status_code=409,
+            detail="Crew belongs to multiple vessels; select a vessel",
+        )
+    vessel_crew, vessel = matches[0]
 
-    crew_profile = db.query(CrewProfile).filter(CrewProfile.hpid == hp_id).first()
+    crew_profile = db.query(CrewProfile).filter(
+        func.upper(func.trim(CrewProfile.hpid)) == hp_id.strip().upper()
+    ).first()
 
     shore_pass = None
     if crew_profile:
-        shore_pass = db.query(ShorePass).filter(
-            ShorePass.crew_profile_id == crew_profile.id
-        ).order_by(ShorePass.created_at.desc()).first()
+        assignment = (
+            db.query(CrewAssignment)
+            .filter(
+                CrewAssignment.vessel_crew_id == vessel_crew.id,
+                CrewAssignment.crew_profile_id == crew_profile.id,
+            )
+            .order_by(CrewAssignment.started_at.desc(), CrewAssignment.id.desc())
+            .first()
+        )
+        if assignment:
+            shore_pass = db.query(ShorePass).filter(
+                ShorePass.crew_profile_id == crew_profile.id,
+                ShorePass.crew_assignment_id == assignment.id,
+            ).order_by(ShorePass.created_at.desc()).first()
 
     full_name = crew_profile.full_name if crew_profile else vessel_crew.name
     rank = crew_profile.rank if crew_profile else vessel_crew.rank
@@ -911,7 +934,7 @@ def get_agent_crew_detail(
         date_of_birth=date_of_birth,
         hpid=hp_id,
         current_port=crew_profile.current_port if crew_profile else None,
-        vessel=crew_profile.vessel if crew_profile else vessel.name,
+        vessel=vessel.name,
         vessel_id=vessel_crew.vessel_id,
         vessel_name=vessel.name,
         imo_number=vessel.imo_number,
@@ -973,6 +996,7 @@ class ShoreLeaveReportOut(BaseModel):
 def shore_leave_report(
     vessel_id: int,
     report_date: Optional[str] = None,
+    vessel_call_id: Optional[int] = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -980,16 +1004,38 @@ def shore_leave_report(
     if current_user.role != "agent":
         raise HTTPException(status_code=403, detail="Only agents can generate reports")
 
-    vessel = db.query(Vessel).filter(
-        Vessel.id == vessel_id, Vessel.agent_id == current_user.id
-    ).first()
-    if not vessel:
-        raise HTTPException(status_code=404, detail="Vessel not found")
     agent_profile = db.query(AgentProfile).filter(
         AgentProfile.user_id == current_user.id
     ).first()
     if not agent_profile:
         raise HTTPException(status_code=403, detail="Agent profile not found")
+    strict_call_scope = vessel_call_id is not None
+    call = None
+    if vessel_call_id is not None:
+        call = db.query(VesselCall).filter(
+            VesselCall.id == vessel_call_id,
+            VesselCall.vessel_id == vessel_id,
+            VesselCall.agency_id == agent_profile.id,
+        ).first()
+        if not call:
+            raise HTTPException(status_code=404, detail="Vessel call not found")
+        vessel = db.query(Vessel).filter(Vessel.id == call.vessel_id).first()
+    else:
+        vessel = db.query(Vessel).filter(
+            Vessel.id == vessel_id, Vessel.agent_id == current_user.id
+        ).first()
+        if vessel:
+            call = db.query(VesselCall).filter(
+                VesselCall.vessel_id == vessel.id,
+                VesselCall.agency_id == agent_profile.id,
+                VesselCall.ended_at.is_(None),
+            ).order_by(VesselCall.id.desc()).first()
+            if call is None:
+                from app.services.historical_context import active_vessel_call
+
+                call = active_vessel_call(db, vessel)
+    if not vessel or not call:
+        raise HTTPException(status_code=404, detail="Vessel call not found")
 
     # The reporting day is the port's calendar day. report_date arrives as the
     # agent typed it, on their calendar — not UTC's. The window is returned as
@@ -1000,21 +1046,23 @@ def shore_leave_report(
     except ValueError:
         raise HTTPException(status_code=400, detail="report_date must be YYYY-MM-DD")
 
-    manifest = db.query(VesselCrew).filter(VesselCrew.vessel_id == vessel.id).all()
     # The manifest decides who is aboard; an account is only how their own
     # records are found. Counting by crew profile alone dropped anyone who had
     # never registered — so a cab booked for three read as one person ashore.
     from app.services import crew_linkage
 
-    roster = crew_linkage.vessel_roster(db, vessel)
+    roster = crew_linkage.vessel_call_roster(db, call)
     crew_profile_ids = roster.profile_ids
     eligible_keys = roster.eligible_keys
 
+    # Shore passes predate vessel-call ownership. Use them only for the current
+    # call; historical reports must not guess which concurrent assignment a
+    # profile-level pass belonged to.
     passes = db.query(ShorePass).filter(
         ShorePass.crew_profile_id.in_(crew_profile_ids),
         ShorePass.out_time >= day_start,
         ShorePass.out_time < day_end,
-    ).all() if crew_profile_ids else []
+    ).all() if crew_profile_ids and call.ended_at is None else []
 
     # A trip belongs to the day it ran. That is what a shore pass's out_time
     # already means, and anchoring trips on created_at instead disagreed with
@@ -1025,12 +1073,15 @@ def shore_leave_report(
     # A trip that never started put nobody ashore and has no running time, so
     # it stays on the day it was booked rather than disappearing from the count.
     trip_start = func.coalesce(CabBooking.trip_started_at, CabBooking.started_at)
-    booking_scope = [CabBooking.vessel_id == vessel.id]
-    if crew_profile_ids:
-        booking_scope.append(and_(
-            CabBooking.vessel_id.is_(None),
-            CabBooking.crew_id.in_(crew_profile_ids),
-        ))
+    booking_scope = [CabBooking.vessel_call_id == call.id]
+    if not strict_call_scope:
+        booking_scope.append(CabBooking.vessel_id == vessel.id)
+        if crew_profile_ids:
+            booking_scope.append(and_(
+                CabBooking.vessel_call_id.is_(None),
+                CabBooking.vessel_id.is_(None),
+                CabBooking.crew_id.in_(crew_profile_ids),
+            ))
     day_trips = db.query(CabBooking).filter(
         or_(*booking_scope),
         or_(
@@ -1181,16 +1232,24 @@ def shore_leave_report(
         sum(person_minutes) / len(person_minutes) if person_minutes else None
     )
 
+    sos_scope = (
+        CrewSos.vessel_call_id == call.id
+        if strict_call_scope else CrewSos.vessel_id == vessel.id
+    )
     day_sos = db.query(CrewSos).filter(
         CrewSos.agency_id == agent_profile.id,
-        CrewSos.vessel_id == vessel.id,
+        sos_scope,
         CrewSos.created_at >= day_start,
         CrewSos.created_at < day_end,
     ).all()
 
+    incident_scope = (
+        Incident.vessel_call_id == call.id
+        if strict_call_scope else Incident.vessel_id == vessel.id
+    )
     day_incidents = db.query(Incident).filter(
         Incident.agency_id == agent_profile.id,
-        Incident.vessel_id == vessel.id,
+        incident_scope,
         Incident.created_at >= day_start,
         Incident.created_at < day_end,
     ).all()
@@ -1208,19 +1267,18 @@ def shore_leave_report(
     )
 
     return ShoreLeaveReportOut(
-        vessel_name=vessel.name,
-        imo_number=vessel.imo_number,
+        vessel_name=call.vessel_name,
+        imo_number=call.imo_number,
         berth=vessel.berth_assignment,
-        flag=vessel.flag,
-        eta=vessel.eta,
-        etd=vessel.etd,
-        port_name=(vessel.agent.agent_profile.assigned_port
-                   if vessel.agent and getattr(vessel.agent, "agent_profile", None) else None),
-        agency_name=agent_profile.agency_name if agent_profile else vessel.agency_name,
+        flag=call.flag,
+        eta=call.eta,
+        etd=call.etd,
+        port_name=call.port_name,
+        agency_name=call.agency_name,
         agency_logo_url=agent_profile.agency_logo_url if agent_profile else None,
         report_date=resolved_date,
         generated_at=datetime.utcnow(),
-        crew_onboard=len(manifest),
+        crew_onboard=len(roster),
         eligible_for_shore_leave=eligible_count,
         shore_leave_utilisation_pct=(
             round(crew_went_ashore * 100 / eligible_count) if eligible_count else 0
@@ -1253,6 +1311,7 @@ def shore_leave_report(
 def create_shore_leave_report_snapshot(
     vessel_id: int,
     report_date: Optional[str] = None,
+    vessel_call_id: Optional[int] = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -1263,15 +1322,17 @@ def create_shore_leave_report_snapshot(
     report = shore_leave_report(
         vessel_id=vessel_id,
         report_date=report_date,
+        vessel_call_id=vessel_call_id,
         db=db,
         current_user=current_user,
     )
     agent_profile = db.query(AgentProfile).filter(
         AgentProfile.user_id == current_user.id
     ).one()
-    vessel_call_id = db.query(VesselCall.id).filter(
+    resolved_call_id = vessel_call_id or db.query(VesselCall.id).filter(
         VesselCall.vessel_id == vessel_id,
         VesselCall.agency_id == agent_profile.id,
+        VesselCall.ended_at.is_(None),
     ).order_by(VesselCall.id.desc()).limit(1).scalar()
 
     from app.services.report_snapshots import (
@@ -1283,9 +1344,11 @@ def create_shore_leave_report_snapshot(
         db,
         report_kind="shore_leave",
         source_id=vessel_id,
-        source_reference=f"shore-leave:{vessel_id}:{report.report_date}",
+        source_reference=(
+            f"shore-leave:{vessel_id}:call-{resolved_call_id}:{report.report_date}"
+        ),
         agency_id=agent_profile.id,
-        vessel_call_id=vessel_call_id,
+        vessel_call_id=resolved_call_id,
         generated_by_user_id=current_user.id,
         payload=report,
     )

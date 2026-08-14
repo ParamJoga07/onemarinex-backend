@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 from app.db.session import get_db
 from app.db.models.vessel import Vessel
 from app.db.models.vessel_crew import VesselCrew
+from app.db.models.crew_assignment import CrewAssignment
 from app.db.models.crew_profile import CrewProfile
 from app.db.models.cab_booking import CabBooking
 from app.db.models.shore_pass import ShorePass
@@ -14,6 +15,15 @@ from app.db.models.user import User
 from app.api.v1.routes_auth import get_current_user
 from app.services.crew_service import generate_hpid
 from app.services.crew_reference import normalize_nationality, normalize_rank
+from app.services.crew_identity import (
+    CrewIdentityConflict,
+    normalize_passport_number,
+    normalized_passport_expression,
+    normalized_person_name,
+    resolve_verified_crew_profile,
+    resolved_identity_decision,
+    persist_identity_conflict,
+)
 import uuid
 
 router = APIRouter()
@@ -30,8 +40,10 @@ def is_partnered_agency(agency_name: Optional[str]) -> bool:
 class CrewMemberIn(BaseModel):
     name: str
     rank: str
-    nationality: Optional[str] = None
+    nationality: str
     passport_number: str
+    # Accepted for backwards compatibility only. Mapping status is derived
+    # from a verified CrewProfile match and this value is never trusted.
     status: Optional[str] = "Pending"
     shore_pass_eligible: Optional[bool] = False
     shore_pass_valid_upto: Optional[datetime] = None
@@ -123,19 +135,340 @@ def _agent_vessel_or_404(db: Session, vessel_id: int, current_user: User) -> Ves
     return vessel
 
 
+def _add_crew_conflict(detail: str) -> HTTPException:
+    return HTTPException(status_code=status.HTTP_409_CONFLICT, detail=detail)
+
+
+def _resolve_profile_or_queue_conflict(
+    db: Session,
+    *,
+    operation: str,
+    vessel: Vessel,
+    passport_number: str,
+    nationality: str,
+    name: str,
+    rank: Optional[str],
+    generated_hpid: str,
+) -> Optional[CrewProfile]:
+    try:
+        return resolve_verified_crew_profile(
+            db,
+            passport_number=passport_number,
+            nationality=nationality,
+            crew_name=name,
+            generated_hpid=generated_hpid,
+        )
+    except CrewIdentityConflict as exc:
+        proposed_identity = {
+            "name": name,
+            "rank": rank,
+            "nationality": nationality,
+            "passport_number": passport_number,
+            "generated_hpid": generated_hpid,
+        }
+        decided, profile = resolved_identity_decision(
+            db,
+            operation=operation,
+            vessel_id=vessel.id,
+            passport_number=passport_number,
+            proposed_identity=proposed_identity,
+        )
+        if decided:
+            return profile
+        conflict = persist_identity_conflict(
+            db,
+            operation=operation,
+            vessel_id=vessel.id,
+            passport_number=passport_number,
+            proposed_identity=proposed_identity,
+            message=str(exc),
+        )
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "message": str(exc),
+                "identity_conflict_id": conflict.id,
+                "status": conflict.status,
+                "version": conflict.version,
+            },
+        ) from exc
+
+
+def _existing_manifest_or_queue_conflict(
+    db: Session,
+    *,
+    operation: str,
+    vessel: Vessel,
+    passport_number: str,
+    generated_hpid: str,
+    proposed_identity: dict,
+) -> Optional[VesselCrew]:
+    try:
+        return _existing_manifest_for_add(
+            db,
+            vessel,
+            passport_number=passport_number,
+            generated_hpid=generated_hpid,
+        )
+    except HTTPException as exc:
+        if exc.status_code != 409:
+            raise
+        message = str(exc.detail)
+        conflict = persist_identity_conflict(
+            db,
+            operation=operation,
+            vessel_id=vessel.id,
+            passport_number=passport_number,
+            proposed_identity=proposed_identity,
+            message=message,
+        )
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": message,
+                "identity_conflict_id": conflict.id,
+                "status": conflict.status,
+                "version": conflict.version,
+            },
+        ) from exc
+
+
+def _same_manifest_identity(
+    crew: VesselCrew,
+    *,
+    name: str,
+    nationality: str,
+    passport_number: str,
+) -> bool:
+    existing_nationality = normalize_nationality(crew.nationality, strict=False)
+    return (
+        normalized_person_name(crew.name) == normalized_person_name(name)
+        and existing_nationality == nationality
+        and normalize_passport_number(crew.passport_number) == passport_number
+    )
+
+
+def _existing_manifest_for_add(
+    db: Session,
+    vessel: Vessel,
+    *,
+    passport_number: str,
+    generated_hpid: str,
+) -> Optional[VesselCrew]:
+    passport_matches = (
+        db.query(VesselCrew)
+        .filter(
+            VesselCrew.vessel_id == vessel.id,
+            normalized_passport_expression(VesselCrew.passport_number)
+            == passport_number,
+        )
+        .order_by(VesselCrew.id)
+        .limit(2)
+        .all()
+    )
+    if len(passport_matches) > 1:
+        raise _add_crew_conflict(
+            "This passport already has duplicate entries on the vessel and "
+            "requires Superadmin identity reconciliation"
+        )
+
+    hpid_matches = (
+        db.query(VesselCrew)
+        .filter(
+            VesselCrew.vessel_id == vessel.id,
+            func.upper(func.trim(VesselCrew.hp_id))
+            == generated_hpid.strip().upper(),
+        )
+        .order_by(VesselCrew.id)
+        .limit(2)
+        .all()
+    )
+    if len(hpid_matches) > 1:
+        raise _add_crew_conflict(
+            "This HPID already has duplicate entries on the vessel and "
+            "requires Superadmin identity reconciliation"
+        )
+
+    passport_match = passport_matches[0] if passport_matches else None
+    hpid_match = hpid_matches[0] if hpid_matches else None
+    if passport_match and hpid_match and passport_match.id != hpid_match.id:
+        raise _add_crew_conflict(
+            "The passport and HPID refer to different vessel crew entries; "
+            "Superadmin identity reconciliation is required"
+        )
+    if hpid_match and normalize_passport_number(hpid_match.passport_number) not in (
+        None,
+        passport_number,
+    ):
+        raise _add_crew_conflict(
+            "The generated HPID already belongs to a different passport; "
+            "Superadmin identity reconciliation is required"
+        )
+    return passport_match or hpid_match
+
+
+def _assignment_for_added_crew(
+    db: Session,
+    vessel: Vessel,
+    crew: VesselCrew,
+    *,
+    profile: Optional[CrewProfile],
+) -> CrewAssignment:
+    """Return/create the one active membership for this person and call."""
+
+    from app.services.historical_context import (
+        active_vessel_call,
+        assignment_for_manifest,
+    )
+
+    call = active_vessel_call(db, vessel)
+    if call is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This vessel has no active call and crew cannot be added",
+        )
+
+    manifest_assignment = (
+        db.query(CrewAssignment)
+        .filter(
+            CrewAssignment.vessel_call_id == call.id,
+            CrewAssignment.vessel_crew_id == crew.id,
+            CrewAssignment.ended_at.is_(None),
+        )
+        .first()
+    )
+    if manifest_assignment is not None:
+        if profile is not None:
+            profile_collision = (
+                db.query(CrewAssignment)
+                .filter(
+                    CrewAssignment.vessel_call_id == call.id,
+                    CrewAssignment.crew_profile_id == profile.id,
+                    CrewAssignment.ended_at.is_(None),
+                    CrewAssignment.id != manifest_assignment.id,
+                )
+                .first()
+            )
+            if profile_collision is not None:
+                raise _add_crew_conflict(
+                    "This crew account is already assigned to the vessel call "
+                    "through another manifest entry"
+                )
+            # A pending manifest can become mapped after the user registers.
+            # Link the existing membership; do not create another assignment.
+            manifest_assignment.crew_profile_id = profile.id
+        return manifest_assignment
+
+    if profile is not None:
+        identity_assignment = (
+            db.query(CrewAssignment)
+            .filter(
+                CrewAssignment.vessel_call_id == call.id,
+                CrewAssignment.crew_profile_id == profile.id,
+                CrewAssignment.ended_at.is_(None),
+            )
+            .first()
+        )
+    else:
+        passport = normalize_passport_number(crew.passport_number)
+        identity_assignment = (
+            db.query(CrewAssignment)
+            .filter(
+                CrewAssignment.vessel_call_id == call.id,
+                CrewAssignment.crew_profile_id.is_(None),
+                CrewAssignment.ended_at.is_(None),
+                normalized_passport_expression(CrewAssignment.passport_number)
+                == passport,
+            )
+            .first()
+        )
+    if identity_assignment is not None:
+        raise _add_crew_conflict(
+            "This crew identity is already assigned to the vessel call through "
+            "another manifest entry"
+        )
+
+    assignment = assignment_for_manifest(db, vessel, crew, profile=profile)
+    if assignment is None:  # Defensive; the active call was resolved above.
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Unable to create an active crew assignment for this vessel",
+        )
+    return assignment
+
+
+def _ensure_crew_shore_pass(
+    db: Session,
+    *,
+    vessel: Vessel,
+    assignment: CrewAssignment,
+    profile: Optional[CrewProfile],
+    port: Optional[str],
+    agency_name: Optional[str],
+) -> None:
+    if profile is None or not is_partnered_agency(agency_name):
+        return
+    existing = db.query(ShorePass).filter(
+        ShorePass.crew_profile_id == profile.id,
+        ShorePass.crew_assignment_id == assignment.id,
+    ).first()
+    if existing is not None:
+        return
+
+    call = assignment.vessel_call
+    pass_port = call.port_name or port
+    pass_vessel = call.vessel_name or vessel.name or "Vessel"
+    port_code = (pass_port or "GEN").replace("port_", "")[:3].upper()
+    vessel_code = pass_vessel.replace(" ", "")[:3].upper()
+    port_display = (pass_port or "General").replace("port_", "").replace("_", " ").title()
+    db.add(ShorePass(
+        crew_profile_id=profile.id,
+        crew_assignment_id=assignment.id,
+        vessel_call_id=assignment.vessel_call_id,
+        agent_name=f"{port_display} Port Authority",
+        shore_pass_id=f"SP-{port_code}-{vessel_code}-{uuid.uuid4().hex[:8].upper()}",
+        port_name=pass_port,
+        vessel_name=pass_vessel,
+        is_verified=False,
+        status="pending",
+    ))
+
+
 def _save_manifest_rows(db: Session, vessel: Vessel, rows, port: Optional[str]) -> int:
     """Upsert parsed manifest rows onto a vessel's crew list.
 
     Kept separate from parsing so the agent can review what was read before any
     of it is written. Matching is on passport number or generated HPID, so
-    re-uploading a corrected manifest updates crew rather than duplicating them.
+    Re-upload is idempotent only for an identical verified identity. Identity
+    corrections and reused passports are reconciliation work and are never
+    silently overwritten by a bulk import.
     """
-    saved = 0
+    # Serialize every confirm/upload for this vessel before checking for
+    # existing manifests or assignments. The database indexes remain the final
+    # boundary, while this lock makes concurrent retries deterministic instead
+    # of letting one fail after partially building related rows.
+    vessel = (
+        db.query(Vessel)
+        .filter(Vessel.id == vessel.id)
+        .with_for_update()
+        .one()
+    )
+    # Validate and resolve the *entire* batch before mutating any manifest,
+    # assignment or shore-pass row. Persisting a later identity conflict uses
+    # its own commit so the queue item survives the HTTP 409; without this
+    # two-phase structure that commit could accidentally make earlier rows in
+    # the failed upload permanent.
+    prepared = []
     for row in rows:
         name = (row.name or "").strip()
         if not name:
             continue
-        passport_number = (row.passport_number or "").strip().upper() or None
+        passport_number = normalize_passport_number(row.passport_number)
+        if not passport_number:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Crew member {name}: Passport number is required",
+            )
         rank = normalize_rank(row.rank)
         try:
             nationality = normalize_nationality(row.nationality, strict=bool(row.nationality))
@@ -145,18 +478,85 @@ def _save_manifest_rows(db: Session, vessel: Vessel, rows, port: Optional[str]) 
                 detail=f"Crew member {name}: {exc}",
             ) from exc
 
-        generated_hpid = generate_hpid(passport_number, nationality, port) if passport_number else None
+        if nationality is None:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Crew member {name}: Nationality is required",
+            )
+        generated_hpid = generate_hpid(passport_number, nationality, port)
+        profile = _resolve_profile_or_queue_conflict(
+            db,
+            operation="BULK_MANIFEST",
+            vessel=vessel,
+            passport_number=passport_number,
+            nationality=nationality,
+            name=name,
+            rank=rank,
+            generated_hpid=generated_hpid,
+        )
 
-        crew = None
-        if passport_number or generated_hpid:
-            conditions = []
-            if passport_number:
-                conditions.append(VesselCrew.passport_number == passport_number)
-            if generated_hpid:
-                conditions.append(VesselCrew.hp_id == generated_hpid)
-            crew = db.query(VesselCrew).filter(
-                VesselCrew.vessel_id == vessel.id, or_(*conditions)
-            ).first()
+        proposed_identity = {
+            "name": name,
+            "rank": rank,
+            "nationality": nationality,
+            "passport_number": passport_number,
+            "generated_hpid": generated_hpid,
+        }
+        crew = _existing_manifest_or_queue_conflict(
+            db,
+            operation="BULK_MANIFEST",
+            vessel=vessel,
+            passport_number=passport_number,
+            generated_hpid=generated_hpid,
+            proposed_identity=proposed_identity,
+        )
+
+        if crew is not None and not _same_manifest_identity(
+            crew,
+            name=name,
+            nationality=nationality,
+            passport_number=passport_number,
+        ):
+            message = (
+                f"Crew member {name}: This passport is already on the vessel "
+                "with different identity details; reconcile it before upload"
+            )
+            conflict = persist_identity_conflict(
+                db,
+                operation="BULK_MANIFEST",
+                vessel_id=vessel.id,
+                passport_number=passport_number,
+                proposed_identity=proposed_identity,
+                message=message,
+            )
+            raise HTTPException(status_code=409, detail={
+                "message": message,
+                "identity_conflict_id": conflict.id,
+                "status": conflict.status,
+                "version": conflict.version,
+            })
+
+        prepared.append({
+            "row": row,
+            "name": name,
+            "rank": rank,
+            "nationality": nationality,
+            "passport_number": passport_number,
+            "generated_hpid": generated_hpid,
+            "profile": profile,
+            "crew": crew,
+        })
+
+    saved = 0
+    for item in prepared:
+        row = item["row"]
+        name = item["name"]
+        rank = item["rank"]
+        nationality = item["nationality"]
+        passport_number = item["passport_number"]
+        generated_hpid = item["generated_hpid"]
+        profile = item["profile"]
+        crew = item["crew"]
 
         # The shore-pass expiry belongs to the vessel, so uploaded crew inherit
         # it rather than carrying whatever the spreadsheet happened to contain.
@@ -168,61 +568,36 @@ def _save_manifest_rows(db: Session, vessel: Vessel, rows, port: Optional[str]) 
                 name=name,
                 rank=rank or "",
                 nationality=nationality,
-                hp_id=generated_hpid,
+                hp_id=(profile.hpid if profile and profile.hpid else generated_hpid),
                 passport_number=passport_number,
-                status="Pending",
+                status="Mapped" if profile else "Pending",
                 shore_pass_eligible=row.shore_pass_eligible,
                 shore_pass_valid_upto=valid_upto,
             )
             db.add(crew)
         else:
-            crew.name = name
             crew.rank = rank or crew.rank
-            crew.nationality = nationality
-            # Never overwrite an HPID that already exists. An HPID is the
-            # identity every other record points at — incidents, SOS, shore
-            # passes, bookings all store it — so regenerating one on a
-            # re-upload silently orphans that crew member's whole history while
-            # they are still aboard.
-            crew.hp_id = crew.hp_id or generated_hpid
-            crew.passport_number = passport_number or crew.passport_number
+            crew.status = "Mapped" if profile else "Pending"
             crew.shore_pass_eligible = row.shore_pass_eligible
             if valid_upto:
                 crew.shore_pass_valid_upto = valid_upto
 
-        profile = (
-            db.query(CrewProfile).filter(CrewProfile.hpid == generated_hpid).first()
-            if generated_hpid else None
-        )
-        if profile:
-            crew.status = "Mapped"
-            agency_name = vessel.agency_name
-            if not agency_name and vessel.agent and getattr(vessel.agent, "agent_profile", None):
-                agency_name = vessel.agent.agent_profile.agency_name
-            if is_partnered_agency(agency_name):
-                existing_pass = db.query(ShorePass).filter(
-                    ShorePass.crew_profile_id == profile.id,
-                    ShorePass.port_name == port,
-                    ShorePass.vessel_name == vessel.name,
-                ).first()
-                if not existing_pass:
-                    port_code = (port or "GEN").replace("port_", "")[:3].upper()
-                    vessel_code = vessel.name.replace(" ", "")[:3].upper()
-                    shore_pass_id = f"SP-{port_code}-{vessel_code}-{uuid.uuid4().hex[:4].upper()}"
-                    port_display = (port or "General").replace("port_", "").replace("_", " ").title()
-                    db.add(ShorePass(
-                        crew_profile_id=profile.id,
-                        agent_name=f"{port_display} Port Authority",
-                        shore_pass_id=shore_pass_id,
-                        port_name=port,
-                        vessel_name=vessel.name,
-                        is_verified=False,
-                        status="pending",
-                    ))
         db.flush()
-        from app.services.historical_context import assignment_for_manifest
-
-        assignment_for_manifest(db, vessel, crew, profile=profile)
+        assignment = _assignment_for_added_crew(
+            db, vessel, crew, profile=profile
+        )
+        assignment.shore_pass_eligible = bool(crew.shore_pass_eligible)
+        agency_name = vessel.agency_name
+        if not agency_name and vessel.agent and getattr(vessel.agent, "agent_profile", None):
+            agency_name = vessel.agent.agent_profile.agency_name
+        _ensure_crew_shore_pass(
+            db,
+            vessel=vessel,
+            assignment=assignment,
+            profile=profile,
+            port=port,
+            agency_name=agency_name,
+        )
         saved += 1
 
     db.commit()
@@ -634,65 +1009,125 @@ def get_crew_manifest(vessel_id: int, current_user: User = Depends(get_current_u
 
 @router.post("/{vessel_id}/crew", response_model=CrewMemberOut, status_code=status.HTTP_201_CREATED)
 def add_crew_member(vessel_id: int, body: CrewMemberIn, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    vessel = db.query(Vessel).filter(Vessel.id == vessel_id, Vessel.agent_id == current_user.id).first()
+    # Serialise additions for one vessel. This makes retries deterministic and
+    # closes the check-then-insert race even before the database uniqueness
+    # indexes are applied by the release migration.
+    vessel = (
+        db.query(Vessel)
+        .filter(Vessel.id == vessel_id, Vessel.agent_id == current_user.id)
+        .with_for_update()
+        .first()
+    )
     if not vessel:
         raise HTTPException(status_code=404, detail="Vessel not found")
     
     agent_profile = current_user.agent_profile
     port = agent_profile.assigned_port if agent_profile else None
     
-    # Generate HPID based on Passport, Nationality, and Port
+    name = " ".join((body.name or "").strip().split())
+    if not name:
+        raise HTTPException(status_code=422, detail="Crew name is required")
+    passport_number = normalize_passport_number(body.passport_number)
+    if not passport_number:
+        raise HTTPException(status_code=422, detail="Passport number is required")
     try:
-        nationality = normalize_nationality(body.nationality, strict=bool(body.nationality))
+        nationality = normalize_nationality(body.nationality, strict=True)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    generated_hpid = generate_hpid(body.passport_number, nationality, port)
-    
-    crew = VesselCrew(
-        vessel_id=vessel.id,
-        name=body.name,
-        rank=normalize_rank(body.rank) or "other",
+    if nationality is None:  # Strict normalization is expected to return ISO-2.
+        raise HTTPException(status_code=422, detail="Nationality is required")
+    generated_hpid = generate_hpid(passport_number, nationality, port)
+    profile = _resolve_profile_or_queue_conflict(
+        db,
+        operation="MANUAL_ADD",
+        vessel=vessel,
+        passport_number=passport_number,
         nationality=nationality,
-        hp_id=generated_hpid,
-        passport_number=body.passport_number,
-        status=body.status,
-        shore_pass_eligible=body.shore_pass_eligible if body.shore_pass_eligible is not None else False,
-        shore_pass_valid_upto=body.shore_pass_valid_upto
+        name=name,
+        rank=normalize_rank(body.rank),
+        generated_hpid=generated_hpid,
     )
-    db.add(crew)
-    db.flush()
-    
-    # Check if a matching CrewProfile exists to automatically generate a ShorePass
-    profile = db.query(CrewProfile).filter(CrewProfile.hpid == generated_hpid).first()
+
+    proposed_identity = {
+        "name": name,
+        "rank": normalize_rank(body.rank),
+        "nationality": nationality,
+        "passport_number": passport_number,
+        "generated_hpid": generated_hpid,
+    }
+    crew = _existing_manifest_or_queue_conflict(
+        db,
+        operation="MANUAL_ADD",
+        vessel=vessel,
+        passport_number=passport_number,
+        generated_hpid=generated_hpid,
+        proposed_identity=proposed_identity,
+    )
+    if crew is not None:
+        if not _same_manifest_identity(
+            crew,
+            name=name,
+            nationality=nationality,
+            passport_number=passport_number,
+        ):
+            message = (
+                "This passport is already on the vessel with different identity "
+                "details; update the existing member or reconcile the identity"
+            )
+            conflict = persist_identity_conflict(
+                db,
+                operation="MANUAL_ADD",
+                vessel_id=vessel.id,
+                passport_number=passport_number,
+                proposed_identity=proposed_identity,
+                message=message,
+            )
+            raise HTTPException(status_code=409, detail={
+                "message": message,
+                "identity_conflict_id": conflict.id,
+                "status": conflict.status,
+                "version": conflict.version,
+            })
+        # Mapping is server-owned and may legitimately change from Pending to
+        # Mapped after the crew member creates an account.
+        crew.status = "Mapped" if profile else "Pending"
+        if body.shore_pass_eligible is not None:
+            crew.shore_pass_eligible = body.shore_pass_eligible
+        if body.shore_pass_valid_upto is not None:
+            crew.shore_pass_valid_upto = body.shore_pass_valid_upto
+    else:
+        crew = VesselCrew(
+            vessel_id=vessel.id,
+            name=name,
+            rank=normalize_rank(body.rank) or "other",
+            nationality=nationality,
+            # A registered account's stable HPID wins over a newly derived HPID.
+            hp_id=(profile.hpid if profile and profile.hpid else generated_hpid),
+            passport_number=passport_number,
+            status="Mapped" if profile else "Pending",
+            shore_pass_eligible=(
+                body.shore_pass_eligible
+                if body.shore_pass_eligible is not None
+                else False
+            ),
+            shore_pass_valid_upto=body.shore_pass_valid_upto,
+        )
+        db.add(crew)
+        db.flush()
+
     agency_name = vessel.agency_name
     if not agency_name and vessel.agent and hasattr(vessel.agent, "agent_profile") and vessel.agent.agent_profile:
         agency_name = vessel.agent.agent_profile.agency_name
-    if profile and is_partnered_agency(agency_name):
-        # Create ShorePass automatically
-        port_code = (port or "GEN").replace("port_", "")[:3].upper()
-        vessel_code = vessel.name.replace(" ", "")[:3].upper()
-        random_suffix = uuid.uuid4().hex[:4].upper()
-        shore_pass_id = f"SP-{port_code}-{vessel_code}-{random_suffix}"
-        
-        # Derive agent name
-        port_display = (port or "General").replace("port_", "").replace("_", " ").title()
-        agent_name = f"{port_display} Port Authority"
-        
-        new_pass = ShorePass(
-            crew_profile_id=profile.id,
-            agent_name=agent_name,
-            shore_pass_id=shore_pass_id,
-            port_name=port,
-            vessel_name=vessel.name,
-            is_verified=False,
-            status="pending"
-        )
-        db.add(new_pass)
-        print(f"DEBUG: Automated ShorePass created for {body.name} (HPID: {generated_hpid})")
-
-    from app.services.historical_context import assignment_for_manifest
-
-    assignment_for_manifest(db, vessel, crew, profile=profile)
+    assignment = _assignment_for_added_crew(db, vessel, crew, profile=profile)
+    assignment.shore_pass_eligible = bool(crew.shore_pass_eligible)
+    _ensure_crew_shore_pass(
+        db,
+        vessel=vessel,
+        assignment=assignment,
+        profile=profile,
+        port=port,
+        agency_name=agency_name,
+    )
 
     db.commit()
     db.refresh(crew)

@@ -181,7 +181,7 @@ class IncidentDetailScopingTests(unittest.TestCase):
         """
         agent, incident = self.make_agency_with_incident(resolved=False)
 
-        result = asyncio.get_event_loop().run_until_complete(
+        result = asyncio.run(
             update_incident_status(
                 id=incident.id, status_update=StatusUpdate(status=IncidentStatus.INVESTIGATING),
                 db=self.db, current_user=agent,
@@ -194,7 +194,7 @@ class IncidentDetailScopingTests(unittest.TestCase):
 
     def test_terminal_incident_cannot_be_reopened(self):
         with self.assertRaises(HTTPException) as error:
-            asyncio.get_event_loop().run_until_complete(
+            asyncio.run(
                 update_incident_status(
                     id=self.incident_a.id, status_update=StatusUpdate(status=IncidentStatus.ACTIVE),
                     db=self.db, current_user=self.agent_a,
@@ -202,15 +202,13 @@ class IncidentDetailScopingTests(unittest.TestCase):
             )
         self.assertEqual(error.exception.status_code, 409)
 
-    def test_non_agents_are_refused(self):
+    def test_superadmin_can_open_incident_detail(self):
         superadmin = SimpleNamespace(id=self.agent_a.id, role="superadmin")
 
-        with self.assertRaises(HTTPException) as ctx:
-            agent_incident_detail(
-                incident_id=self.incident_a.id, db=self.db, current_user=superadmin,
-            )
-
-        self.assertEqual(ctx.exception.status_code, 403)
+        detail = agent_incident_detail(
+            incident_id=self.incident_a.id, db=self.db, current_user=superadmin,
+        )
+        self.assertEqual(detail["incident"]["id"], self.incident_a.id)
 
     def test_safety_report_lists_resolved_record_for_owned_vessel(self):
         result = agent_safety_report_records(

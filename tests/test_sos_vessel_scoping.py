@@ -19,15 +19,22 @@ from sqlalchemy.orm import Session
 
 from app.api.v1.routes_sos import (
     SosCustomUpdateIn,
+    SosNoteIn,
+    SosTimelineEntryIn,
     SosStatusUpdateIn,
+    add_sos_note,
     add_sos_update,
+    delete_sos_note,
+    delete_sos_timeline_entry,
+    edit_sos_note,
+    edit_sos_timeline_entry,
     get_sos_timeline,
     list_sos_requests,
     update_sos_status,
 )
 from app.db.models.agent_profile import AgentProfile
 from app.db.models.crew_profile import CrewProfile
-from app.db.models.crew_sos import CrewSos, CrewSosTimelineEvent
+from app.db.models.crew_sos import CrewSos, CrewSosNote, CrewSosTimelineEvent
 from app.db.models.user import User
 from app.db.models.vessel import Vessel
 from app.db.models.vessel_crew import VesselCrew
@@ -80,13 +87,14 @@ class SosVesselScopingTests(unittest.TestCase):
 
         sos = CrewSos(user_id=crew_user.id, crew_profile_id=crew.id,
                       port_name=self.PORT, vessel=vessel.name, status="ACTIVE",
+                      crew_email=crew_user.email,
                       agency_id=agent_profile.id, vessel_id=vessel.id,
                       context_resolution="vessel_id")
         self.db.add(sos)
         self.db.flush()
 
         agent = SimpleNamespace(
-            id=agent_user.id, role="agent",
+            id=agent_user.id, role="agent", name="Agent Desk",
             agent_profile=agent_profile,
         )
         return agent, sos
@@ -106,6 +114,14 @@ class SosVesselScopingTests(unittest.TestCase):
         listed = list_sos_requests(db=self.db, current_user=self.agent_a)
 
         self.assertEqual([s["id"] for s in listed], [self.sos_a.id])
+        self.assertIsNone(listed[0]["crew_email"])
+        self.assertIsNone(listed[0]["sos_email"])
+        agent_detail = get_sos_timeline(
+            sos_id=self.sos_a.id, db=self.db, current_user=self.agent_a
+        )
+        self.assertIsNone(agent_detail.crew_email)
+        self.assertIsNone(agent_detail.crew_details["email"])
+        self.assertIsNone(agent_detail.sos_email)
 
     def test_agent_cannot_open_another_agencys_alert(self):
         with self.assertRaises(HTTPException) as ctx:
@@ -194,6 +210,106 @@ class SosVesselScopingTests(unittest.TestCase):
 
         self.assertIn(self.sos_a.id, ids)
         self.assertIn(self.sos_b.id, ids)
+        selected = next(row for row in listed if row["id"] == self.sos_a.id)
+        self.assertEqual(selected["crew_email"], self.sos_a.crew_email)
+        admin_detail = get_sos_timeline(
+            sos_id=self.sos_a.id, db=self.db, current_user=superadmin
+        )
+        self.assertEqual(admin_detail.crew_email, self.sos_a.crew_email)
+        self.assertEqual(admin_detail.crew_details["email"], self.sos_a.crew_email)
+        self.assertEqual(admin_detail.sos_email, self.sos_a.sos_email)
+
+    def test_superadmin_can_manage_timeline_and_notes_without_bypassing_agent_scope(self):
+        superadmin = SimpleNamespace(
+            id=self.agent_a.id, role="superadmin", name="Platform Admin", agent_profile=None
+        )
+        update = add_sos_update(
+            sos_id=self.sos_a.id,
+            body=SosCustomUpdateIn(label="Crew contacted", detail="Phone answered"),
+            db=self.db,
+            current_user=superadmin,
+        )
+        self.assertEqual(update["source"], "superadmin")
+        edited = edit_sos_timeline_entry(
+            event_id=update["id"],
+            body=SosTimelineEntryIn(
+                label="Driver contacted", detail="Driver is responding",
+                event_type="investigation",
+            ),
+            db=self.db,
+            current_user=superadmin,
+        )
+        self.assertEqual(edited["label"], "Driver contacted")
+
+        note = add_sos_note(
+            sos_id=self.sos_a.id,
+            body=SosNoteIn(note="Initial response is in progress"),
+            db=self.db,
+            current_user=superadmin,
+        )
+        edited_note = edit_sos_note(
+            note_id=note["id"],
+            body=SosNoteIn(note="Crew is safe and returning"),
+            db=self.db,
+            current_user=superadmin,
+        )
+        self.assertEqual(edited_note["note"], "Crew is safe and returning")
+
+        with self.assertRaises(HTTPException) as other_agent_note:
+            edit_sos_note(
+                note_id=note["id"],
+                body=SosNoteIn(note="Not my agency"),
+                db=self.db,
+                current_user=self.agent_b,
+            )
+        self.assertEqual(other_agent_note.exception.status_code, 404)
+        with self.assertRaises(HTTPException) as agent_cannot_edit_admin_update:
+            edit_sos_timeline_entry(
+                event_id=update["id"],
+                body=SosTimelineEntryIn(label="Not allowed"),
+                db=self.db,
+                current_user=self.agent_a,
+            )
+        self.assertEqual(agent_cannot_edit_admin_update.exception.status_code, 404)
+
+        self.assertEqual(
+            delete_sos_note(
+                note_id=note["id"], db=self.db, current_user=superadmin
+            ),
+            {"deleted": True, "id": note["id"]},
+        )
+        self.assertEqual(
+            delete_sos_timeline_entry(
+                event_id=update["id"], db=self.db, current_user=superadmin
+            ),
+            {"deleted": True, "id": update["id"]},
+        )
+
+    def test_agent_can_only_change_their_own_note_on_an_active_alert(self):
+        note = add_sos_note(
+            sos_id=self.sos_a.id,
+            body=SosNoteIn(note="Agent response"),
+            db=self.db,
+            current_user=self.agent_a,
+        )
+        stored_note = self.db.query(CrewSosNote).filter(CrewSosNote.id == note["id"]).one()
+        stored_note.author_user_id = self.agent_b.id
+        self.db.flush()
+        with self.assertRaises(HTTPException) as denied:
+            edit_sos_note(
+                note_id=note["id"], body=SosNoteIn(note="Rewritten"),
+                db=self.db, current_user=self.agent_a,
+            )
+        self.assertEqual(denied.exception.status_code, 404)
+
+        stored_note.author_user_id = self.agent_a.id
+        self.sos_a.status = "CLOSED"
+        self.db.flush()
+        with self.assertRaises(HTTPException) as locked:
+            delete_sos_note(
+                note_id=note["id"], db=self.db, current_user=self.agent_a,
+            )
+        self.assertEqual(locked.exception.status_code, 409)
 
 
 if __name__ == "__main__":

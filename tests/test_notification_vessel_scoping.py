@@ -11,6 +11,7 @@ back, so it leaves no rows behind.
 
 import unittest
 import uuid
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import app.db.base  # noqa: F401 — registers every model on Base
@@ -22,12 +23,16 @@ from app.api.v1.routes_notifications import (
     NotificationUpdateIn,
     create_notification,
     delete_notification,
+    get_unread_count,
     list_notifications_admin,
     list_notifications_for_crew,
+    mark_notification_read,
     update_notification,
 )
 from app.db.models.user import User
 from app.db.models.crew_profile import CrewProfile
+from app.db.models.notification import Notification
+from app.services.historical_context import assignment_for_manifest
 from app.db.models.vessel import Vessel
 from app.db.models.vessel_crew import VesselCrew
 from app.db.session import engine
@@ -182,17 +187,17 @@ class NotificationVesselScopingTests(unittest.TestCase):
         self.db.add(crew_user)
         self.db.flush()
         hpid = _uniq("HP")
-        self.db.add_all([
-            CrewProfile(
+        profile = CrewProfile(
                 user_id=crew_user.id, full_name="Crew", rank="able_seaman",
                 nationality="IN", hpid=hpid, current_port=self.PORT,
                 vessel=self.vessel_a.name,
-            ),
-            VesselCrew(
+            )
+        manifest = VesselCrew(
                 vessel_id=self.vessel_a.id, name="Crew", rank="able_seaman", hp_id=hpid,
-            ),
-        ])
+            )
+        self.db.add_all([profile, manifest])
         self.db.flush()
+        assignment_for_manifest(self.db, self.vessel_a, manifest, profile=profile)
         create_notification(
             body=NotificationCreateIn(
                 title="Own fleet", message="For our fleet",
@@ -212,6 +217,94 @@ class NotificationVesselScopingTests(unittest.TestCase):
         visible = list_notifications_for_crew(db=self.db, current_user=crew)
 
         self.assertEqual([item.title for item in visible], ["Own fleet"])
+
+    def test_authorization_happens_before_notification_limit(self):
+        crew_user = User(
+            email=_uniq("crew") + "@example.com", hashed_password="x", role="crew"
+        )
+        self.db.add(crew_user)
+        self.db.flush()
+        profile = CrewProfile(
+            user_id=crew_user.id,
+            full_name="Crew",
+            rank="able_seaman",
+            nationality="IN",
+            hpid=_uniq("HP"),
+            current_port=self.PORT,
+            vessel=self.vessel_a.name,
+        )
+        manifest = VesselCrew(
+            vessel_id=self.vessel_a.id,
+            name="Crew",
+            rank="able_seaman",
+            hp_id=profile.hpid,
+        )
+        self.db.add_all([profile, manifest])
+        self.db.flush()
+        assignment_for_manifest(self.db, self.vessel_a, manifest, profile=profile)
+
+        self.db.add(Notification(
+            title="Relevant older notice",
+            message="Must remain visible",
+            audience_type="single_vessel",
+            target_vessel_ids=[self.vessel_a.id],
+        ))
+        self.db.flush()
+        self.db.add_all([
+            Notification(
+                title=f"Other vessel {index}",
+                message="Not for this crew",
+                audience_type="single_vessel",
+                target_vessel_ids=[self.vessel_b.id],
+            )
+            for index in range(501)
+        ])
+        self.db.flush()
+
+        visible = list_notifications_for_crew(
+            db=self.db,
+            current_user=SimpleNamespace(id=crew_user.id, role="crew"),
+        )
+
+        self.assertEqual([item.title for item in visible], ["Relevant older notice"])
+
+    def test_unread_and_read_authorization_include_visible_rows_older_than_feed_limit(self):
+        crew_user = User(
+            email=_uniq("crew") + "@example.com", hashed_password="x", role="crew"
+        )
+        self.db.add(crew_user)
+        self.db.flush()
+        profile = CrewProfile(
+            user_id=crew_user.id, full_name="Crew", rank="able_seaman",
+            nationality="IN", hpid=_uniq("HP"), current_port=self.PORT,
+            vessel=self.vessel_a.name,
+        )
+        manifest = VesselCrew(
+            vessel_id=self.vessel_a.id, name="Crew", rank="able_seaman",
+            hp_id=profile.hpid,
+        )
+        self.db.add_all([profile, manifest])
+        self.db.flush()
+        assignment_for_manifest(self.db, self.vessel_a, manifest, profile=profile)
+        notices = [
+            Notification(
+                title=f"Relevant {index}", message="For this crew",
+                audience_type="single_vessel", target_vessel_ids=[self.vessel_a.id],
+            )
+            for index in range(501)
+        ]
+        self.db.add_all(notices)
+        self.db.flush()
+        crew = SimpleNamespace(id=crew_user.id, role="crew")
+
+        self.assertEqual(get_unread_count(db=self.db, current_user=crew), {"count": 501})
+        self.assertEqual(
+            mark_notification_read(
+                notification_id=notices[0].id, db=self.db, current_user=crew,
+            ),
+            {"status": "ok"},
+        )
+        self.assertEqual(get_unread_count(db=self.db, current_user=crew), {"count": 500})
 
     def test_crew_who_changed_ship_stop_receiving_the_old_ships_notices(self):
         """The reported leak: notices reaching vessels they were not sent to.
@@ -236,19 +329,28 @@ class NotificationVesselScopingTests(unittest.TestCase):
         self.db.flush()
         hpid = _uniq("HP")
         passport = _uniq("P").replace("-", "")[:12].upper()
-        self.db.add(CrewProfile(
+        profile = CrewProfile(
             user_id=crew_user.id, full_name="Crew", rank="able_seaman",
             nationality="IN", hpid=hpid, passport_number=passport,
             current_port=self.PORT,
             # They have transferred to the new ship.
             vessel=new_ship.name,
-        ))
+        )
+        self.db.add(profile)
         # The same person is still listed on both manifests.
+        assignments = []
         for vessel in (self.vessel_a, new_ship):
-            self.db.add(VesselCrew(
+            manifest = VesselCrew(
                 vessel_id=vessel.id, name="Crew", rank="able_seaman",
                 hp_id=hpid, passport_number=passport,
-            ))
+            )
+            self.db.add(manifest)
+            self.db.flush()
+            assignments.append(
+                assignment_for_manifest(self.db, vessel, manifest, profile=profile)
+            )
+        self.db.flush()
+        assignments[0].ended_at = datetime.now(timezone.utc) - timedelta(days=1)
         self.db.flush()
 
         self.send(self.agent_a, self.vessel_a.name)

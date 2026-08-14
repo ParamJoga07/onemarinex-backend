@@ -1,6 +1,7 @@
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import and_
+from sqlalchemy import and_, cast, false, func, or_
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, Field
 from datetime import datetime
@@ -281,45 +282,29 @@ def _recipient_context(db: Session, current_user):
     vessel_name = None
     vessel_ids: set[int] = set()
     if current_user.role == "crew":
-        from app.db.models.vessel import Vessel
-        from app.db.models.vessel_crew import VesselCrew
-        from sqlalchemy import func, or_
+        from app.services.historical_context import (
+            eligible_assignments_for_profile,
+        )
 
         profile = db.query(CrewProfile).filter(CrewProfile.user_id == current_user.id).first()
         if profile:
-            port_name = profile.current_port
-            vessel_name = profile.vessel
-
-            # The ship they are on *now*, not every ship they have ever sailed.
-            #
-            # This used to match their HPID and passport against the whole
-            # vessel_crew table with no vessel filter, so a crew member who had
-            # joined a second ship stayed a recipient for their old one — and a
-            # notice addressed to one vessel reached crew on another. Their
-            # current vessel is the one their profile names; the manifest match
-            # is the fallback for crew whose profile has no vessel set.
-            if vessel_name:
-                vessel_ids.update(
-                    row[0] for row in db.query(Vessel.id).filter(
-                        func.lower(func.trim(Vessel.name)) == vessel_name.strip().lower()
-                    ).all()
-                )
-
-            if not vessel_ids:
-                clauses = []
-                if profile.hpid:
-                    clauses.append(
-                        func.upper(func.trim(VesselCrew.hp_id)) == profile.hpid.strip().upper()
-                    )
-                if profile.passport_number:
-                    clauses.append(
-                        func.upper(func.trim(VesselCrew.passport_number))
-                        == profile.passport_number.strip().upper()
-                    )
-                if clauses:
-                    vessel_ids.update(
-                        row[0] for row in db.query(VesselCrew.vessel_id).filter(or_(*clauses)).all()
-                    )
+            assignments = eligible_assignments_for_profile(db, profile)
+            vessel_ids.update(
+                row.vessel_call.vessel_id for row in assignments
+                if row.vessel_call and row.vessel_call.vessel_id
+            )
+            ports = {
+                row.vessel_call.port_name for row in assignments
+                if row.vessel_call and row.vessel_call.port_name
+            }
+            names = {
+                row.vessel_call.vessel_name for row in assignments
+                if row.vessel_call and row.vessel_call.vessel_name
+            }
+            # Legacy free-string filtering is safe only when exactly one
+            # assignment applies. Multi-vessel delivery uses target IDs.
+            port_name = next(iter(ports)) if len(ports) == 1 else None
+            vessel_name = next(iter(names)) if len(names) == 1 else None
     else:
         from app.db.models.agent_profile import AgentProfile
         profile = db.query(AgentProfile).filter(AgentProfile.user_id == current_user.id).first()
@@ -328,9 +313,14 @@ def _recipient_context(db: Session, current_user):
     return port_name, vessel_name, vessel_ids
 
 
-def _visible_notifications(db: Session, current_user) -> List[Notification]:
+def _visible_notifications_query(db: Session, current_user):
     port_name, vessel_name, vessel_ids = _recipient_context(db, current_user)
     query = db.query(Notification)
+    targeted_audiences = {"single_vessel", "all_agent_vessels"}
+    legacy_audience = or_(
+        Notification.audience_type.is_(None),
+        Notification.audience_type.notin_(targeted_audiences),
+    )
     if current_user.role == "crew":
         query = query.filter(
             ~and_(
@@ -338,33 +328,50 @@ def _visible_notifications(db: Session, current_user) -> List[Notification]:
                 Notification.created_by == current_user.id,
             )
         )
-    if port_name:
-        query = query.filter(
-            (Notification.port_name.is_(None)) | (Notification.port_name == port_name)
+        targeted_vessel = or_(*(
+            cast(Notification.target_vessel_ids, JSONB).contains([vessel_id])
+            for vessel_id in vessel_ids
+        )) if vessel_ids else false()
+        legacy_port = (
+            or_(Notification.port_name.is_(None), Notification.port_name == port_name)
+            if port_name
+            else Notification.port_name.is_(None)
         )
+        legacy_vessel = (
+            or_(
+                Notification.vessel.is_(None),
+                func.lower(func.trim(Notification.vessel))
+                == vessel_name.strip().lower(),
+            )
+            if vessel_name
+            else Notification.vessel.is_(None)
+        )
+        query = query.filter(or_(
+            and_(
+                Notification.audience_type.in_(targeted_audiences),
+                targeted_vessel,
+            ),
+            and_(legacy_audience, legacy_port, legacy_vessel),
+        ))
     else:
-        query = query.filter(Notification.port_name.is_(None))
+        if port_name:
+            query = query.filter(
+                (Notification.port_name.is_(None)) | (Notification.port_name == port_name)
+            )
+        else:
+            query = query.filter(Notification.port_name.is_(None))
+        query = query.filter(legacy_audience, Notification.vessel.is_(None))
 
-    rows = query.order_by(Notification.created_at.desc(), Notification.id.desc()).all()
-    visible: List[Notification] = []
-    for item in rows:
-        if item.audience_type in {"single_vessel", "all_agent_vessels"}:
-            targets = {
-                int(value) for value in (item.target_vessel_ids or [])
-                if str(value).isdigit()
-            }
-            if current_user.role == "crew" and targets.intersection(vessel_ids):
-                visible.append(item)
-            continue
-        # Backward-compatible platform/port/vessel records.
-        if current_user.role == "crew":
-            if item.vessel is None or (
-                vessel_name and item.vessel.strip().lower() == vessel_name.strip().lower()
-            ):
-                visible.append(item)
-        elif item.vessel is None:
-            visible.append(item)
-    return visible
+    return query
+
+
+def _visible_notifications(db: Session, current_user) -> List[Notification]:
+    return (
+        _visible_notifications_query(db, current_user)
+        .order_by(Notification.created_at.desc(), Notification.id.desc())
+        .limit(500)
+        .all()
+    )
 
 
 @router.get("/", response_model=List[NotificationCrewOut])
@@ -412,16 +419,19 @@ def get_unread_count(
     if current_user.role not in ["crew", "agent"]:
         raise HTTPException(status_code=403, detail="Only crew or agents can view notifications")
 
-    notification_ids = [item.id for item in _visible_notifications(db, current_user)]
-    if not notification_ids:
-        return {"count": 0}
-
-    read_ids = db.query(NotificationRead.notification_id).filter(
-        NotificationRead.user_id == current_user.id,
-        NotificationRead.notification_id.in_(notification_ids),
-    ).all()
-    read_set = {row[0] for row in read_ids}
-    return {"count": len(notification_ids) - len(read_set)}
+    count = (
+        _visible_notifications_query(db, current_user)
+        .outerjoin(
+            NotificationRead,
+            and_(
+                NotificationRead.notification_id == Notification.id,
+                NotificationRead.user_id == current_user.id,
+            ),
+        )
+        .filter(NotificationRead.id.is_(None))
+        .count()
+    )
+    return {"count": count}
 
 
 @router.post("/{notification_id}/read")
@@ -433,7 +443,12 @@ def mark_notification_read(
     if current_user.role not in ["crew", "agent"]:
         raise HTTPException(status_code=403, detail="Only crew or agents can mark notifications")
 
-    if notification_id not in {item.id for item in _visible_notifications(db, current_user)}:
+    visible = (
+        _visible_notifications_query(db, current_user)
+        .filter(Notification.id == notification_id)
+        .first()
+    )
+    if visible is None:
         raise HTTPException(status_code=404, detail="Notification not found")
 
     existing = db.query(NotificationRead).filter(

@@ -149,7 +149,13 @@ def get_ports(db: Session = Depends(get_db)):
     ports = db.query(Port).filter(Port.is_active == True).all()
     return ports
 
-def _visible_rules(db: Session, viewer, port_rules: list) -> list:
+def _visible_rules(
+    db: Session,
+    viewer,
+    port_rules: list,
+    *,
+    crew_assignment_id: Optional[int] = None,
+) -> list:
     """The rules this reader should see.
 
     Three different answers, because two different people own rules here:
@@ -163,10 +169,14 @@ def _visible_rules(db: Session, viewer, port_rules: list) -> list:
     """
     if viewer is not None and viewer.role == "agent":
         return _agency_rules_for(db, viewer)
-    return list(port_rules) + _agency_rules_for(db, viewer)
+    return list(port_rules) + _agency_rules_for(
+        db, viewer, crew_assignment_id=crew_assignment_id
+    )
 
 
-def _agency_rules_for(db: Session, viewer) -> list:
+def _agency_rules_for(
+    db: Session, viewer, *, crew_assignment_id: Optional[int] = None
+) -> list:
     """Rules authored by the agency responsible for `viewer`.
 
     Empty for everyone else — these belong to one agency, not to the port.
@@ -181,14 +191,24 @@ def _agency_rules_for(db: Session, viewer) -> list:
     if viewer.role == "crew":
         from app.db.models.agent_profile import AgentProfile
         from app.db.models.crew_profile import CrewProfile
-        from app.services import agent_contact
+        from app.services.historical_context import (
+            selected_assignment_for_profile,
+        )
 
         crew = db.query(CrewProfile).filter(CrewProfile.user_id == viewer.id).first()
-        vessel = agent_contact.vessel_for_crew(db, crew)
-        if vessel is None or not vessel.agent_id:
+        if crew is None:
+            return []
+        try:
+            assignment = selected_assignment_for_profile(
+                db, crew, crew_assignment_id
+            )
+        except ValueError:
+            return []
+        call = assignment.vessel_call if assignment else None
+        if call is None or call.agency_id is None:
             return []
         profile = db.query(AgentProfile).filter(
-            AgentProfile.user_id == vessel.agent_id
+            AgentProfile.id == call.agency_id
         ).first()
         return safe_parse_json(profile.agency_rules, []) if profile else []
 
@@ -198,6 +218,7 @@ def _agency_rules_for(db: Session, viewer) -> list:
 @router.get("/{port_name}/rules", response_model=PortRulesOut)
 def get_port_rules(
     port_name: str,
+    crew_assignment_id: Optional[int] = None,
     db: Session = Depends(get_db),
     viewer: Optional[User] = Depends(get_current_user_optional),
 ):
@@ -217,7 +238,12 @@ def get_port_rules(
         clock = port_clock_snapshot(canonical_port)
         return {
             "port_name": canonical_port,
-            "rules": _visible_rules(db, viewer, []),
+            "rules": _visible_rules(
+                db,
+                viewer,
+                [],
+                crew_assignment_id=crew_assignment_id,
+            ),
             "opening_time": None,
             "closing_time": None,
             "working_days": None,
@@ -244,7 +270,12 @@ def get_port_rules(
     clock = port_clock_snapshot(rules.port_name, rules.timezone)
     return {
         "port_name": rules.port_name,
-        "rules": _visible_rules(db, viewer, safe_parse_json(rules.rules, [])),
+        "rules": _visible_rules(
+            db,
+            viewer,
+            safe_parse_json(rules.rules, []),
+            crew_assignment_id=crew_assignment_id,
+        ),
         "opening_time": rules.opening_time,
         "closing_time": rules.closing_time,
         "working_days": working_days,

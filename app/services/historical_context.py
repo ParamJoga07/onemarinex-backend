@@ -20,6 +20,10 @@ from app.db.models.port import Port
 from app.db.models.vessel import Vessel
 from app.db.models.vessel_call import VesselCall
 from app.db.models.vessel_crew import VesselCrew
+from app.services.crew_identity import (
+    normalize_passport_number,
+    normalized_passport_expression,
+)
 
 
 def _utcnow() -> datetime:
@@ -59,6 +63,14 @@ def active_vessel_call(
     )
     if call is not None or not create:
         return call
+
+    # A vessel call is an operational boundary, not a convenience row. Never
+    # manufacture a new one while a vessel is outside current operations. The
+    # lifecycle transition which reassigns/reopens a vessel must first make it
+    # active and assign an agent explicitly.
+    stored_status = str(vessel.status or "").strip().lower()
+    if vessel.agent_id is None or stored_status in {"archived", "departed"}:
+        return None
 
     agent = agent_profile_for_vessel(db, vessel)
     port = port_for_reference(db, agent.assigned_port if agent else None)
@@ -108,7 +120,9 @@ def finish_vessel_call(
 
 def refresh_active_vessel_call(db: Session, vessel: Vessel) -> Optional[VesselCall]:
     """Refresh mutable voyage details while a call is still operational."""
-    call = active_vessel_call(db, vessel)
+    # Editing voyage metadata must never create a fresh call. Call creation is
+    # reserved for vessel onboarding and an explicit reassignment transition.
+    call = active_vessel_call(db, vessel, create=False)
     if call is None:
         return None
     agent = agent_profile_for_vessel(db, vessel)
@@ -138,8 +152,8 @@ def crew_profile_for_manifest(
         )
     if (manifest.passport_number or "").strip():
         clauses.append(
-            func.upper(func.trim(CrewProfile.passport_number))
-            == manifest.passport_number.strip().upper()
+            normalized_passport_expression(CrewProfile.passport_number)
+            == normalize_passport_number(manifest.passport_number)
         )
     if not clauses:
         return None
@@ -179,6 +193,7 @@ def assignment_for_manifest(
         nationality=manifest.nationality,
         hpid=manifest.hp_id,
         passport_number=manifest.passport_number,
+        shore_pass_eligible=bool(manifest.shore_pass_eligible),
         started_at=manifest.created_at or call.started_at or _utcnow(),
     )
     db.add(assignment)
@@ -205,6 +220,60 @@ def active_assignment_for_profile(
     return matches[0] if len(matches) == 1 else None
 
 
+def eligible_assignments_for_profile(
+    db: Session,
+    profile: Optional[CrewProfile],
+) -> list[CrewAssignment]:
+    """All exact assignments this crew member can use for a new operation."""
+    if profile is None:
+        return []
+    return (
+        db.query(CrewAssignment)
+        .join(VesselCall, VesselCall.id == CrewAssignment.vessel_call_id)
+        .join(Vessel, Vessel.id == VesselCall.vessel_id)
+        .filter(
+            CrewAssignment.crew_profile_id == profile.id,
+            CrewAssignment.ended_at.is_(None),
+            VesselCall.ended_at.is_(None),
+            Vessel.agent_id.isnot(None),
+            func.lower(func.coalesce(Vessel.status, "")).notin_(["archived", "departed"]),
+        )
+        .order_by(CrewAssignment.started_at.desc(), CrewAssignment.id.desc())
+        .all()
+    )
+
+
+def selected_assignment_for_profile(
+    db: Session,
+    profile: Optional[CrewProfile],
+    crew_assignment_id: Optional[int],
+    *,
+    required_when_ambiguous: bool = True,
+) -> Optional[CrewAssignment]:
+    """Validate a client selection or resolve the only eligible assignment.
+
+    This deliberately refuses passport/HPID/current-profile inference. Those
+    fields identify a person, not the vessel call for a new operation.
+    """
+    matches = eligible_assignments_for_profile(db, profile)
+    if crew_assignment_id is not None:
+        selected = next(
+            (row for row in matches if row.id == crew_assignment_id), None
+        )
+        if selected is None:
+            raise ValueError(
+                "The selected vessel assignment is not active for this crew member"
+            )
+        return selected
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1 and required_when_ambiguous:
+        raise ValueError(
+            "Multiple active vessel assignments found; select a vessel before continuing"
+        )
+    return None
+
+
 def unique_current_manifest_for_profile(
     db: Session, profile: Optional[CrewProfile]
 ) -> Optional[VesselCrew]:
@@ -222,8 +291,8 @@ def unique_current_manifest_for_profile(
         )
     if (profile.passport_number or "").strip():
         clauses.append(
-            func.upper(func.trim(VesselCrew.passport_number))
-            == profile.passport_number.strip().upper()
+            normalized_passport_expression(VesselCrew.passport_number)
+            == normalize_passport_number(profile.passport_number)
         )
     if not clauses:
         return None
@@ -253,29 +322,20 @@ def event_context(
     if booking is not None and getattr(booking, "vessel_call_id", None):
         call = db.query(VesselCall).filter(VesselCall.id == booking.vessel_call_id).first()
         resolution = "booking"
-    if call is None and booking is not None and getattr(booking, "vessel_id", None):
-        vessel = db.query(Vessel).filter(Vessel.id == booking.vessel_id).first()
-        call = active_vessel_call(db, vessel)
-        resolution = "booking"
+    # A booking written without immutable call context is legacy/unresolved.
+    # Never create a present-day call while trying to describe its history.
     if call is None and vessel is not None:
-        call = active_vessel_call(db, vessel)
-        resolution = "vessel_id"
+        call = active_vessel_call(db, vessel, create=False)
+        resolution = "vessel_id" if call is not None else "unresolved"
     assignment = None
     if booking is not None and getattr(booking, "crew_assignment_id", None):
         assignment = db.query(CrewAssignment).filter(
             CrewAssignment.id == booking.crew_assignment_id
         ).first()
-    if assignment is None:
+    if assignment is None and call is not None and booking is None:
         assignment = active_assignment_for_profile(
             db, profile, vessel_call_id=call.id if call else None
         )
-    if call is None and assignment is None:
-        manifest = unique_current_manifest_for_profile(db, profile)
-        if manifest is not None:
-            vessel = db.query(Vessel).filter(Vessel.id == manifest.vessel_id).first()
-            assignment = assignment_for_manifest(
-                db, vessel, manifest, profile=profile
-            ) if vessel else None
     if call is None and assignment is not None:
         call = assignment.vessel_call
         resolution = "assignment"
