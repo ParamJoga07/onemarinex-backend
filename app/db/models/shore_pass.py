@@ -7,6 +7,18 @@ class ShorePass(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     crew_profile_id = Column(Integer, ForeignKey("crew_profiles.id", ondelete="CASCADE"), nullable=False)
+    crew_assignment_id = Column(
+        Integer,
+        ForeignKey("crew_assignments.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    vessel_call_id = Column(
+        Integer,
+        ForeignKey("vessel_calls.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
 
     agent_name = Column(String(120), nullable=True)
     shore_pass_id = Column(String(64), nullable=False, unique=True)

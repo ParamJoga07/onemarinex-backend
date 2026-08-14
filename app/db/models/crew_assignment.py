@@ -1,4 +1,4 @@
-from sqlalchemy import Column, DateTime, ForeignKey, Index, Integer, String, text
+from sqlalchemy import Boolean, Column, DateTime, ForeignKey, Index, Integer, String, text
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 
@@ -17,6 +17,25 @@ class CrewAssignment(Base):
             unique=True,
             postgresql_where=text(
                 "ended_at IS NULL AND vessel_crew_id IS NOT NULL"
+            ),
+        ),
+        Index(
+            "uq_crew_assignments_active_profile",
+            "vessel_call_id",
+            "crew_profile_id",
+            unique=True,
+            postgresql_where=text(
+                "ended_at IS NULL AND crew_profile_id IS NOT NULL"
+            ),
+        ),
+        Index(
+            "uq_crew_assignments_active_pending_passport",
+            "vessel_call_id",
+            text("upper(replace(trim(passport_number), ' ', ''))"),
+            unique=True,
+            postgresql_where=text(
+                "ended_at IS NULL AND crew_profile_id IS NULL "
+                "AND passport_number IS NOT NULL AND trim(passport_number) <> ''"
             ),
         ),
     )
@@ -46,6 +65,10 @@ class CrewAssignment(Base):
     nationality = Column(String(100), nullable=True)
     hpid = Column(String(100), nullable=True, index=True)
     passport_number = Column(String(64), nullable=True)
+    # Emergency contacts are vessel-assignment specific. A profile-level value
+    # cannot represent a sailor serving on two vessels at the same time.
+    emergency_email = Column(String(255), nullable=True)
+    shore_pass_eligible = Column(Boolean, nullable=False, default=False, server_default="false")
 
     started_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     ended_at = Column(DateTime(timezone=True), nullable=True)

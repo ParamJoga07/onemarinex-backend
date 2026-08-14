@@ -11,6 +11,7 @@ back, so it leaves no rows behind.
 
 import unittest
 import uuid
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import app.db.base  # noqa: F401 — registers every model on Base
@@ -28,6 +29,7 @@ from app.api.v1.routes_notifications import (
 )
 from app.db.models.user import User
 from app.db.models.crew_profile import CrewProfile
+from app.services.historical_context import assignment_for_manifest
 from app.db.models.vessel import Vessel
 from app.db.models.vessel_crew import VesselCrew
 from app.db.session import engine
@@ -182,17 +184,17 @@ class NotificationVesselScopingTests(unittest.TestCase):
         self.db.add(crew_user)
         self.db.flush()
         hpid = _uniq("HP")
-        self.db.add_all([
-            CrewProfile(
+        profile = CrewProfile(
                 user_id=crew_user.id, full_name="Crew", rank="able_seaman",
                 nationality="IN", hpid=hpid, current_port=self.PORT,
                 vessel=self.vessel_a.name,
-            ),
-            VesselCrew(
+            )
+        manifest = VesselCrew(
                 vessel_id=self.vessel_a.id, name="Crew", rank="able_seaman", hp_id=hpid,
-            ),
-        ])
+            )
+        self.db.add_all([profile, manifest])
         self.db.flush()
+        assignment_for_manifest(self.db, self.vessel_a, manifest, profile=profile)
         create_notification(
             body=NotificationCreateIn(
                 title="Own fleet", message="For our fleet",
@@ -236,19 +238,28 @@ class NotificationVesselScopingTests(unittest.TestCase):
         self.db.flush()
         hpid = _uniq("HP")
         passport = _uniq("P").replace("-", "")[:12].upper()
-        self.db.add(CrewProfile(
+        profile = CrewProfile(
             user_id=crew_user.id, full_name="Crew", rank="able_seaman",
             nationality="IN", hpid=hpid, passport_number=passport,
             current_port=self.PORT,
             # They have transferred to the new ship.
             vessel=new_ship.name,
-        ))
+        )
+        self.db.add(profile)
         # The same person is still listed on both manifests.
+        assignments = []
         for vessel in (self.vessel_a, new_ship):
-            self.db.add(VesselCrew(
+            manifest = VesselCrew(
                 vessel_id=vessel.id, name="Crew", rank="able_seaman",
                 hp_id=hpid, passport_number=passport,
-            ))
+            )
+            self.db.add(manifest)
+            self.db.flush()
+            assignments.append(
+                assignment_for_manifest(self.db, vessel, manifest, profile=profile)
+            )
+        self.db.flush()
+        assignments[0].ended_at = datetime.now(timezone.utc) - timedelta(days=1)
         self.db.flush()
 
         self.send(self.agent_a, self.vessel_a.name)

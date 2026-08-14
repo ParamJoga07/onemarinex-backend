@@ -7,7 +7,7 @@ from app.db.session import get_db
 from app.db.models.incident import Incident, IncidentNote, IncidentStatus, IncidentType
 from app.db.models.crew_assignment import CrewAssignment
 from app.api.v1.routes_auth import get_current_user
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 router = APIRouter()
 
@@ -38,7 +38,7 @@ class IncidentBase(BaseModel):
 
 class IncidentCreate(IncidentBase):
     # Recipient/aggregator is always derived from the authenticated actor.
-    pass
+    crew_assignment_id: Optional[int] = Field(default=None, gt=0)
 
 class IncidentResponse(IncidentBase):
     id: int
@@ -71,45 +71,6 @@ def _agent_incident_filter(db: Session, agent_user_id: int):
     # No current-profile fallback: rows without an immutable agency remain
     # superadmin-only until they are manually reconciled.
     return Incident.agency_id == agency_id if agency_id is not None else None
-
-
-def _resolve_vessel_for_crew(db: Session, crew) -> Optional[int]:
-    """Resolve the crew member's vessel from server-owned identity fields.
-
-    The browser must never choose who receives a crew incident. HPID is the
-    primary link, with passport and current vessel name as compatibility paths
-    for legacy rows affected by the historical IN/IND HPID mismatch.
-    """
-    from app.db.models.vessel_crew import VesselCrew
-    from sqlalchemy import func, or_
-
-    if crew is None:
-        return None
-
-    identity_clauses = []
-    if crew.hpid:
-        identity_clauses.append(
-            func.upper(func.trim(VesselCrew.hp_id)) == crew.hpid.strip().upper()
-        )
-    if crew.passport_number:
-        identity_clauses.append(
-            func.upper(func.trim(VesselCrew.passport_number))
-            == crew.passport_number.strip().upper()
-        )
-
-    query = db.query(VesselCrew.vessel_id).join(
-        Vessel, Vessel.id == VesselCrew.vessel_id
-    )
-    if identity_clauses:
-        match = query.filter(or_(*identity_clauses)).first()
-        if match:
-            return match[0]
-
-    if crew.vessel:
-        match = query.filter(Vessel.name == crew.vessel).first()
-        if match:
-            return match[0]
-    return None
 
 
 def _record_timeline(db: Session, incident: Incident, event_type: str, label: str,
@@ -335,8 +296,15 @@ async def create_incident(
         if not aggregator:
             raise HTTPException(status_code=403, detail="Not an aggregator")
         
-        # Remove fields that we will set explicitly
-        for field in ["aggregator_id"]:
+        if incident_in.crew_assignment_id is not None:
+            raise HTTPException(
+                status_code=400,
+                detail="Aggregators cannot select a crew vessel assignment",
+            )
+
+        # Remove fields that we will set explicitly or cannot derive from an
+        # authenticated aggregator operation.
+        for field in ["aggregator_id", "crew_assignment_id"]:
             incident_data.pop(field, None)
 
         incident = Incident(
@@ -347,6 +315,8 @@ async def create_incident(
     elif current_user.role == "crew":
         from app.db.models.crew_profile import CrewProfile
         crew = db.query(CrewProfile).filter(CrewProfile.user_id == current_user.id).first()
+        if crew is None:
+            raise HTTPException(status_code=404, detail="Crew profile not found")
         
         requested_trip_id = (incident_data.get("trip_id") or "").strip() or None
 
@@ -359,6 +329,7 @@ async def create_incident(
             "type",
             "port_name",
             "trip_id",
+            "crew_assignment_id",
         ]:
             incident_data.pop(field, None)
 
@@ -381,14 +352,64 @@ async def create_incident(
             trip_id = selected_booking.booking_id
         from app.services.historical_context import event_context
 
-        historical = event_context(db, booking=selected_booking, profile=crew)
+        requested_assignment_id = incident_in.crew_assignment_id
+        if selected_booking is not None:
+            if requested_assignment_id is not None and (
+                selected_booking.crew_assignment_id != requested_assignment_id
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="The selected assignment does not belong to this trip",
+                )
+            if selected_booking.crew_assignment_id is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail="This legacy trip has unresolved vessel ownership",
+                )
+            historical = event_context(
+                db, booking=selected_booking, profile=crew
+            )
+        else:
+            from app.services.historical_context import (
+                selected_assignment_for_profile,
+            )
+
+            try:
+                assignment = selected_assignment_for_profile(
+                    db, crew, requested_assignment_id
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc))
+            if assignment is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail="No active vessel assignment is available for this incident",
+                )
+            call = assignment.vessel_call
+            if call is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail="The selected vessel assignment has no vessel call context",
+                )
+            historical = {
+                "vessel_call": call,
+                "vessel_id": call.vessel_id,
+                "agency_id": call.agency_id,
+                "crew_assignment_id": assignment.id,
+                "port_id": call.port_id,
+                "context_resolution": "assignment",
+            }
         incident = Incident(
             **incident_data,
             incident_id=incident_id,
             reporter_name=current_user.name,
             reporter_role=crew.rank if crew else "Crew",
             reporter_id=reporter_hpid,
-            port_name=crew.current_port if crew else None,
+            port_name=(
+                historical["vessel_call"].port_name
+                if historical["vessel_call"]
+                else None
+            ),
             vessel_id=historical["vessel_id"],
             vessel_call_id=(
                 historical["vessel_call"].id if historical["vessel_call"] else None

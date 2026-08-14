@@ -35,7 +35,7 @@ class StoragePolicyTests(unittest.TestCase):
 
 class FileUploadTests(unittest.TestCase):
     def run_upload(self, file):
-        return asyncio.get_event_loop().run_until_complete(
+        return asyncio.run(
             upload_file(file=file, current_user=SimpleNamespace(id=42, role="agent"))
         )
 

@@ -1,0 +1,267 @@
+"""Identity rules for adding a person to a vessel call.
+
+Passport numbers in historical data differ in case and whitespace, while an
+HPID may differ because older HPIDs included the person's port and nationality.
+Neither difference should create another manifest row.  Conversely, a passport
+shared by several profiles is not safe evidence for choosing one account.
+
+These helpers deliberately refuse ambiguous matches.  They never merge crew
+profiles or guess which account owns a passport; that requires an audited
+identity-reconciliation decision.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from typing import Optional
+
+from sqlalchemy import func, text
+from sqlalchemy.orm import Session
+
+from app.db.models.crew_profile import CrewProfile
+from app.db.models.crew_identity_conflict import CrewIdentityConflictRecord
+from app.services.crew_reference import normalize_nationality
+
+
+class CrewIdentityConflict(ValueError):
+    """The supplied identity points at conflicting existing records."""
+
+
+def normalize_passport_number(value: Optional[str]) -> Optional[str]:
+    """Return the canonical comparison/storage form for a passport number.
+
+    Spaces are presentation noise in passport identifiers, including spaces
+    introduced by OCR.  Punctuation is retained because removing it could make
+    two genuinely different legacy identifiers compare equal.
+    """
+
+    if value is None:
+        return None
+    normalized = "".join(str(value).strip().upper().split())
+    return normalized or None
+
+
+def normalized_passport_expression(column):
+    """SQL equivalent of :func:`normalize_passport_number` for existing rows."""
+
+    # Existing production values contain ordinary spaces.  New writes are
+    # canonical, so this expression is primarily a compatibility bridge.
+    return func.replace(func.upper(func.trim(column)), " ", "")
+
+
+def resolve_verified_crew_profile(
+    db: Session,
+    *,
+    passport_number: str,
+    nationality: str,
+    crew_name: Optional[str] = None,
+    generated_hpid: Optional[str] = None,
+) -> Optional[CrewProfile]:
+    """Resolve one verified account or return ``None`` for a pending member.
+
+    A unique normalized passport plus matching nationality can recover an
+    account whose old HPID used a different port spelling.  More than one
+    passport match, disagreement between HPID and passport, or conflicting
+    nationality is returned as a reconciliation conflict instead of being
+    silently linked.
+    """
+
+    passport = normalize_passport_number(passport_number)
+    if not passport:
+        raise CrewIdentityConflict("A passport number is required")
+
+    passport_matches = (
+        db.query(CrewProfile)
+        .filter(normalized_passport_expression(CrewProfile.passport_number) == passport)
+        .order_by(CrewProfile.id)
+        .limit(3)
+        .all()
+    )
+    if len(passport_matches) > 1:
+        raise CrewIdentityConflict(
+            "This passport matches multiple crew accounts and requires "
+            "Superadmin identity reconciliation"
+        )
+
+    hpid_match = None
+    if generated_hpid:
+        hpid_matches = (
+            db.query(CrewProfile)
+            .filter(
+                func.upper(func.trim(CrewProfile.hpid))
+                == generated_hpid.strip().upper()
+            )
+            .order_by(CrewProfile.id)
+            .limit(2)
+            .all()
+        )
+        if len(hpid_matches) > 1:  # Defensive: hpid is expected to be unique.
+            raise CrewIdentityConflict(
+                "This HPID matches multiple crew accounts and requires "
+                "Superadmin identity reconciliation"
+            )
+        hpid_match = hpid_matches[0] if hpid_matches else None
+
+    passport_match = passport_matches[0] if passport_matches else None
+    if hpid_match and passport_match and hpid_match.id != passport_match.id:
+        raise CrewIdentityConflict(
+            "The passport and HPID identify different crew accounts; "
+            "Superadmin identity reconciliation is required"
+        )
+
+    profile = passport_match or hpid_match
+    if profile is None:
+        return None
+
+    stored_passport = normalize_passport_number(profile.passport_number)
+    if stored_passport and stored_passport != passport:
+        raise CrewIdentityConflict(
+            "The matched crew account has a different passport; "
+            "Superadmin identity reconciliation is required"
+        )
+
+    stored_nationality = normalize_nationality(profile.nationality, strict=False)
+    if stored_nationality and stored_nationality != nationality:
+        raise CrewIdentityConflict(
+            "The passport matches an account with a different nationality; "
+            "Superadmin identity reconciliation is required"
+        )
+    if crew_name and normalized_person_name(profile.full_name) != normalized_person_name(
+        crew_name
+    ):
+        raise CrewIdentityConflict(
+            "The passport matches an account with a different crew name; "
+            "Superadmin identity reconciliation is required"
+        )
+    return profile
+
+
+def normalized_person_name(value: Optional[str]) -> str:
+    return " ".join(str(value or "").strip().casefold().split())
+
+
+def identity_candidate_profile_ids(db: Session, passport_number: str) -> list[int]:
+    passport = normalize_passport_number(passport_number)
+    if not passport:
+        return []
+    return [
+        row[0]
+        for row in db.query(CrewProfile.id)
+        .filter(normalized_passport_expression(CrewProfile.passport_number) == passport)
+        .order_by(CrewProfile.id)
+        .all()
+    ]
+
+
+def identity_fingerprint(proposed_identity: dict) -> str:
+    """Stable identity evidence key used to scope a human decision.
+
+    Rank is deliberately excluded: rank changes throughout a seafarer's
+    career.  Name, nationality and passport must all describe the same retry;
+    a decision for one person must never authorize a different person who
+    later presents the same reused passport.
+    """
+
+    payload = {
+        "name": normalized_person_name(proposed_identity.get("name")),
+        "nationality": normalize_nationality(
+            proposed_identity.get("nationality"), strict=False
+        ),
+        "passport_number": normalize_passport_number(
+            proposed_identity.get("passport_number")
+        ),
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def resolved_identity_decision(
+    db: Session,
+    *,
+    operation: str,
+    vessel_id: int,
+    passport_number: str,
+    proposed_identity: dict,
+) -> tuple[bool, Optional[CrewProfile]]:
+    """Return an audited Superadmin decision for a retry, if one exists."""
+
+    passport = normalize_passport_number(passport_number)
+    row = (
+        db.query(CrewIdentityConflictRecord)
+        .filter(
+            CrewIdentityConflictRecord.operation == operation,
+            CrewIdentityConflictRecord.vessel_id == vessel_id,
+            CrewIdentityConflictRecord.passport_key == passport,
+            CrewIdentityConflictRecord.identity_fingerprint
+            == identity_fingerprint(proposed_identity),
+            CrewIdentityConflictRecord.status == "RESOLVED",
+        )
+        .order_by(CrewIdentityConflictRecord.resolved_at.desc(), CrewIdentityConflictRecord.id.desc())
+        .first()
+    )
+    if row is None:
+        return False, None
+    if row.resolution_action == "LEAVE_PENDING":
+        return True, None
+    if row.resolution_action == "SELECT_PROFILE" and row.selected_profile_id:
+        return True, db.query(CrewProfile).filter(
+            CrewProfile.id == row.selected_profile_id
+        ).first()
+    return False, None
+
+
+def persist_identity_conflict(
+    db: Session,
+    *,
+    operation: str,
+    vessel_id: int,
+    passport_number: str,
+    proposed_identity: dict,
+    message: str,
+) -> CrewIdentityConflictRecord:
+    """Persist or refresh one open queue item, without touching identities."""
+
+    passport = normalize_passport_number(passport_number)
+    fingerprint = identity_fingerprint(proposed_identity)
+    # Serialize concurrent reports of this exact ambiguity so retries update
+    # one durable queue item instead of racing two OPEN records.
+    bind = db.get_bind()
+    if bind is not None and bind.dialect.name == "postgresql":
+        db.execute(
+            text("SELECT pg_advisory_xact_lock(hashtext(:key))"),
+            {"key": f"crew-identity:{vessel_id}:{passport}:{fingerprint}"},
+        )
+    existing = (
+        db.query(CrewIdentityConflictRecord)
+        .filter(
+            CrewIdentityConflictRecord.vessel_id == vessel_id,
+            CrewIdentityConflictRecord.passport_key == passport,
+            CrewIdentityConflictRecord.identity_fingerprint == fingerprint,
+            CrewIdentityConflictRecord.status == "OPEN",
+        )
+        .order_by(CrewIdentityConflictRecord.id.desc())
+        .first()
+    )
+    candidates = identity_candidate_profile_ids(db, passport)
+    if existing:
+        existing.operation = operation
+        existing.proposed_identity = proposed_identity
+        existing.candidate_profile_ids = candidates
+        existing.conflict_message = message
+        existing.version += 1
+        row = existing
+    else:
+        row = CrewIdentityConflictRecord(
+            operation=operation,
+            vessel_id=vessel_id,
+            passport_key=passport,
+            identity_fingerprint=fingerprint,
+            proposed_identity=proposed_identity,
+            candidate_profile_ids=candidates,
+            conflict_message=message,
+        )
+        db.add(row)
+    db.commit()
+    db.refresh(row)
+    return row

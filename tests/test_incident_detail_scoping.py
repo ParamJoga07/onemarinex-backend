@@ -181,7 +181,7 @@ class IncidentDetailScopingTests(unittest.TestCase):
         """
         agent, incident = self.make_agency_with_incident(resolved=False)
 
-        result = asyncio.get_event_loop().run_until_complete(
+        result = asyncio.run(
             update_incident_status(
                 id=incident.id, status_update=StatusUpdate(status=IncidentStatus.INVESTIGATING),
                 db=self.db, current_user=agent,
@@ -194,7 +194,7 @@ class IncidentDetailScopingTests(unittest.TestCase):
 
     def test_terminal_incident_cannot_be_reopened(self):
         with self.assertRaises(HTTPException) as error:
-            asyncio.get_event_loop().run_until_complete(
+            asyncio.run(
                 update_incident_status(
                     id=self.incident_a.id, status_update=StatusUpdate(status=IncidentStatus.ACTIVE),
                     db=self.db, current_user=self.agent_a,

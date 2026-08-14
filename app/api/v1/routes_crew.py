@@ -1,8 +1,10 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
-from sqlalchemy import cast, String, func
+from sqlalchemy import cast, String, func, or_, text
+from sqlalchemy.exc import IntegrityError
 from typing import List, Optional
 from datetime import date, datetime, timedelta
+import hashlib
 import logging
 import re
 import uuid
@@ -19,6 +21,7 @@ from app.db.models.driver import Driver
 from app.db.models.incident import Incident, IncidentStatus, IncidentType
 from app.db.models.notification import Notification
 from app.db.models.crew_sos import CrewSos, CrewSosTimelineEvent
+from app.db.models.crew_assignment import CrewAssignment
 from app.db.models.port import Port
 from app.db.models.port_rule import PortRule
 from app.db.models.aggregator_profile import AggregatorProfile
@@ -59,6 +62,16 @@ PACKAGE_CLOSING_BUFFER_MINUTES = 2 * 60
 # still be able to book one — most of all once closing time has passed.
 TRANSFER_DIRECTIONS = {"to_city", "return_to_port"}
 DEFAULT_TRANSFER_DIRECTION = "to_city"
+
+
+def _assignment_call_or_conflict(assignment: CrewAssignment):
+    call = assignment.vessel_call
+    if call is None:
+        raise HTTPException(
+            status_code=409,
+            detail="The selected vessel assignment has no vessel call context",
+        )
+    return call
 
 
 def _port_rule_for(db: Session, port_value: Optional[str]) -> Optional[PortRule]:
@@ -327,12 +340,74 @@ class CabBookingCreateIn(BaseModel):
     ride_type: str  # flexible_ride | guaranteed_coordinated_ride
     trip_type: Optional[str] = None  # package_trip | coordinated_transfer
     direction: Optional[str] = None  # to_city | return_to_port
+    crew_assignment_id: Optional[int] = Field(default=None, gt=0)
+    # Temporarily optional for a backend-first deployment. New clients always
+    # send and reuse it; legacy callers receive no retry guarantee.
+    idempotency_key: Optional[str] = Field(default=None, min_length=8, max_length=64)
 
 class CabBookingCreateOut(BaseModel):
     booking_id: str
     otp: str
     status: str
     agent_number: Optional[str] = None
+
+
+class EligibleCrewAssignmentOut(BaseModel):
+    crew_assignment_id: int
+    vessel_call_id: int
+    vessel_id: Optional[int] = None
+    vessel_name: str
+    imo_number: Optional[str] = None
+    agency_id: Optional[int] = None
+    agency_name: Optional[str] = None
+    port_id: Optional[int] = None
+    port_name: Optional[str] = None
+    started_at: datetime
+    emergency_email: Optional[str] = None
+
+
+@router.get("/assignments/eligible")
+def list_eligible_crew_assignments(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if current_user.role != "crew":
+        raise HTTPException(status_code=403, detail="Only crew can list vessel assignments")
+    profile = db.query(CrewProfile).filter(CrewProfile.user_id == current_user.id).first()
+    if not profile:
+        raise HTTPException(status_code=404, detail="Crew profile not found")
+    from app.services.historical_context import (
+        eligible_assignments_for_profile,
+        ensure_assignments_for_profile,
+    )
+
+    ensure_assignments_for_profile(db, profile)
+    assignments = [
+        row
+        for row in eligible_assignments_for_profile(db, profile)
+        if row.vessel_call is not None
+        and row.vessel_call.vessel_id is not None
+        and bool(row.vessel_call.vessel_name)
+    ]
+    return {
+        "assignments": [
+            EligibleCrewAssignmentOut(
+                crew_assignment_id=row.id,
+                vessel_call_id=row.vessel_call_id,
+                vessel_id=row.vessel_call.vessel_id,
+                vessel_name=row.vessel_call.vessel_name,
+                imo_number=row.vessel_call.imo_number,
+                agency_id=row.vessel_call.agency_id,
+                agency_name=row.vessel_call.agency_name,
+                port_id=row.vessel_call.port_id,
+                port_name=row.vessel_call.port_name,
+                started_at=row.started_at,
+                emergency_email=row.emergency_email,
+            ).model_dump()
+            for row in assignments
+        ],
+        "requires_selection": len(assignments) > 1,
+    }
 
 class CabBookingDetailsOut(BaseModel):
     booking_id: str
@@ -584,72 +659,86 @@ def filter_estimates_for_ride_type(
     return available_estimates
 
 def sync_crew_manifest_helper(profile: CrewProfile, db: Session):
-    """
-    Tries to match CrewProfile with VesselCrew manifest.
-    If match found, updates VesselCrew status to Mapped, syncs vessel name,
-    port (if agent has one assigned), and generates an automated ShorePass if not present.
+    """Materialise every exact manifest membership for ``profile``.
+
+    Registration cannot choose one vessel when the same person is legitimately
+    present on two manifests.  This helper therefore maps every exact identity
+    match and never rewrites the profile's display vessel/port.
     """
     from app.db.models.vessel_crew import VesselCrew
     from app.db.models.vessel import Vessel
     
-    # 1. Try to find VesselCrew matching current vessel and generated HPID or passport search
-    hpid = profile.hpid or generate_hpid(profile.passport_number, profile.nationality, profile.current_port)
-    
-    v_crew = None
-    if profile.vessel and profile.vessel.strip():
-        target_vessel_name = profile.vessel.strip()
-        v_crew = (
-            db.query(VesselCrew)
-            .join(Vessel, VesselCrew.vessel_id == Vessel.id)
-            .filter(
-                func.lower(Vessel.name) == target_vessel_name.lower(),
-                (VesselCrew.hp_id == hpid) | (VesselCrew.passport_number == profile.passport_number)
-            )
-            .first()
-        )
-    else:
-        v_crew = db.query(VesselCrew).filter(VesselCrew.hp_id == hpid).first()
-        if not v_crew and profile.passport_number:
-            v_crew = db.query(VesselCrew).filter(VesselCrew.passport_number == profile.passport_number).first()
-        if not v_crew and profile.passport_number:
-            v_crew = db.query(VesselCrew).filter(VesselCrew.hp_id.like(f"HP-{profile.passport_number}-%")).first()
-        
-    if v_crew:
-        # 2. Sync fields
+    stable_hpid = ensure_stable_hpid(db, profile)
+    # An HPID uniquely issued to this signed-in profile is safe. Passport-only
+    # matches are accepted only when their name and nationality also agree;
+    # production contains reused passport values, so an OR query over passport
+    # alone would let one account claim several different people.
+    from app.services.crew_identity import (
+        normalize_passport_number,
+        normalized_passport_expression,
+        normalized_person_name,
+    )
+
+    hpid_manifests = db.query(VesselCrew).filter(
+        func.upper(func.trim(VesselCrew.hp_id)) == stable_hpid.upper()
+    ).all()
+    passport = normalize_passport_number(profile.passport_number)
+    passport_manifests = (
+        db.query(VesselCrew)
+        .filter(normalized_passport_expression(VesselCrew.passport_number) == passport)
+        .all()
+        if passport
+        else []
+    )
+    profile_name = normalized_person_name(profile.full_name)
+    profile_nationality = normalize_nationality(profile.nationality, strict=False)
+    manifests_by_id = {row.id: row for row in hpid_manifests}
+    for row in passport_manifests:
+        row_nationality = normalize_nationality(row.nationality, strict=False)
+        if (
+            normalized_person_name(row.name) == profile_name
+            and (not row_nationality or row_nationality == profile_nationality)
+        ):
+            manifests_by_id[row.id] = row
+    manifests = list(manifests_by_id.values())
+
+    for v_crew in manifests:
         v_crew.status = "Mapped"
-        
-        # Find vessel
         vessel = db.query(Vessel).filter(Vessel.id == v_crew.vessel_id).first()
         if vessel:
-            # Only sync vessel name from manifest if crew hasn't set one yet
-            if not profile.vessel:
-                profile.vessel = vessel.name
-            
-            # Sync port from agent if available and crew doesn't have one set yet
             vessel_port = None
             if vessel.agent and vessel.agent.agent_profile:
                 vessel_port = vessel.agent.agent_profile.assigned_port
-                
-            if vessel_port and not profile.current_port:
-                profile.current_port = vessel_port
-                
-            # The profile HPID is an immutable public identity. Align the
-            # manifest to it; never regenerate it from mutable port/profile data.
-            v_crew.hp_id = ensure_stable_hpid(db, profile)
-            
-            # 3. Auto-generate ShorePass if not exists (only if vessel is under a listed agency)
+            v_crew.hp_id = stable_hpid
+            from app.services.historical_context import assignment_for_manifest
+
+            assignment = assignment_for_manifest(db, vessel, v_crew, profile=profile)
+            if assignment and assignment.crew_profile_id is None:
+                profile_collision = db.query(CrewAssignment.id).filter(
+                    CrewAssignment.vessel_call_id == assignment.vessel_call_id,
+                    CrewAssignment.crew_profile_id == profile.id,
+                    CrewAssignment.ended_at.is_(None),
+                    CrewAssignment.id != assignment.id,
+                ).first()
+                if profile_collision is None:
+                    assignment.crew_profile_id = profile.id
+                else:
+                    logger.warning(
+                        "Skipped duplicate active assignment link for profile %s on call %s",
+                        profile.id,
+                        assignment.vessel_call_id,
+                    )
+
             agency_name = vessel.agency_name
             if not agency_name and vessel.agent and hasattr(vessel.agent, "agent_profile") and vessel.agent.agent_profile:
                 agency_name = vessel.agent.agent_profile.agency_name
 
-            if is_partnered_agency(agency_name):
-                port_to_use = vessel_port or profile.current_port or "GEN"
+            if is_partnered_agency(agency_name) and assignment:
+                port_to_use = assignment.vessel_call.port_name or vessel_port or "GEN"
                 existing_pass = db.query(ShorePass).filter(
                     ShorePass.crew_profile_id == profile.id,
-                    ShorePass.port_name == port_to_use,
-                    ShorePass.vessel_name == vessel.name
+                    ShorePass.crew_assignment_id == assignment.id,
                 ).first()
-                
                 if not existing_pass:
                     port_code = port_to_use.replace("port_", "")[:3].upper()
                     vessel_code = vessel.name.replace(" ", "")[:3].upper()
@@ -661,6 +750,8 @@ def sync_crew_manifest_helper(profile: CrewProfile, db: Session):
                     
                     new_pass = ShorePass(
                         crew_profile_id=profile.id,
+                        crew_assignment_id=assignment.id,
+                        vessel_call_id=assignment.vessel_call_id,
                         agent_name=agent_name,
                         shore_pass_id=shore_pass_id,
                         port_name=port_to_use,
@@ -670,19 +761,17 @@ def sync_crew_manifest_helper(profile: CrewProfile, db: Session):
                     )
                     db.add(new_pass)
 
-            from app.services.historical_context import assignment_for_manifest
-
-            assignment = assignment_for_manifest(db, vessel, v_crew, profile=profile)
-            if assignment and assignment.crew_profile_id is None:
-                assignment.crew_profile_id = profile.id
-                
-        try:
-            db.commit()
-            db.refresh(profile)
-            db.refresh(v_crew)
-        except Exception as e:
-            db.rollback()
-            print(f"Error syncing manifest: {e}")
+    try:
+        db.commit()
+        db.refresh(profile)
+    except IntegrityError:
+        db.rollback()
+        logger.exception("Unable to materialise manifest assignments for crew %s", profile.id)
+        raise
+    except Exception:
+        db.rollback()
+        logger.exception("Unable to materialise manifest assignments for crew %s", profile.id)
+        raise
 
 @router.patch("/profile", response_model=dict)
 def update_crew_profile(
@@ -725,6 +814,7 @@ def update_crew_profile(
 
 @router.get("/profile", response_model=CrewProfileOut)
 def get_crew_profile(
+    crew_assignment_id: Optional[int] = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
@@ -732,69 +822,49 @@ def get_crew_profile(
     if not profile:
         raise HTTPException(status_code=404, detail="Crew profile not found")
         
-    # Sync with manifest
-    sync_crew_manifest_helper(profile, db)
-    
-    # Expose the extra fields
-    from app.db.models.vessel_crew import VesselCrew
-    from app.db.models.vessel import Vessel
-    
-    v_crew = None
-    if profile.vessel and profile.vessel.strip():
-        target_vessel_name = profile.vessel.strip()
-        v_crew = (
-            db.query(VesselCrew)
-            .join(Vessel, VesselCrew.vessel_id == Vessel.id)
-            .filter(
-                func.lower(Vessel.name) == target_vessel_name.lower(),
-                (VesselCrew.hp_id == profile.hpid) | (VesselCrew.passport_number == profile.passport_number)
-            )
-            .first()
+    from app.services.historical_context import selected_assignment_for_profile
+
+    try:
+        assignment = selected_assignment_for_profile(
+            db, profile, crew_assignment_id
         )
-    else:
-        v_crew = db.query(VesselCrew).filter(VesselCrew.hp_id == profile.hpid).first()
-        if not v_crew and profile.passport_number:
-            v_crew = db.query(VesselCrew).filter(VesselCrew.passport_number == profile.passport_number).first()
-    vessel = None
-    if v_crew:
-        vessel = db.query(Vessel).filter(Vessel.id == v_crew.vessel_id).first()
-    if vessel:
-        from app.services.vessel_lifecycle import synchronize_vessel_lifecycle
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
 
-        if synchronize_vessel_lifecycle(db, [vessel]):
-            db.commit()
-            db.refresh(vessel)
-        
-    profile.vessel_imo = vessel.imo_number if vessel else None
-    profile.vessel_type = vessel.vessel_type if vessel else None
-    profile.berth_assignment = vessel.berth_assignment if vessel else None
-    profile.eta = vessel.eta if vessel else None
-    profile.etd = vessel.etd if vessel else None
-    profile.vessel_status = vessel.status if vessel else None
-    profile.expiry_date = v_crew.expiry_date if v_crew else None
-    profile.mapping_status = v_crew.status if v_crew else "Unmapped"
-    profile.shore_pass_eligible = v_crew.shore_pass_eligible if v_crew else False
-    
-    v_target = vessel
-    if not v_target and profile.vessel:
-        v_target = db.query(Vessel).filter(Vessel.name.ilike(profile.vessel.strip())).first()
+    output = CrewProfileOut.model_validate(profile)
+    if assignment is None:
+        return output.model_copy(update={
+            "mapping_status": "Unmapped",
+            "shore_pass_eligible": False,
+            "agency_name": "Other",
+            "has_partnered_agency": False,
+            "vessel_exists": False,
+        })
 
-    agency_name = None
-    if v_target:
-        agency_name = v_target.agency_name
-        if not agency_name and v_target.agent and hasattr(v_target.agent, "agent_profile") and v_target.agent.agent_profile:
-            agency_name = v_target.agent.agent_profile.agency_name
-
-    if not agency_name:
-        agency_name = "Other"
-
-    profile.agency_name = agency_name
-    profile.has_partnered_agency = is_partnered_agency(agency_name)
-    profile.vessel_exists = v_target is not None
-    
-    return profile
+    call = _assignment_call_or_conflict(assignment)
+    vessel = call.vessel
+    manifest = assignment.vessel_crew
+    agency_name = call.agency_name or "Other"
+    return output.model_copy(update={
+        "sos_email": assignment.emergency_email,
+        "current_port": call.port_name,
+        "vessel": call.vessel_name,
+        "vessel_imo": call.imo_number,
+        "vessel_type": vessel.vessel_type if vessel else None,
+        "berth_assignment": vessel.berth_assignment if vessel else None,
+        "eta": call.eta,
+        "etd": call.etd,
+        "vessel_status": vessel.status if vessel else call.status,
+        "expiry_date": manifest.expiry_date if manifest else None,
+        "mapping_status": manifest.status if manifest else "Mapped",
+        "shore_pass_eligible": assignment.shore_pass_eligible,
+        "agency_name": agency_name,
+        "has_partnered_agency": is_partnered_agency(agency_name),
+        "vessel_exists": vessel is not None,
+    })
 
 class SOSConfigIn(BaseModel):
+    crew_assignment_id: Optional[int] = Field(default=None, gt=0)
     sos_email: EmailStr
 
 class SOSTriggerIn(BaseModel):
@@ -840,17 +910,34 @@ def update_sos_config(
     if not profile:
         raise HTTPException(status_code=404, detail="Crew profile not found")
         
-    profile.sos_email = str(body.sos_email).strip()
+    from app.services.historical_context import selected_assignment_for_profile
+
+    try:
+        assignment = selected_assignment_for_profile(
+            db, profile, body.crew_assignment_id
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    if assignment is None:
+        raise HTTPException(
+            status_code=409,
+            detail="No active vessel assignment is available for SOS configuration",
+        )
+    assignment.emergency_email = str(body.sos_email).strip()
     try:
         db.commit()
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
         
-    return {"message": "SOS config updated successfully", "sos_email": profile.sos_email}
+    return {
+        "message": "SOS config updated successfully",
+        "sos_email": assignment.emergency_email,
+        "crew_assignment_id": assignment.id,
+    }
 
 
-def _active_sos_booking(db: Session, crew_profile_id: int) -> Optional[CabBooking]:
+def _active_sos_bookings(db: Session, crew_profile_id: int) -> list[CabBooking]:
     from app.db.models.cab_booking import BookingStatus
 
     return (
@@ -864,12 +951,29 @@ def _active_sos_booking(db: Session, crew_profile_id: int) -> Optional[CabBookin
             ]),
         )
         .order_by(CabBooking.created_at.desc(), CabBooking.id.desc())
-        .first()
+        .all()
+    )
+
+
+def _active_sos_booking_for_trip(
+    db: Session, crew_profile_id: int, trip_id: str
+) -> Optional[CabBooking]:
+    requested = (trip_id or "").strip()
+    if not requested:
+        return None
+    return next(
+        (
+            row
+            for row in _active_sos_bookings(db, crew_profile_id)
+            if row.booking_id == requested
+        ),
+        None,
     )
 
 
 @router.get("/sos/eligibility", response_model=SosEligibilityOut)
 def get_sos_eligibility(
+    trip_id: Optional[str] = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -879,8 +983,29 @@ def get_sos_eligibility(
     if not profile:
         raise HTTPException(status_code=404, detail="Crew profile not found")
 
-    email_configured = bool((current_user.email or "").strip() and (profile.sos_email or "").strip())
-    active_booking = _active_sos_booking(db, profile.id)
+    active_bookings = _active_sos_bookings(db, profile.id)
+    active_booking = (
+        _active_sos_booking_for_trip(db, profile.id, trip_id)
+        if trip_id
+        else (active_bookings[0] if len(active_bookings) == 1 else None)
+    )
+    if active_booking is None and len(active_bookings) > 1 and not trip_id:
+        return {
+            "eligible": False,
+            "reason": "Select an active trip before using SOS.",
+            "trip_id": None,
+            # This flag describes the selected operational context. With no
+            # selected trip there is intentionally no single SOS address.
+            "email_configured": False,
+        }
+
+    assignment = active_booking.crew_assignment if active_booking else None
+    emergency_email = (
+        (assignment.emergency_email or "").strip() if assignment else ""
+    )
+    email_configured = bool(
+        (current_user.email or "").strip() and emergency_email
+    )
     reason = None
     if not email_configured:
         reason = "A crew email and ship SOS email are required."
@@ -976,32 +1101,36 @@ def trigger_sos(
 
     if not (current_user.email or "").strip():
         raise HTTPException(status_code=400, detail="Crew email is required for SOS")
-    if not (profile.sos_email or "").strip():
-        raise HTTPException(status_code=400, detail="Ship SOS email is not configured")
-
-    # Resolve the trip from the authenticated crew profile. Never trust a
-    # client-provided trip id by itself: it must belong to this crew and remain
-    # in one of the pre-existing active SOS statuses.
-    active_booking = _active_sos_booking(db, profile.id)
+    # The submitted trip selects the exact assignment. A profile-level email
+    # cannot safely identify the ship when this person sails on two vessels.
     requested_trip_id = body.trip_id.strip()
-    if active_booking is None or active_booking.booking_id != requested_trip_id:
+    active_booking = _active_sos_booking_for_trip(
+        db, profile.id, requested_trip_id
+    )
+    if active_booking is None:
         raise HTTPException(
             status_code=400,
             detail="SOS requires an existing active trip belonging to this crew member",
         )
+    assignment = active_booking.crew_assignment
+    emergency_email = (
+        (assignment.emergency_email or "").strip() if assignment else ""
+    )
+    if not emergency_email:
+        raise HTTPException(status_code=400, detail="Ship SOS email is not configured")
 
-    port_name = active_booking.port or profile.current_port
+    port_name = active_booking.port
     from app.services.historical_context import event_context
 
     historical = event_context(db, booking=active_booking, profile=profile)
     vessel_snapshot = (
         historical["vessel_call"].vessel_name
         if historical["vessel_call"]
-        else profile.vessel
+        else None
     )
 
     # 1. Ship Email
-    recipients = [profile.sos_email]
+    recipients = [emergency_email]
 
     # 2. HeyPorts Support
     recipients.append("support@heyports.com")
@@ -1011,7 +1140,7 @@ def trigger_sos(
     # for real once SMTP_* is configured; logs otherwise.
     from app.services.email import send_sos_alert
     send_sos_alert(
-        ship_email=profile.sos_email,
+        ship_email=emergency_email,
         crew_name=profile.full_name or current_user.email,
         crew_email=current_user.email,
         vessel=vessel_snapshot,
@@ -1035,7 +1164,7 @@ def trigger_sos(
         context_resolution=historical["context_resolution"],
         trip_id=active_booking.booking_id,
         crew_email=current_user.email.strip(),
-        sos_email=profile.sos_email.strip(),
+        sos_email=emergency_email,
         port_name=port_name,
         vessel=vessel_snapshot,
         lat=body.lat,
@@ -1176,6 +1305,7 @@ def trigger_sos(
     return {
         "status": "success",
         "message": "SOS Alert sent to all recipients",
+        "id": new_sos.id,
         "recipients_count": len(set(recipients)),
         "incident_id": None,
         "trip_id": active_booking.booking_id,
@@ -1230,6 +1360,7 @@ def submit_feedback(
     return {"status": "success", "message": "Feedback received"}
 
 class GenerateShorePassIn(BaseModel):
+    crew_assignment_id: Optional[int] = Field(default=None, gt=0)
     port_name: Optional[str] = None
     vessel_name: Optional[str] = None
 
@@ -1249,19 +1380,35 @@ def generate_shorepass(
     if not profile:
         raise HTTPException(status_code=404, detail="Crew profile not found")
     
-    # Use explicitly passed port/vessel, fallback to profile values
-    port = body.port_name or profile.current_port
-    vessel = body.vessel_name or profile.vessel
+    from app.services.historical_context import selected_assignment_for_profile
 
-    if not port or not vessel:
-        raise HTTPException(status_code=400, detail="Port and Vessel must be selected first")
+    try:
+        assignment = selected_assignment_for_profile(
+            db, profile, body.crew_assignment_id
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    if assignment is None:
+        raise HTTPException(status_code=409, detail="No active vessel assignment is available")
+    call = _assignment_call_or_conflict(assignment)
+    port = call.port_name or body.port_name
+    vessel = call.vessel_name
+    if not vessel:
+        raise HTTPException(
+            status_code=409,
+            detail="The selected vessel assignment has no vessel context",
+        )
+    # Caller-supplied labels are display hints only and may not select another
+    # operational context.
+    if body.vessel_name and body.vessel_name.strip().lower() != vessel.strip().lower():
+        raise HTTPException(status_code=409, detail="Vessel does not match selected assignment")
+    agency_name = call.agency_name
 
-    # Check if vessel is under a listed agency
-    from app.db.models.vessel import Vessel
-    v_target = db.query(Vessel).filter(Vessel.name.ilike(vessel.strip())).first()
-    agency_name = v_target.agency_name if v_target else None
-    if not agency_name and v_target and v_target.agent and hasattr(v_target.agent, "agent_profile") and v_target.agent.agent_profile:
-        agency_name = v_target.agent.agent_profile.agency_name
+    if not port:
+        raise HTTPException(
+            status_code=409,
+            detail="The selected vessel assignment has no port context",
+        )
 
     if not is_partnered_agency(agency_name):
         return None
@@ -1281,8 +1428,17 @@ def generate_shorepass(
     ensure_stable_hpid(db, profile, port=port)
 
     # Generate shore pass
+    existing = db.query(ShorePass).filter(
+        ShorePass.crew_profile_id == profile.id,
+        ShorePass.crew_assignment_id == assignment.id,
+    ).order_by(ShorePass.created_at.desc()).first()
+    if existing:
+        return existing
+
     new_pass = ShorePass(
         crew_profile_id=profile.id,
+        crew_assignment_id=assignment.id,
+        vessel_call_id=assignment.vessel_call_id,
         agent_name=agent_name,
         shore_pass_id=shore_pass_id,
         port_name=port,
@@ -1306,32 +1462,36 @@ def generate_shorepass(
 
 @router.get("/shorepass", response_model=Optional[ShorePassOut])
 def get_current_shorepass(
+    crew_assignment_id: Optional[int] = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
     profile = db.query(CrewProfile).filter(CrewProfile.user_id == current_user.id).first()
-    if not profile or not profile.vessel:
+    if not profile:
         return None
-    
-    from app.db.models.vessel import Vessel
-    v_target = db.query(Vessel).filter(Vessel.name.ilike(profile.vessel.strip())).first()
-    agency_name = v_target.agency_name if v_target else None
-    if not agency_name and v_target and v_target.agent and hasattr(v_target.agent, "agent_profile") and v_target.agent.agent_profile:
-        agency_name = v_target.agent.agent_profile.agency_name
+
+    from app.services.historical_context import selected_assignment_for_profile
+    try:
+        assignment = selected_assignment_for_profile(db, profile, crew_assignment_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    if assignment is None:
+        return None
+    call = _assignment_call_or_conflict(assignment)
+    agency_name = call.agency_name
 
     if not is_partnered_agency(agency_name):
         return None
 
-    # Get the latest shore pass for the CURRENT port and CURRENT vessel
     last_pass = db.query(ShorePass).filter(
         ShorePass.crew_profile_id == profile.id,
-        ShorePass.port_name == profile.current_port,
-        func.lower(ShorePass.vessel_name) == profile.vessel.strip().lower()
+        ShorePass.crew_assignment_id == assignment.id,
     ).order_by(ShorePass.created_at.desc()).first()
     return last_pass
 
 @router.get("/shorepass/eligibility")
 def check_shorepass_eligibility(
+    crew_assignment_id: Optional[int] = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
@@ -1339,43 +1499,29 @@ def check_shorepass_eligibility(
     Returns under_agent=true only if the vessel name AND the crew's HPID
     are both found in some agent's vessel_crew mapping AND agency is NOT 'Other'.
     """
-    from app.db.models.vessel import Vessel
-    from app.db.models.vessel_crew import VesselCrew
-    from app.db.models.user import User as UserModel
-
     if current_user.role != "crew":
         return {"under_agent": False, "agent_name": None}
 
     profile = db.query(CrewProfile).filter(CrewProfile.user_id == current_user.id).first()
-    if not profile or not profile.vessel or not profile.hpid:
+    if not profile:
         return {"under_agent": False, "agent_name": None}
-
-    # Check if this vessel name exists AND has a vessel_crew entry with matching hp_id
-    matching_vessel = (
-        db.query(Vessel)
-        .join(VesselCrew, VesselCrew.vessel_id == Vessel.id)
-        .filter(
-            Vessel.name.ilike(f"%{profile.vessel}%"),
-            VesselCrew.hp_id == profile.hpid,
-        )
-        .first()
-    )
-
-    if not matching_vessel:
+    from app.services.historical_context import selected_assignment_for_profile
+    try:
+        assignment = selected_assignment_for_profile(db, profile, crew_assignment_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    if assignment is None:
         return {"under_agent": False, "agent_name": None}
-
-    agency_name = matching_vessel.agency_name
-    if not agency_name and matching_vessel.agent and hasattr(matching_vessel.agent, "agent_profile") and matching_vessel.agent.agent_profile:
-        agency_name = matching_vessel.agent.agent_profile.agency_name
+    call = _assignment_call_or_conflict(assignment)
+    agency_name = call.agency_name
 
     if not is_partnered_agency(agency_name):
         return {"under_agent": False, "agent_name": None}
 
-    # Get the agent's name
-    agent_user = db.query(UserModel).filter(UserModel.id == matching_vessel.agent_id).first()
     return {
         "under_agent": True,
-        "agent_name": agent_user.name if agent_user else None,
+        "agent_name": agency_name,
+        "crew_assignment_id": assignment.id,
     }
 
 @router.post("/shorepass/{pass_id}/verify", response_model=ShorePassOut)
@@ -2032,6 +2178,76 @@ def book_cab(
     if not profile:
         raise HTTPException(status_code=404, detail="Crew profile not found")
 
+    # Resolve retries before checking availability or broadcasting to
+    # providers. A retry may arrive after the port window changed, but must
+    # still receive the booking originally created for this action.
+    idempotency_key = (
+        body.idempotency_key.strip()
+        if body.idempotency_key
+        else f"legacy-{uuid.uuid4().hex}"
+    )
+    fingerprint_payload = body.model_dump(
+        mode="json", exclude={"idempotency_key"}
+    )
+    request_fingerprint = hashlib.sha256(
+        json.dumps(
+            fingerprint_payload, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+    ).hexdigest()
+    # PostgreSQL transaction-scoped advisory locks serialize identical client
+    # actions before any provider notification/timeline side effect is made.
+    # SQLite test/dev databases rely on the unique index as the final guard.
+    bind = db.get_bind()
+    if bind is not None and bind.dialect.name == "postgresql":
+        lock_material = hashlib.sha256(
+            f"{profile.id}:{idempotency_key}".encode("utf-8")
+        ).digest()[:8]
+        lock_key = int.from_bytes(lock_material, "big", signed=True)
+        db.execute(
+            text("SELECT pg_advisory_xact_lock(:lock_key)"),
+            {"lock_key": lock_key},
+        )
+    existing_booking = (
+        db.query(CabBooking)
+        .filter(
+            CabBooking.crew_id == profile.id,
+            CabBooking.client_idempotency_key == idempotency_key,
+        )
+        .first()
+    )
+    if existing_booking is not None:
+        if existing_booking.request_fingerprint != request_fingerprint:
+            raise HTTPException(
+                status_code=409,
+                detail="This idempotency key was already used for a different booking",
+            )
+        return CabBookingCreateOut(
+            booking_id=existing_booking.booking_id,
+            otp=existing_booking.otp,
+            status=(
+                existing_booking.status.value
+                if hasattr(existing_booking.status, "value")
+                else existing_booking.status
+            ),
+            agent_number=existing_booking.agent_number,
+        )
+
+    from app.services.historical_context import selected_assignment_for_profile
+
+    try:
+        booking_assignment = selected_assignment_for_profile(
+            db, profile, body.crew_assignment_id
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    if booking_assignment is None:
+        raise HTTPException(
+            status_code=409,
+            detail="No active vessel assignment is available for this booking",
+        )
+    booking_call = _assignment_call_or_conflict(booking_assignment)
+    booking_vessel = booking_call.vessel
+
     from app.db.models.cab_booking import VehicleType, BookingStatus, RideType
     from app.db.models.booking_timeline import TimelineEventType
     from app.services.booking_service import is_ride_type_available
@@ -2042,10 +2258,14 @@ def book_cab(
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid ride type")
 
-    # Current port is maintained on the authenticated crew profile. Treat it
-    # as authoritative so changing a request/local-storage port cannot select
-    # a looser set of opening hours.
-    port_value = profile.current_port or body.port
+    # The selected vessel call owns the operation. Device storage and mutable
+    # CrewProfile fields cannot choose another port when the person has two
+    # concurrent assignments.
+    port_value = (
+        (booking_call.port.code if booking_call.port else None)
+        or booking_call.port_name
+        or body.port
+    )
     resolved_trip_type = body.trip_type or (
         "package_trip" if body.scheduled_time is None else "coordinated_transfer"
     )
@@ -2201,11 +2421,11 @@ def book_cab(
 
     from app.services import agent_contact
 
-    booking_vessel = agent_contact.vessel_for_crew(db, profile)
-    booking_agent_number = agent_contact.support_number_for_crew(db, profile)
-    from app.services.historical_context import event_context, port_for_reference
+    booking_agent_number = agent_contact.support_number_for_assignment(
+        db, booking_assignment
+    )
+    from app.services.historical_context import port_for_reference
 
-    historical = event_context(db, profile=profile, vessel=booking_vessel)
     booking_port = port_for_reference(db, port_value)
 
     new_booking = CabBooking(
@@ -2234,14 +2454,14 @@ def book_cab(
         aggregator_name=None,
         # The ship this trip is taken from, pinned now rather than inferred
         # later — see app/services/agent_contact.py.
-        vessel_id=booking_vessel.id if booking_vessel else None,
-        vessel_call_id=(
-            historical["vessel_call"].id if historical["vessel_call"] else None
-        ),
-        crew_assignment_id=historical["crew_assignment_id"],
-        agency_id=historical["agency_id"],
-        port_id=historical["port_id"] or (booking_port.id if booking_port else None),
-        context_resolution=historical["context_resolution"],
+        vessel_id=booking_call.vessel_id,
+        vessel_call_id=booking_call.id,
+        crew_assignment_id=booking_assignment.id,
+        agency_id=booking_call.agency_id,
+        port_id=booking_call.port_id or (booking_port.id if booking_port else None),
+        context_resolution="assignment",
+        client_idempotency_key=idempotency_key,
+        request_fingerprint=request_fingerprint,
         # The agency's own number, not the port's. These two were previously
         # both filled from port_rules.helpline_number, so the "agent number" was
         # really the shared port helpline: an agent editing their contact number
@@ -2282,6 +2502,42 @@ def book_cab(
     try:
         db.commit()
         db.refresh(new_booking)
+    except IntegrityError as exc:
+        db.rollback()
+        raced_booking = (
+            db.query(CabBooking)
+            .filter(
+                CabBooking.crew_id == profile.id,
+                CabBooking.client_idempotency_key == idempotency_key,
+            )
+            .first()
+        )
+        if (
+            raced_booking is not None
+            and raced_booking.request_fingerprint == request_fingerprint
+        ):
+            return CabBookingCreateOut(
+                booking_id=raced_booking.booking_id,
+                otp=raced_booking.otp,
+                status=(
+                    raced_booking.status.value
+                    if hasattr(raced_booking.status, "value")
+                    else raced_booking.status
+                ),
+                agent_number=raced_booking.agent_number,
+            )
+        if raced_booking is None or idempotency_key.startswith("legacy-"):
+            logger.exception(
+                "Booking creation failed with a non-idempotency integrity error"
+            )
+            raise HTTPException(
+                status_code=500,
+                detail="Unable to create booking",
+            ) from exc
+        raise HTTPException(
+            status_code=409,
+            detail="The booking was submitted concurrently; retry with the same idempotency key",
+        )
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
@@ -2426,13 +2682,7 @@ def get_booking_details(
             raise HTTPException(status_code=404, detail="Booking not found")
     
     from app.services.booking_service import serialize_booking
-    from app.services import agent_contact
     serialized = serialize_booking(booking)
-    # Read the agency's number live, falling back to whatever the booking
-    # stored. The column is a snapshot, so an agent who corrects their contact
-    # number would otherwise never see it change on a trip already running —
-    # which is exactly how it looked frozen.
-    live_agent_number = agent_contact.support_number_for_crew(db, booking.crew)
     return CabBookingDetailsOut(
         booking_id=booking.booking_id,
         vehicle_name=booking.vehicle_name,
@@ -2443,7 +2693,8 @@ def get_booking_details(
         driver_phone=serialized.get("driver_phone") or "Not Yet Assigned",
         assigned_driver_id=serialized.get("assigned_driver_id"),
         otp=booking.otp,
-        agent_number=live_agent_number or booking.agent_number,
+        # Historical trip contact is a snapshot from its exact assignment.
+        agent_number=booking.agent_number,
         helpline_number=serialized.get("helpline_number"),
         status=booking.status.value,
         ride_type=serialized.get("ride_type"),

@@ -747,7 +747,7 @@ def get_agent_bookings(
         CrewProfile.id.label("crew_id"),
         func.coalesce(CrewAssignment.crew_name, CrewProfile.full_name).label("crew_name"),
         func.coalesce(CrewAssignment.hpid, CrewProfile.hpid).label("crew_hpid"),
-        func.coalesce(VesselCall.vessel_name, CrewProfile.vessel).label("crew_vessel"),
+        VesselCall.vessel_name.label("crew_vessel"),
         AggregatorProfile.company_name.label("provider_company_name"),
         AggregatorProfile.provider_type.label("provider_type"),
         Driver.name.label("assigned_driver_name"),
@@ -871,30 +871,51 @@ class AgentCrewDetailOut(BaseModel):
 @router.get("/crew/{hp_id}", response_model=AgentCrewDetailOut)
 def get_agent_crew_detail(
     hp_id: str,
+    vessel_id: Optional[int] = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     if current_user.role != "agent":
         raise HTTPException(status_code=403, detail="Only agents can access this")
 
-    # Find the VesselCrew record for this HPID on one of the agent's vessels
-    vessel_crew = db.query(VesselCrew).filter(VesselCrew.hp_id == hp_id).first()
-    vessel = None
-    if vessel_crew:
-        vessel = db.query(Vessel).filter(
-            Vessel.id == vessel_crew.vessel_id,
-            Vessel.agent_id == current_user.id
-        ).first()
-    if not vessel_crew or not vessel:
+    query = (
+        db.query(VesselCrew, Vessel)
+        .join(Vessel, Vessel.id == VesselCrew.vessel_id)
+        .filter(
+            VesselCrew.hp_id == hp_id,
+            Vessel.agent_id == current_user.id,
+        )
+    )
+    if vessel_id is not None:
+        query = query.filter(Vessel.id == vessel_id)
+    matches = query.limit(2).all()
+    if not matches:
         raise HTTPException(status_code=404, detail="Crew not found in your vessels")
+    if len(matches) > 1:
+        raise HTTPException(
+            status_code=409,
+            detail="Crew belongs to multiple vessels; select a vessel",
+        )
+    vessel_crew, vessel = matches[0]
 
     crew_profile = db.query(CrewProfile).filter(CrewProfile.hpid == hp_id).first()
 
     shore_pass = None
     if crew_profile:
-        shore_pass = db.query(ShorePass).filter(
-            ShorePass.crew_profile_id == crew_profile.id
-        ).order_by(ShorePass.created_at.desc()).first()
+        assignment = (
+            db.query(CrewAssignment)
+            .filter(
+                CrewAssignment.vessel_crew_id == vessel_crew.id,
+                CrewAssignment.crew_profile_id == crew_profile.id,
+            )
+            .order_by(CrewAssignment.started_at.desc(), CrewAssignment.id.desc())
+            .first()
+        )
+        if assignment:
+            shore_pass = db.query(ShorePass).filter(
+                ShorePass.crew_profile_id == crew_profile.id,
+                ShorePass.crew_assignment_id == assignment.id,
+            ).order_by(ShorePass.created_at.desc()).first()
 
     full_name = crew_profile.full_name if crew_profile else vessel_crew.name
     rank = crew_profile.rank if crew_profile else vessel_crew.rank
@@ -911,7 +932,7 @@ def get_agent_crew_detail(
         date_of_birth=date_of_birth,
         hpid=hp_id,
         current_port=crew_profile.current_port if crew_profile else None,
-        vessel=crew_profile.vessel if crew_profile else vessel.name,
+        vessel=vessel.name,
         vessel_id=vessel_crew.vessel_id,
         vessel_name=vessel.name,
         imo_number=vessel.imo_number,

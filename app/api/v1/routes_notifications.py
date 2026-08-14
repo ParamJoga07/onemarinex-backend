@@ -1,6 +1,7 @@
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import and_
+from sqlalchemy import and_, cast, or_
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, Field
 from datetime import datetime
@@ -281,45 +282,33 @@ def _recipient_context(db: Session, current_user):
     vessel_name = None
     vessel_ids: set[int] = set()
     if current_user.role == "crew":
-        from app.db.models.vessel import Vessel
-        from app.db.models.vessel_crew import VesselCrew
-        from sqlalchemy import func, or_
+        from app.services.historical_context import (
+            eligible_assignments_for_profile,
+            ensure_assignments_for_profile,
+        )
 
         profile = db.query(CrewProfile).filter(CrewProfile.user_id == current_user.id).first()
         if profile:
-            port_name = profile.current_port
-            vessel_name = profile.vessel
-
-            # The ship they are on *now*, not every ship they have ever sailed.
-            #
-            # This used to match their HPID and passport against the whole
-            # vessel_crew table with no vessel filter, so a crew member who had
-            # joined a second ship stayed a recipient for their old one — and a
-            # notice addressed to one vessel reached crew on another. Their
-            # current vessel is the one their profile names; the manifest match
-            # is the fallback for crew whose profile has no vessel set.
-            if vessel_name:
-                vessel_ids.update(
-                    row[0] for row in db.query(Vessel.id).filter(
-                        func.lower(func.trim(Vessel.name)) == vessel_name.strip().lower()
-                    ).all()
-                )
-
-            if not vessel_ids:
-                clauses = []
-                if profile.hpid:
-                    clauses.append(
-                        func.upper(func.trim(VesselCrew.hp_id)) == profile.hpid.strip().upper()
-                    )
-                if profile.passport_number:
-                    clauses.append(
-                        func.upper(func.trim(VesselCrew.passport_number))
-                        == profile.passport_number.strip().upper()
-                    )
-                if clauses:
-                    vessel_ids.update(
-                        row[0] for row in db.query(VesselCrew.vessel_id).filter(or_(*clauses)).all()
-                    )
+            assignments = eligible_assignments_for_profile(db, profile)
+            if not assignments:
+                ensure_assignments_for_profile(db, profile)
+                assignments = eligible_assignments_for_profile(db, profile)
+            vessel_ids.update(
+                row.vessel_call.vessel_id for row in assignments
+                if row.vessel_call and row.vessel_call.vessel_id
+            )
+            ports = {
+                row.vessel_call.port_name for row in assignments
+                if row.vessel_call and row.vessel_call.port_name
+            }
+            names = {
+                row.vessel_call.vessel_name for row in assignments
+                if row.vessel_call and row.vessel_call.vessel_name
+            }
+            # Legacy free-string filtering is safe only when exactly one
+            # assignment applies. Multi-vessel delivery uses target IDs.
+            port_name = next(iter(ports)) if len(ports) == 1 else None
+            vessel_name = next(iter(names)) if len(names) == 1 else None
     else:
         from app.db.models.agent_profile import AgentProfile
         profile = db.query(AgentProfile).filter(AgentProfile.user_id == current_user.id).first()
@@ -338,14 +327,32 @@ def _visible_notifications(db: Session, current_user) -> List[Notification]:
                 Notification.created_by == current_user.id,
             )
         )
-    if port_name:
-        query = query.filter(
-            (Notification.port_name.is_(None)) | (Notification.port_name == port_name)
+        audience_filters = [Notification.port_name.is_(None)]
+        if port_name:
+            audience_filters.append(Notification.port_name == port_name)
+        audience_filters.extend(
+            cast(Notification.target_vessel_ids, JSONB).contains([vessel_id])
+            for vessel_id in vessel_ids
         )
-    else:
-        query = query.filter(Notification.port_name.is_(None))
+        query = query.filter(or_(*audience_filters))
+    # Exact assignment-targeted notifications are authoritative by vessel ID.
+    # An older VesselCall can legitimately have no port snapshot, so applying
+    # the legacy port gate here would discard a correctly targeted message.
+    # Agent feeds retain their existing query-level port scope; crew legacy
+    # audiences are port-filtered in the loop below.
+    if current_user.role != "crew":
+        if port_name:
+            query = query.filter(
+                (Notification.port_name.is_(None)) | (Notification.port_name == port_name)
+            )
+        else:
+            query = query.filter(Notification.port_name.is_(None))
 
-    rows = query.order_by(Notification.created_at.desc(), Notification.id.desc()).all()
+    rows = (
+        query.order_by(Notification.created_at.desc(), Notification.id.desc())
+        .limit(500)
+        .all()
+    )
     visible: List[Notification] = []
     for item in rows:
         if item.audience_type in {"single_vessel", "all_agent_vessels"}:
@@ -358,6 +365,10 @@ def _visible_notifications(db: Session, current_user) -> List[Notification]:
             continue
         # Backward-compatible platform/port/vessel records.
         if current_user.role == "crew":
+            if item.port_name is not None and (
+                not port_name or item.port_name != port_name
+            ):
+                continue
             if item.vessel is None or (
                 vessel_name and item.vessel.strip().lower() == vessel_name.strip().lower()
             ):
