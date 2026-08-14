@@ -9,12 +9,9 @@ from alembic.script import ScriptDirectory
 ROOT = Path(__file__).resolve().parents[1]
 MIGRATION = (
     ROOT
-    / "alembic/versions/p7q8r9s0t1u2_assignment_scoped_operations.py"
+    / "alembic/versions/r9s0t1u2v3w4_assignment_scoped_operations.py"
 )
 PREFLIGHT = ROOT / "scripts/preflight_assignment_scoped_operations.py"
-DECISION_MIGRATION = (
-    ROOT / "alembic/versions/q8r9s0t1u2v3_scope_identity_decisions.py"
-)
 
 
 def test_assignment_scoped_release_stays_on_the_single_linear_graph():
@@ -25,11 +22,7 @@ def test_assignment_scoped_release_stays_on_the_single_linear_graph():
     assert script.get_heads() == ["r9s0t1u2v3w4"]
     assert (
         script.get_revision("r9s0t1u2v3w4").down_revision
-        == "q8r9s0t1u2v3"
-    )
-    assert (
-        script.get_revision("q8r9s0t1u2v3").down_revision
-        == "p7q8r9s0t1u2"
+        == "o6p7q8r9s0t1"
     )
 
 
@@ -67,7 +60,7 @@ def test_preflight_supports_only_the_previous_and_new_heads_and_is_read_only():
     source = PREFLIGHT.read_text()
 
     assert 'EXPECTED_HEAD = "r9s0t1u2v3w4"' in source
-    assert '"q8r9s0t1u2v3"' in source
+    assert 'PREVIOUS_HEADS = {"o6p7q8r9s0t1"}' in source
     assert "duplicate_active_profiles" in source
     assert "duplicate_pending_passports" in source
     assert "duplicate_magic_links" in source
@@ -98,10 +91,9 @@ def test_preflight_supports_only_the_previous_and_new_heads_and_is_read_only():
     )
 
 
-def test_identity_decision_repair_handles_an_already_stamped_early_p7_shape():
-    source = DECISION_MIGRATION.read_text()
+def test_identity_queue_is_created_in_its_final_shape():
+    source = MIGRATION.read_text()
 
-    assert '"identity_fingerprint" not in columns' in source
-    assert "THEN 'OPEN' ELSE status END" in source
-    assert "resolved_at = CASE WHEN status = 'RESOLVED' THEN NULL" in source
-    assert "ix_crew_identity_conflicts_identity_fingerprint" in source
+    assert 'sa.Column("identity_fingerprint", sa.String(64), nullable=False)' in source
+    assert "uq_crew_identity_conflicts_open_identity" in source
+    assert '"open identity conflicts"' in source

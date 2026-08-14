@@ -10,19 +10,26 @@ from sqlalchemy.orm import Session
 
 import app.db.base  # noqa: F401
 from app.api.v1.routes_crew import (
+    CabBookingCreateIn,
     SOSConfigIn,
     _active_sos_booking_for_trip,
+    list_eligible_crew_assignments,
     update_sos_config,
 )
 from app.db.models.agent_profile import AgentProfile
 from app.db.models.cab_booking import BookingStatus, CabBooking
 from app.db.models.crew_profile import CrewProfile
+from app.db.models.crew_assignment import CrewAssignment
 from app.db.models.driver_magic_link import DriverMagicLink
 from app.db.models.user import User
 from app.db.models.vessel import Vessel
+from app.db.models.vessel_call import VesselCall
 from app.db.models.vessel_crew import VesselCrew
 from app.db.session import engine
-from app.services.historical_context import assignment_for_manifest
+from app.services.historical_context import (
+    assignment_for_manifest,
+    crew_profile_for_manifest,
+)
 from app.services.magic_link_service import create_or_refresh_magic_link
 
 
@@ -179,6 +186,71 @@ def test_booking_idempotency_key_is_unique_per_crew(db):
     duplicate.request_fingerprint = "a" * 64
     with pytest.raises(IntegrityError):
         db.flush()
+
+
+def test_booking_otp_is_server_owned():
+    assert "otp" not in CabBookingCreateIn.model_fields
+
+
+def test_eligible_assignment_read_does_not_create_transaction_local_ids(db):
+    user, profile = _crew(db)
+    agent = User(
+        email=f"{_uniq('agent')}@example.com", hashed_password="x", role="agent"
+    )
+    db.add(agent)
+    db.flush()
+    vessel = Vessel(
+        agent_id=agent.id,
+        name="MV Legacy Manifest",
+        imo_number=_uniq("IMO"),
+        vessel_type="Cargo",
+        status="Active",
+    )
+    db.add(vessel)
+    db.flush()
+    db.add(VesselCrew(
+        vessel_id=vessel.id,
+        name=profile.full_name,
+        rank=profile.rank,
+        nationality=profile.nationality,
+        hp_id=profile.hpid,
+    ))
+    db.flush()
+
+    result = list_eligible_crew_assignments(
+        db=db, current_user=SimpleNamespace(id=user.id, role="crew")
+    )
+
+    assert result["assignments"] == []
+    assert db.query(VesselCall).filter(VesselCall.vessel_id == vessel.id).count() == 0
+    assert db.query(CrewAssignment).filter(
+        CrewAssignment.crew_profile_id == profile.id
+    ).count() == 0
+
+
+def test_manifest_passport_matching_uses_canonical_whitespace(db):
+    _user, profile = _crew(db)
+    profile.hpid = None
+    profile.passport_number = "AB123"
+    vessel = Vessel(
+        name="MV Normalized",
+        imo_number=_uniq("IMO"),
+        vessel_type="Cargo",
+        status="Active",
+    )
+    db.add(vessel)
+    db.flush()
+    manifest = VesselCrew(
+        vessel_id=vessel.id,
+        name=profile.full_name,
+        rank=profile.rank,
+        nationality=profile.nationality,
+        passport_number="AB 123",
+    )
+    db.add(manifest)
+    db.flush()
+
+    assert crew_profile_for_manifest(db, manifest).id == profile.id
 
 
 def test_magic_link_retry_returns_same_row_and_token(db):

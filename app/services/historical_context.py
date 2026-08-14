@@ -20,6 +20,10 @@ from app.db.models.port import Port
 from app.db.models.vessel import Vessel
 from app.db.models.vessel_call import VesselCall
 from app.db.models.vessel_crew import VesselCrew
+from app.services.crew_identity import (
+    normalize_passport_number,
+    normalized_passport_expression,
+)
 
 
 def _utcnow() -> datetime:
@@ -148,8 +152,8 @@ def crew_profile_for_manifest(
         )
     if (manifest.passport_number or "").strip():
         clauses.append(
-            func.upper(func.trim(CrewProfile.passport_number))
-            == manifest.passport_number.strip().upper()
+            normalized_passport_expression(CrewProfile.passport_number)
+            == normalize_passport_number(manifest.passport_number)
         )
     if not clauses:
         return None
@@ -239,43 +243,6 @@ def eligible_assignments_for_profile(
     )
 
 
-def ensure_assignments_for_profile(db: Session, profile: Optional[CrewProfile]) -> None:
-    """Materialise missing assignments without choosing between vessels.
-
-    Release 1 introduced assignment rows, but older/local datasets may still
-    contain only manifests. This compatibility bridge creates every exact
-    current assignment and never returns an arbitrary first match.
-    """
-    if profile is None:
-        return
-    clauses = []
-    if (profile.hpid or "").strip():
-        clauses.append(
-            func.upper(func.trim(VesselCrew.hp_id)) == profile.hpid.strip().upper()
-        )
-    if (profile.passport_number or "").strip():
-        clauses.append(
-            func.upper(func.trim(VesselCrew.passport_number))
-            == profile.passport_number.strip().upper()
-        )
-    if not clauses:
-        return
-    manifests = db.query(VesselCrew).filter(or_(*clauses)).all()
-    for manifest in manifests:
-        vessel = db.query(Vessel).filter(Vessel.id == manifest.vessel_id).first()
-        if vessel is None:
-            continue
-        call = active_vessel_call(db, vessel, create=False)
-        if call is None and vessel.agent_id is not None and str(
-            vessel.status or ""
-        ).lower() not in {"archived", "departed"}:
-            call = active_vessel_call(db, vessel)
-        if call is not None:
-            assignment_for_manifest(
-                db, vessel, manifest, profile=profile, create=True
-            )
-
-
 def selected_assignment_for_profile(
     db: Session,
     profile: Optional[CrewProfile],
@@ -288,11 +255,6 @@ def selected_assignment_for_profile(
     This deliberately refuses passport/HPID/current-profile inference. Those
     fields identify a person, not the vessel call for a new operation.
     """
-    # Materialise every exact manifest-backed assignment before deciding
-    # whether implicit selection is safe. Only doing this for an empty result
-    # could hide a second legacy manifest and auto-select the one assignment
-    # that happened to have been materialised already.
-    ensure_assignments_for_profile(db, profile)
     matches = eligible_assignments_for_profile(db, profile)
     if crew_assignment_id is not None:
         selected = next(
@@ -329,8 +291,8 @@ def unique_current_manifest_for_profile(
         )
     if (profile.passport_number or "").strip():
         clauses.append(
-            func.upper(func.trim(VesselCrew.passport_number))
-            == profile.passport_number.strip().upper()
+            normalized_passport_expression(VesselCrew.passport_number)
+            == normalize_passport_number(profile.passport_number)
         )
     if not clauses:
         return None

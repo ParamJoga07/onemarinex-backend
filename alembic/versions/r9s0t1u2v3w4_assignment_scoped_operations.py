@@ -1,6 +1,6 @@
 """Assignment-scoped operations and request idempotency.
 
-Revision ID: p7q8r9s0t1u2
+Revision ID: r9s0t1u2v3w4
 Revises: o6p7q8r9s0t1
 """
 
@@ -9,7 +9,7 @@ import sqlalchemy as sa
 from sqlalchemy import inspect
 
 
-revision = "p7q8r9s0t1u2"
+revision = "r9s0t1u2v3w4"
 down_revision = "o6p7q8r9s0t1"
 branch_labels = None
 depends_on = None
@@ -217,11 +217,20 @@ def upgrade():
         GROUP BY booking_id
         HAVING count(*) > 1
     """)).fetchall()
+    duplicate_open_identity_conflicts = bind.execute(sa.text("""
+        SELECT coalesce(vessel_id, -1), passport_key,
+               identity_fingerprint, count(*)
+        FROM crew_identity_conflicts
+        WHERE status = 'OPEN'
+        GROUP BY coalesce(vessel_id, -1), passport_key, identity_fingerprint
+        HAVING count(*) > 1
+    """)).fetchall()
     problems = {
         "booking idempotency keys": duplicate_booking_keys,
         "active crew profiles": duplicate_profiles,
         "pending passports": duplicate_passports,
         "driver magic links": duplicate_links,
+        "open identity conflicts": duplicate_open_identity_conflicts,
     }
     blocked = {key: value for key, value in problems.items() if value}
     if blocked:
@@ -289,6 +298,19 @@ def upgrade():
             "ix_shore_passes_vessel_call_id",
             "shore_passes",
             ["vessel_call_id"],
+        )
+    indexes = _indexes("crew_identity_conflicts")
+    if "uq_crew_identity_conflicts_open_identity" not in indexes:
+        op.create_index(
+            "uq_crew_identity_conflicts_open_identity",
+            "crew_identity_conflicts",
+            [
+                sa.text("coalesce(vessel_id, -1)"),
+                "passport_key",
+                "identity_fingerprint",
+            ],
+            unique=True,
+            postgresql_where=sa.text("status = 'OPEN'"),
         )
 
 

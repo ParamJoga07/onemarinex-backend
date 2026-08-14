@@ -29,6 +29,7 @@ from app.api.v1.routes_notifications import (
 )
 from app.db.models.user import User
 from app.db.models.crew_profile import CrewProfile
+from app.db.models.notification import Notification
 from app.services.historical_context import assignment_for_manifest
 from app.db.models.vessel import Vessel
 from app.db.models.vessel_crew import VesselCrew
@@ -214,6 +215,56 @@ class NotificationVesselScopingTests(unittest.TestCase):
         visible = list_notifications_for_crew(db=self.db, current_user=crew)
 
         self.assertEqual([item.title for item in visible], ["Own fleet"])
+
+    def test_authorization_happens_before_notification_limit(self):
+        crew_user = User(
+            email=_uniq("crew") + "@example.com", hashed_password="x", role="crew"
+        )
+        self.db.add(crew_user)
+        self.db.flush()
+        profile = CrewProfile(
+            user_id=crew_user.id,
+            full_name="Crew",
+            rank="able_seaman",
+            nationality="IN",
+            hpid=_uniq("HP"),
+            current_port=self.PORT,
+            vessel=self.vessel_a.name,
+        )
+        manifest = VesselCrew(
+            vessel_id=self.vessel_a.id,
+            name="Crew",
+            rank="able_seaman",
+            hp_id=profile.hpid,
+        )
+        self.db.add_all([profile, manifest])
+        self.db.flush()
+        assignment_for_manifest(self.db, self.vessel_a, manifest, profile=profile)
+
+        self.db.add(Notification(
+            title="Relevant older notice",
+            message="Must remain visible",
+            audience_type="single_vessel",
+            target_vessel_ids=[self.vessel_a.id],
+        ))
+        self.db.flush()
+        self.db.add_all([
+            Notification(
+                title=f"Other vessel {index}",
+                message="Not for this crew",
+                audience_type="single_vessel",
+                target_vessel_ids=[self.vessel_b.id],
+            )
+            for index in range(501)
+        ])
+        self.db.flush()
+
+        visible = list_notifications_for_crew(
+            db=self.db,
+            current_user=SimpleNamespace(id=crew_user.id, role="crew"),
+        )
+
+        self.assertEqual([item.title for item in visible], ["Relevant older notice"])
 
     def test_crew_who_changed_ship_stop_receiving_the_old_ships_notices(self):
         """The reported leak: notices reaching vessels they were not sent to.

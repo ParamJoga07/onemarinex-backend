@@ -7,6 +7,7 @@ from datetime import date, datetime, timedelta
 import hashlib
 import logging
 import re
+import secrets
 import uuid
 import json
 import urllib.request
@@ -336,7 +337,6 @@ class CabBookingCreateIn(BaseModel):
     crew_member_ids: Optional[List[str]] = None
     scheduled_time: Optional[datetime] = None
     planned_return: Optional[str] = None
-    otp: Optional[str] = None
     ride_type: str  # flexible_ride | guaranteed_coordinated_ride
     trip_type: Optional[str] = None  # package_trip | coordinated_transfer
     direction: Optional[str] = None  # to_city | return_to_port
@@ -376,12 +376,8 @@ def list_eligible_crew_assignments(
     profile = db.query(CrewProfile).filter(CrewProfile.user_id == current_user.id).first()
     if not profile:
         raise HTTPException(status_code=404, detail="Crew profile not found")
-    from app.services.historical_context import (
-        eligible_assignments_for_profile,
-        ensure_assignments_for_profile,
-    )
+    from app.services.historical_context import eligible_assignments_for_profile
 
-    ensure_assignments_for_profile(db, profile)
     assignments = [
         row
         for row in eligible_assignments_for_profile(db, profile)
@@ -2264,8 +2260,12 @@ def book_cab(
     port_value = (
         (booking_call.port.code if booking_call.port else None)
         or booking_call.port_name
-        or body.port
     )
+    if not port_value:
+        raise HTTPException(
+            status_code=409,
+            detail="The selected vessel assignment has no port context",
+        )
     resolved_trip_type = body.trip_type or (
         "package_trip" if body.scheduled_time is None else "coordinated_transfer"
     )
@@ -2415,7 +2415,7 @@ def book_cab(
     final_distance = resolved_distance if resolved_distance > 0 else body.distance_km
 
     booking_id = f"CAB-{uuid.uuid4().hex[:8].upper()}"
-    otp = body.otp or (profile.ride_otp if profile else None) or "1234"
+    otp = str(secrets.randbelow(9000) + 1000)
     now = datetime.utcnow()
     booking_port_rule = _port_rule_for(db, port_value)
 

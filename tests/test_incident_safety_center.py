@@ -29,6 +29,7 @@ from app.db.models.user import User
 from app.db.models.vessel import Vessel
 from app.db.models.vessel_crew import VesselCrew
 from app.db.session import engine
+from app.services.historical_context import assignment_for_manifest
 
 
 def _uniq(prefix):
@@ -75,9 +76,15 @@ class SafetyCenterTests(unittest.TestCase):
                         vessel_type="Bulk Carrier", status="Active")
         self.db.add_all([crew, vessel])
         self.db.flush()
-        self.db.add(VesselCrew(vessel_id=vessel.id, name="Test Crew",
-                               rank="third_officer", hp_id=hpid))
+        manifest = VesselCrew(
+            vessel_id=vessel.id,
+            name="Test Crew",
+            rank="third_officer",
+            hp_id=hpid,
+        )
+        self.db.add(manifest)
         self.db.flush()
+        assignment_for_manifest(self.db, vessel, manifest, profile=crew)
 
         agent = SimpleNamespace(
             id=agent_user.id, role="agent", name="Agent", agent_profile=agent_profile

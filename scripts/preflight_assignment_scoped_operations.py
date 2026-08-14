@@ -11,7 +11,7 @@ from sqlalchemy import inspect, text
 from app.db.session import engine
 
 
-PREVIOUS_HEADS = {"o6p7q8r9s0t1", "p7q8r9s0t1u2", "q8r9s0t1u2v3"}
+PREVIOUS_HEADS = {"o6p7q8r9s0t1"}
 EXPECTED_HEAD = "r9s0t1u2v3w4"
 
 

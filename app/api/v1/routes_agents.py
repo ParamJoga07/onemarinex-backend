@@ -882,23 +882,25 @@ def get_agent_crew_detail(
         db.query(VesselCrew, Vessel)
         .join(Vessel, Vessel.id == VesselCrew.vessel_id)
         .filter(
-            VesselCrew.hp_id == hp_id,
+            func.upper(func.trim(VesselCrew.hp_id)) == hp_id.strip().upper(),
             Vessel.agent_id == current_user.id,
         )
     )
     if vessel_id is not None:
         query = query.filter(Vessel.id == vessel_id)
-    matches = query.limit(2).all()
+    matches = query.order_by(VesselCrew.id.desc()).all()
     if not matches:
         raise HTTPException(status_code=404, detail="Crew not found in your vessels")
-    if len(matches) > 1:
+    if len({vessel.id for _, vessel in matches}) > 1:
         raise HTTPException(
             status_code=409,
             detail="Crew belongs to multiple vessels; select a vessel",
         )
     vessel_crew, vessel = matches[0]
 
-    crew_profile = db.query(CrewProfile).filter(CrewProfile.hpid == hp_id).first()
+    crew_profile = db.query(CrewProfile).filter(
+        func.upper(func.trim(CrewProfile.hpid)) == hp_id.strip().upper()
+    ).first()
 
     shore_pass = None
     if crew_profile:

@@ -1,6 +1,6 @@
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import and_, cast, or_
+from sqlalchemy import and_, cast, false, func, or_
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, Field
@@ -284,15 +284,11 @@ def _recipient_context(db: Session, current_user):
     if current_user.role == "crew":
         from app.services.historical_context import (
             eligible_assignments_for_profile,
-            ensure_assignments_for_profile,
         )
 
         profile = db.query(CrewProfile).filter(CrewProfile.user_id == current_user.id).first()
         if profile:
             assignments = eligible_assignments_for_profile(db, profile)
-            if not assignments:
-                ensure_assignments_for_profile(db, profile)
-                assignments = eligible_assignments_for_profile(db, profile)
             vessel_ids.update(
                 row.vessel_call.vessel_id for row in assignments
                 if row.vessel_call and row.vessel_call.vessel_id
@@ -320,6 +316,11 @@ def _recipient_context(db: Session, current_user):
 def _visible_notifications(db: Session, current_user) -> List[Notification]:
     port_name, vessel_name, vessel_ids = _recipient_context(db, current_user)
     query = db.query(Notification)
+    targeted_audiences = {"single_vessel", "all_agent_vessels"}
+    legacy_audience = or_(
+        Notification.audience_type.is_(None),
+        Notification.audience_type.notin_(targeted_audiences),
+    )
     if current_user.role == "crew":
         query = query.filter(
             ~and_(
@@ -327,55 +328,46 @@ def _visible_notifications(db: Session, current_user) -> List[Notification]:
                 Notification.created_by == current_user.id,
             )
         )
-        audience_filters = [Notification.port_name.is_(None)]
-        if port_name:
-            audience_filters.append(Notification.port_name == port_name)
-        audience_filters.extend(
+        targeted_vessel = or_(*(
             cast(Notification.target_vessel_ids, JSONB).contains([vessel_id])
             for vessel_id in vessel_ids
+        )) if vessel_ids else false()
+        legacy_port = (
+            or_(Notification.port_name.is_(None), Notification.port_name == port_name)
+            if port_name
+            else Notification.port_name.is_(None)
         )
-        query = query.filter(or_(*audience_filters))
-    # Exact assignment-targeted notifications are authoritative by vessel ID.
-    # An older VesselCall can legitimately have no port snapshot, so applying
-    # the legacy port gate here would discard a correctly targeted message.
-    # Agent feeds retain their existing query-level port scope; crew legacy
-    # audiences are port-filtered in the loop below.
-    if current_user.role != "crew":
+        legacy_vessel = (
+            or_(
+                Notification.vessel.is_(None),
+                func.lower(func.trim(Notification.vessel))
+                == vessel_name.strip().lower(),
+            )
+            if vessel_name
+            else Notification.vessel.is_(None)
+        )
+        query = query.filter(or_(
+            and_(
+                Notification.audience_type.in_(targeted_audiences),
+                targeted_vessel,
+            ),
+            and_(legacy_audience, legacy_port, legacy_vessel),
+        ))
+    else:
         if port_name:
             query = query.filter(
                 (Notification.port_name.is_(None)) | (Notification.port_name == port_name)
             )
         else:
             query = query.filter(Notification.port_name.is_(None))
+        query = query.filter(legacy_audience, Notification.vessel.is_(None))
 
-    rows = (
-        query.order_by(Notification.created_at.desc(), Notification.id.desc())
+    return (
+        query
+        .order_by(Notification.created_at.desc(), Notification.id.desc())
         .limit(500)
         .all()
     )
-    visible: List[Notification] = []
-    for item in rows:
-        if item.audience_type in {"single_vessel", "all_agent_vessels"}:
-            targets = {
-                int(value) for value in (item.target_vessel_ids or [])
-                if str(value).isdigit()
-            }
-            if current_user.role == "crew" and targets.intersection(vessel_ids):
-                visible.append(item)
-            continue
-        # Backward-compatible platform/port/vessel records.
-        if current_user.role == "crew":
-            if item.port_name is not None and (
-                not port_name or item.port_name != port_name
-            ):
-                continue
-            if item.vessel is None or (
-                vessel_name and item.vessel.strip().lower() == vessel_name.strip().lower()
-            ):
-                visible.append(item)
-        elif item.vessel is None:
-            visible.append(item)
-    return visible
 
 
 @router.get("/", response_model=List[NotificationCrewOut])

@@ -192,16 +192,12 @@ def _agency_rules_for(
         from app.db.models.agent_profile import AgentProfile
         from app.db.models.crew_profile import CrewProfile
         from app.services.historical_context import (
-            eligible_assignments_for_profile,
-            ensure_assignments_for_profile,
             selected_assignment_for_profile,
         )
 
         crew = db.query(CrewProfile).filter(CrewProfile.user_id == viewer.id).first()
         if crew is None:
             return []
-        if not eligible_assignments_for_profile(db, crew):
-            ensure_assignments_for_profile(db, crew)
         try:
             assignment = selected_assignment_for_profile(
                 db, crew, crew_assignment_id
