@@ -191,13 +191,24 @@ class ManualTimelineEntryTests(unittest.TestCase):
         self.assertEqual(denied.exception.status_code, missing.exception.status_code)
         self.assertEqual(denied.exception.detail, missing.exception.detail)
 
-    def test_non_agents_are_refused(self):
+    def test_superadmin_can_add_a_manual_update(self):
         superadmin = SimpleNamespace(id=self.agent.id, role="superadmin", name="SA")
 
-        with self.assertRaises(HTTPException) as ctx:
-            self.add(agent=superadmin)
+        result = self.add(agent=superadmin)
+        self.assertEqual(result["source"], "superadmin")
+        self.assertTrue(result["editable"])
 
-        self.assertEqual(ctx.exception.status_code, 403)
+        with self.assertRaises(HTTPException) as edit_denied:
+            edit_incident_timeline_entry(
+                event_id=result["id"], body=TimelineEntryIn(label="Agent rewrite"),
+                db=self.db, current_user=self.agent,
+            )
+        with self.assertRaises(HTTPException) as delete_denied:
+            delete_incident_timeline_entry(
+                event_id=result["id"], db=self.db, current_user=self.agent,
+            )
+        self.assertEqual(edit_denied.exception.status_code, 404)
+        self.assertEqual(delete_denied.exception.status_code, 404)
 
 
 if __name__ == "__main__":

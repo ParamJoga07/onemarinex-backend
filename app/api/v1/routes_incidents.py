@@ -863,8 +863,8 @@ def agent_incident_detail(
     who raised it. Four round-trips for one screen is wasteful when the
     ownership check is identical for all four.
     """
-    if current_user.role != "agent":
-        raise HTTPException(status_code=403, detail="Only agents can view incident details")
+    if current_user.role not in {"agent", "superadmin"}:
+        raise HTTPException(status_code=403, detail="Not authorized to view incident details")
 
     from app.db.models.crew_profile import CrewProfile
     from app.db.models.incident import IncidentTimelineEvent
@@ -874,7 +874,13 @@ def agent_incident_detail(
     from app.services.historical_context import vessel_call_context
     from app.services.operations_context import booking_context, find_booking, vessel_context
 
-    incident = _agent_incident_or_404(db, current_user.id, incident_id)
+    incident = (
+        db.query(Incident).filter(Incident.id == incident_id).first()
+        if current_user.role == "superadmin"
+        else _agent_incident_or_404(db, current_user.id, incident_id)
+    )
+    if incident is None:
+        raise HTTPException(status_code=404, detail="Incident not found")
 
     events = (
         db.query(IncidentTimelineEvent)
@@ -988,8 +994,8 @@ def agent_safety_report(
     current_user = Depends(get_current_user),
 ):
     """Canonical, server-stamped payload for Incident and SOS PDF reports."""
-    if current_user.role != "agent":
-        raise HTTPException(status_code=403, detail="Only agents can generate safety reports")
+    if current_user.role not in {"agent", "superadmin"}:
+        raise HTTPException(status_code=403, detail="Not authorized to generate safety reports")
     kind = record_kind.strip().lower()
     if kind == "incident":
         payload = agent_incident_detail(record_id, db=db, current_user=current_user)
@@ -1015,8 +1021,8 @@ def create_agent_safety_report_snapshot(
     current_user = Depends(get_current_user),
 ):
     """Freeze one generated safety report as an immutable audit artifact."""
-    if current_user.role != "agent":
-        raise HTTPException(status_code=403, detail="Only agents can generate report snapshots")
+    if current_user.role not in {"agent", "superadmin"}:
+        raise HTTPException(status_code=403, detail="Not authorized to generate report snapshots")
 
     from app.db.models.agent_profile import AgentProfile
     from app.db.models.crew_sos import CrewSos
@@ -1032,18 +1038,25 @@ def create_agent_safety_report_snapshot(
         current_user=current_user,
     )
     kind = report["record_kind"]
-    agency_id = db.query(AgentProfile.id).filter(
-        AgentProfile.user_id == current_user.id
-    ).scalar()
-    if agency_id is None:
-        raise HTTPException(status_code=403, detail="Agent profile not found")
-
     if kind == "incident":
         source = db.query(Incident).filter(Incident.id == record_id).one()
         reference = source.incident_id
     else:
         source = db.query(CrewSos).filter(CrewSos.id == record_id).one()
         reference = f"SOS-{source.id}"
+
+    agency_id = (
+        source.agency_id
+        if current_user.role == "superadmin"
+        else db.query(AgentProfile.id).filter(
+            AgentProfile.user_id == current_user.id
+        ).scalar()
+    )
+    if agency_id is None:
+        raise HTTPException(
+            status_code=409,
+            detail="This historical record needs agency reconciliation before snapshotting",
+        )
 
     snapshot = create_report_snapshot(
         db,
@@ -1133,7 +1146,7 @@ class TimelineEntryIn(BaseModel):
 MANUAL_EVENT_TYPES = {"update", "investigation", "resolved", "note"}
 
 
-def _manual_event_or_404(db: Session, agent_user_id: int, event_id: int):
+def _manual_event_or_404(db: Session, current_user, event_id: int):
     """A manual timeline row on an incident this agent owns.
 
     System rows are the incident's own audit trail — they are never editable,
@@ -1152,17 +1165,20 @@ def _manual_event_or_404(db: Session, agent_user_id: int, event_id: int):
     # The ownership check raises its own "Incident not found". Re-raise with the
     # timeline wording so a row belonging to another agency is indistinguishable
     # from one that does not exist — otherwise the message itself confirms the id.
-    try:
-        _agent_incident_or_404(db, agent_user_id, event.incident_id)
-    except HTTPException:
-        raise HTTPException(status_code=404, detail="Timeline entry not found")
+    if current_user.role != "superadmin":
+        try:
+            _agent_incident_or_404(db, current_user.id, event.incident_id)
+        except HTTPException:
+            raise HTTPException(status_code=404, detail="Timeline entry not found")
 
-    if (event.source or "system") != "agent":
+    if (event.source or "system") not in {"agent", "superadmin"}:
+        raise HTTPException(status_code=404, detail="Timeline entry not found")
+    if current_user.role == "agent" and (event.source or "system") != "agent":
         raise HTTPException(status_code=404, detail="Timeline entry not found")
     return event
 
 
-def _timeline_out(event) -> dict:
+def _timeline_out(event, viewer_role: str) -> dict:
     return {
         "id": event.id,
         "source": event.source,
@@ -1171,7 +1187,10 @@ def _timeline_out(event) -> dict:
         "detail": event.detail,
         "actor_name": event.actor_name,
         "event_time": event.event_time,
-        "editable": (event.source or "system") == "agent",
+        "editable": (
+            (event.source or "system") in {"agent", "superadmin"}
+            and (viewer_role == "superadmin" or (event.source or "system") == "agent")
+        ),
     }
 
 
@@ -1183,12 +1202,18 @@ def add_incident_timeline_entry(
     current_user = Depends(get_current_user),
 ):
     """Add an agent's own update to an incident timeline."""
-    if current_user.role != "agent":
-        raise HTTPException(status_code=403, detail="Only agents can add timeline updates")
+    if current_user.role not in {"agent", "superadmin"}:
+        raise HTTPException(status_code=403, detail="Not authorized to add timeline updates")
 
     from app.db.models.incident import IncidentTimelineEvent
 
-    incident = _agent_incident_or_404(db, current_user.id, incident_id)
+    incident = (
+        db.query(Incident).filter(Incident.id == incident_id).first()
+        if current_user.role == "superadmin"
+        else _agent_incident_or_404(db, current_user.id, incident_id)
+    )
+    if incident is None:
+        raise HTTPException(status_code=404, detail="Incident not found")
     if incident.status in (IncidentStatus.RESOLVED, IncidentStatus.CANCELLED):
         raise HTTPException(status_code=409,
                             detail="Timeline updates are locked for a closed incident")
@@ -1202,7 +1227,7 @@ def add_incident_timeline_entry(
 
     event = IncidentTimelineEvent(
         incident_id=incident.id,
-        source="agent",
+        source=current_user.role,
         event_type=event_type,
         label=label,
         detail=(body.detail or "").strip() or None,
@@ -1212,7 +1237,7 @@ def add_incident_timeline_entry(
     db.add(event)
     db.commit()
     db.refresh(event)
-    return _timeline_out(event)
+    return _timeline_out(event, current_user.role)
 
 
 @router.patch("/agent/timeline/{event_id}")
@@ -1222,10 +1247,10 @@ def edit_incident_timeline_entry(
     db: Session = Depends(get_db),
     current_user = Depends(get_current_user),
 ):
-    if current_user.role != "agent":
-        raise HTTPException(status_code=403, detail="Only agents can edit timeline updates")
+    if current_user.role not in {"agent", "superadmin"}:
+        raise HTTPException(status_code=403, detail="Not authorized to edit timeline updates")
 
-    event = _manual_event_or_404(db, current_user.id, event_id)
+    event = _manual_event_or_404(db, current_user, event_id)
     label = (body.label or "").strip()
     if not label:
         raise HTTPException(status_code=400, detail="An update needs a label")
@@ -1242,7 +1267,7 @@ def edit_incident_timeline_entry(
 
     db.commit()
     db.refresh(event)
-    return _timeline_out(event)
+    return _timeline_out(event, current_user.role)
 
 
 @router.delete("/agent/timeline/{event_id}")
@@ -1251,10 +1276,10 @@ def delete_incident_timeline_entry(
     db: Session = Depends(get_db),
     current_user = Depends(get_current_user),
 ):
-    if current_user.role != "agent":
-        raise HTTPException(status_code=403, detail="Only agents can delete timeline updates")
+    if current_user.role not in {"agent", "superadmin"}:
+        raise HTTPException(status_code=403, detail="Not authorized to delete timeline updates")
 
-    event = _manual_event_or_404(db, current_user.id, event_id)
+    event = _manual_event_or_404(db, current_user, event_id)
     db.delete(event)
     db.commit()
     return {"deleted": True, "id": event_id}

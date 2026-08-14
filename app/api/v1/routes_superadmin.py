@@ -191,6 +191,7 @@ class HistoricalContextResolutionIn(BaseModel):
     evidence_type: str
     evidence_reference: Optional[str] = None
     notes: str
+    expected_context: Optional[Dict[str, Any]] = None
 
     @field_validator("notes")
     @classmethod
@@ -198,6 +199,31 @@ class HistoricalContextResolutionIn(BaseModel):
         normalized = value.strip()
         if not 10 <= len(normalized) <= 2000:
             raise ValueError("notes must be between 10 and 2000 non-whitespace characters")
+        return normalized
+
+
+class IdentityConflictResolutionIn(BaseModel):
+    expected_version: int = Field(gt=0)
+    action: Literal["SELECT_PROFILE", "LEAVE_PENDING", "DISMISS"]
+    crew_profile_id: Optional[int] = Field(default=None, gt=0)
+    evidence_type: str
+    evidence_reference: Optional[str] = Field(default=None, max_length=255)
+    reason: str = Field(min_length=10, max_length=2000)
+
+    @field_validator("evidence_type")
+    @classmethod
+    def trim_required(cls, value: str) -> str:
+        normalized = value.strip()
+        if not 2 <= len(normalized) <= 64:
+            raise ValueError("evidence_type must be between 2 and 64 non-whitespace characters")
+        return normalized
+
+    @field_validator("reason")
+    @classmethod
+    def trim_reason(cls, value: str) -> str:
+        normalized = value.strip()
+        if len(normalized) < 10:
+            raise ValueError("reason must be at least 10 non-whitespace characters")
         return normalized
     
 # --- Helpers ---
@@ -208,6 +234,93 @@ def verify_superadmin(current_user: User):
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Only superadmins can access this resource"
         )
+
+
+def _identity_conflict_payload(db: Session, row, *, include_audit: bool = False):
+    from app.db.models.crew_identity_conflict import CrewIdentityConflictAudit
+
+    candidates = (
+        db.query(CrewProfile)
+        .filter(CrewProfile.id.in_(row.candidate_profile_ids or []))
+        .order_by(CrewProfile.id)
+        .all()
+    )
+    payload = {
+        "id": row.id,
+        "operation": row.operation,
+        "vessel": {
+            "id": row.vessel_id,
+            "name": row.vessel.name if row.vessel else None,
+            "imo_number": row.vessel.imo_number if row.vessel else None,
+        },
+        # Flat aliases preserve compatibility for an early internal client;
+        # new clients should use the nested stable objects below.
+        "vessel_id": row.vessel_id,
+        "vessel_name": row.vessel.name if row.vessel else None,
+        "passport_key": row.passport_key,
+        "proposed_identity": row.proposed_identity,
+        "candidates": [
+            {
+                "id": profile.id,
+                "hpid": profile.hpid,
+                "full_name": profile.full_name,
+                "rank": profile.rank,
+                "nationality": profile.nationality,
+                "passport_number": profile.passport_number,
+            }
+            for profile in candidates
+        ],
+        "conflict_message": row.conflict_message,
+        "message": row.conflict_message,
+        "status": row.status,
+        "version": row.version,
+        "resolution_action": row.resolution_action,
+        "selected_profile_id": row.selected_profile_id,
+        "evidence_type": row.evidence_type,
+        "evidence_reference": row.evidence_reference,
+        "resolution_reason": row.resolution_reason,
+        "resolved_by_user_id": row.resolved_by_user_id,
+        "resolved_at": row.resolved_at,
+        "created_at": row.created_at,
+        "updated_at": row.updated_at,
+    }
+    payload["candidate_profiles"] = payload["candidates"]
+    payload["resolution"] = (
+        {
+            "action": row.resolution_action,
+            "selected_profile_id": row.selected_profile_id,
+            "evidence_type": row.evidence_type,
+            "evidence_reference": row.evidence_reference,
+            "reason": row.resolution_reason,
+            "resolved_by_user_id": row.resolved_by_user_id,
+            "resolved_at": row.resolved_at,
+        }
+        if row.status == "RESOLVED"
+        else None
+    )
+    if include_audit:
+        audits = (
+            db.query(CrewIdentityConflictAudit)
+            .filter(CrewIdentityConflictAudit.conflict_id == row.id)
+            .order_by(CrewIdentityConflictAudit.created_at, CrewIdentityConflictAudit.id)
+            .all()
+        )
+        payload["audits"] = [
+            {
+                "id": audit.id,
+                "actor_user_id": audit.actor_user_id,
+                "action": audit.action,
+                "expected_version": audit.expected_version,
+                "before": audit.before_state,
+                "after": audit.after_state,
+                "evidence_type": audit.evidence_type,
+                "evidence_reference": audit.evidence_reference,
+                "reason": audit.reason,
+                "created_at": audit.created_at,
+            }
+            for audit in audits
+        ]
+    return payload
 
 
 def slugify_tag(value: str) -> str:
@@ -221,6 +334,132 @@ def ensure_vendor_tags_table(db: Session) -> None:
     VendorTag.__table__.create(bind=db.get_bind(), checkfirst=True)
 
 # --- Routes ---
+
+
+@router.get("/identity-conflicts")
+def list_identity_conflicts(
+    status_filter: Literal["OPEN", "RESOLVED", "ALL"] = "OPEN",
+    page: int = 1,
+    limit: int = 50,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    verify_superadmin(current_user)
+    from app.db.models.crew_identity_conflict import CrewIdentityConflictRecord
+
+    page = max(1, page)
+    limit = max(1, min(limit, 100))
+    query = db.query(CrewIdentityConflictRecord)
+    if status_filter != "ALL":
+        query = query.filter(CrewIdentityConflictRecord.status == status_filter)
+    total = query.count()
+    rows = (
+        query.order_by(
+            CrewIdentityConflictRecord.created_at.desc(),
+            CrewIdentityConflictRecord.id.desc(),
+        )
+        .offset((page - 1) * limit)
+        .limit(limit)
+        .all()
+    )
+    return {
+        "items": [_identity_conflict_payload(db, row) for row in rows],
+        "total": total,
+        "page": page,
+        "limit": limit,
+    }
+
+
+@router.get("/identity-conflicts/{conflict_id}")
+def get_identity_conflict(
+    conflict_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    verify_superadmin(current_user)
+    from app.db.models.crew_identity_conflict import CrewIdentityConflictRecord
+
+    row = db.query(CrewIdentityConflictRecord).filter(
+        CrewIdentityConflictRecord.id == conflict_id
+    ).first()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Identity conflict not found")
+    return _identity_conflict_payload(db, row, include_audit=True)
+
+
+@router.post("/identity-conflicts/{conflict_id}/resolve")
+def resolve_identity_conflict(
+    conflict_id: int,
+    body: IdentityConflictResolutionIn,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    verify_superadmin(current_user)
+    from app.db.models.crew_identity_conflict import (
+        CrewIdentityConflictAudit,
+        CrewIdentityConflictRecord,
+    )
+
+    row = (
+        db.query(CrewIdentityConflictRecord)
+        .filter(CrewIdentityConflictRecord.id == conflict_id)
+        .with_for_update()
+        .first()
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="Identity conflict not found")
+    if row.version != body.expected_version:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "Identity conflict changed; reload before resolving",
+                "current_version": row.version,
+            },
+        )
+    if row.status != "OPEN":
+        raise HTTPException(status_code=409, detail="Identity conflict is already resolved")
+    if body.action == "SELECT_PROFILE":
+        if body.crew_profile_id is None:
+            raise HTTPException(status_code=422, detail="crew_profile_id is required")
+        if body.crew_profile_id not in (row.candidate_profile_ids or []):
+            raise HTTPException(
+                status_code=409,
+                detail="Selected profile is not a candidate for this conflict",
+            )
+        if db.query(CrewProfile.id).filter(CrewProfile.id == body.crew_profile_id).scalar() is None:
+            raise HTTPException(status_code=409, detail="Selected profile no longer exists")
+    elif body.crew_profile_id is not None:
+        raise HTTPException(
+            status_code=422,
+            detail="crew_profile_id is valid only for SELECT_PROFILE",
+        )
+
+    before = _identity_conflict_payload(db, row)
+    row.status = "RESOLVED"
+    row.version += 1
+    row.resolution_action = body.action
+    row.selected_profile_id = body.crew_profile_id
+    row.evidence_type = body.evidence_type
+    row.evidence_reference = (body.evidence_reference or "").strip() or None
+    row.resolution_reason = body.reason
+    row.resolved_by_user_id = current_user.id
+    row.resolved_at = datetime.utcnow()
+    db.flush()
+    after = _identity_conflict_payload(db, row)
+    db.add(CrewIdentityConflictAudit(
+        conflict_id=row.id,
+        actor_user_id=current_user.id,
+        action=body.action,
+        expected_version=body.expected_version,
+        before_state=jsonable_encoder(before),
+        after_state=jsonable_encoder(after),
+        evidence_type=body.evidence_type,
+        evidence_reference=(body.evidence_reference or "").strip() or None,
+        reason=body.reason,
+    ))
+    db.commit()
+    db.refresh(row)
+    return _identity_conflict_payload(db, row, include_audit=True)
 
 @router.get("/stats", response_model=DashboardStats)
 def get_dashboard_stats(
@@ -2039,6 +2278,20 @@ def reconcile_historical_context(
     record = db.query(model).filter(model.id == record_id).with_for_update().first()
     if record is None:
         raise HTTPException(status_code=404, detail="Historical record not found")
+    locked_context = _context_dict(record)
+    if body.expected_context is not None:
+        expected = {
+            key: body.expected_context.get(key)
+            for key in locked_context
+        }
+        if expected != locked_context:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": "Historical record changed after it was loaded; refresh and review it again",
+                    "current_context": locked_context,
+                },
+            )
     existing_call = db.query(VesselCall).filter(
         VesselCall.id == record.vessel_call_id
     ).first() if record.vessel_call_id else None
@@ -2066,7 +2319,7 @@ def reconcile_historical_context(
                 detail="A linked booking must be recorded as trip_record evidence",
             )
 
-    previous = _context_dict(record)
+    previous = locked_context
     assignment = None
     if record.crew_assignment_id:
         assignment = db.query(CrewAssignment).filter(

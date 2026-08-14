@@ -198,6 +198,24 @@ class SafetyCenterTests(unittest.TestCase):
         self.assertIsNone(incident.aggregator_id)
         self.assertEqual(incident.vessel_id, self.vessel_a.id)
 
+    def test_superadmin_can_manage_detail_without_weakening_agent_scope(self):
+        created = self.raise_incident(
+            self.crew_a, category="general_support"
+        )
+        superadmin = SimpleNamespace(
+            id=999999, role="superadmin", name="Super Admin"
+        )
+
+        detail = ri.agent_incident_detail(
+            created["id"], db=self.db, current_user=superadmin
+        )
+        self.assertEqual(detail["incident"]["id"], created["id"])
+        with self.assertRaises(HTTPException) as hidden:
+            ri.agent_incident_detail(
+                created["id"], db=self.db, current_user=self.agent_b
+            )
+        self.assertEqual(hidden.exception.status_code, 404)
+
     def test_legacy_trip_without_assignment_context_is_rejected(self):
         booking = self.make_trip(self.crew_a)
         with self.assertRaises(HTTPException) as ctx:

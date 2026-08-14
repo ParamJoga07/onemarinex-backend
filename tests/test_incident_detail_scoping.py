@@ -202,15 +202,13 @@ class IncidentDetailScopingTests(unittest.TestCase):
             )
         self.assertEqual(error.exception.status_code, 409)
 
-    def test_non_agents_are_refused(self):
+    def test_superadmin_can_open_incident_detail(self):
         superadmin = SimpleNamespace(id=self.agent_a.id, role="superadmin")
 
-        with self.assertRaises(HTTPException) as ctx:
-            agent_incident_detail(
-                incident_id=self.incident_a.id, db=self.db, current_user=superadmin,
-            )
-
-        self.assertEqual(ctx.exception.status_code, 403)
+        detail = agent_incident_detail(
+            incident_id=self.incident_a.id, db=self.db, current_user=superadmin,
+        )
+        self.assertEqual(detail["incident"]["id"], self.incident_a.id)
 
     def test_safety_report_lists_resolved_record_for_owned_vessel(self):
         result = agent_safety_report_records(
