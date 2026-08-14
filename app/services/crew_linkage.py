@@ -144,6 +144,26 @@ def vessel_roster(db: Session, vessel) -> VesselRoster:
     return VesselRoster(members)
 
 
+def vessel_call_roster(db: Session, vessel_call) -> VesselRoster:
+    """Historical crew roster captured by one immutable vessel call."""
+    from app.db.models.crew_assignment import CrewAssignment
+
+    assignments = db.query(CrewAssignment).filter(
+        CrewAssignment.vessel_call_id == vessel_call.id
+    ).order_by(CrewAssignment.id).all()
+    members = []
+    for row in assignments:
+        hpid = (row.hpid or "").strip().upper() or None
+        members.append(RosterMember(
+            key=hpid or f"assignment:{row.id}",
+            profile_id=row.crew_profile_id,
+            hpid=hpid,
+            name=row.crew_name,
+            eligible=bool(row.shore_pass_eligible),
+        ))
+    return VesselRoster(members)
+
+
 def vessel_matches_record(vessel, stamped_vessel: Optional[str]) -> Optional[bool]:
     """Does a record stamped `stamped_vessel` belong to `vessel`?
 
@@ -174,4 +194,3 @@ def filter_records_for_vessel(vessel, records, stamp_of) -> list:
             continue
         kept.append(record)
     return kept
-

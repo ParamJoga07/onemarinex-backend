@@ -80,6 +80,9 @@ class CrewSosNote(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     sos_id = Column(Integer, ForeignKey("crew_sos_requests.id", ondelete="CASCADE"), nullable=False, index=True)
+    author_user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    last_edited_by_user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    edited_at = Column(DateTime(timezone=True), nullable=True)
     author_name = Column(String(255), nullable=True)
     note = Column(Text, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)

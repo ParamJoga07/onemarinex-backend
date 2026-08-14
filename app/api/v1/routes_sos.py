@@ -93,8 +93,12 @@ def list_sos_requests(
             "lng": sos.lng,
             "created_at": sos.created_at,
             "crew_name": sos.crew_profile.full_name if sos.crew_profile else None,
-            "crew_email": sos.crew_email or (sos.user.email if sos.user else None),
-            "sos_email": sos.sos_email,
+            "crew_email": (
+                sos.crew_email or (sos.user.email if sos.user else None)
+                if current_user.role == "superadmin"
+                else None
+            ),
+            "sos_email": sos.sos_email if current_user.role == "superadmin" else None,
             "crew_phone": sos.user.mobile_number if sos.user else None,
             "trip_id": sos.trip_id,
         }
@@ -233,6 +237,13 @@ def get_sos_timeline(
             "detail": item.detail,
             "actor_name": item.actor_name,
             "event_time": item.event_time,
+            "editable": (
+                (item.source or "system") in {"agent", "superadmin"}
+                and (
+                    current_user.role == "superadmin"
+                    or (item.source or "system") == "agent"
+                )
+            ),
         }
         for item in persisted_timeline
     ]
@@ -258,8 +269,12 @@ def get_sos_timeline(
         id=sos.id,
         status=sos.status,
         crew_name=sos.crew_profile.full_name if sos.crew_profile else None,
-        crew_email=sos.crew_email or (sos.user.email if sos.user else None),
-        sos_email=sos.sos_email,
+        crew_email=(
+            sos.crew_email or (sos.user.email if sos.user else None)
+            if current_user.role == "superadmin"
+            else None
+        ),
+        sos_email=sos.sos_email if current_user.role == "superadmin" else None,
         crew_phone=sos.user.mobile_number if sos.user else None,
         trip_id=sos.trip_id,
         port_name=sos.port_name,
@@ -271,6 +286,8 @@ def get_sos_timeline(
         notes=[{
             "id": note.id, "author_name": note.author_name,
             "note": note.note, "created_at": note.created_at,
+            "last_edited_by_user_id": note.last_edited_by_user_id,
+            "edited_at": note.edited_at,
         } for note in notes],
         vessel_details=(
             vessel_call_context(vessel_call, fallback_port=sos.port_name)
@@ -288,7 +305,11 @@ def get_sos_timeline(
                 sos.crew_profile.nationality if sos.crew_profile else None
             ),
             "phone": sos.user.mobile_number if sos.user else None,
-            "email": sos.crew_email or (sos.user.email if sos.user else None),
+            "email": (
+                sos.crew_email or (sos.user.email if sos.user else None)
+                if current_user.role == "superadmin"
+                else None
+            ),
         },
         # As of when the SOS was raised: where the crew actually were at that
         # moment, not wherever the cab ended up afterwards.
@@ -381,7 +402,7 @@ def add_sos_update(
         raise HTTPException(status_code=400, detail="Update label is required")
     event = CrewSosTimelineEvent(
         sos_id=sos.id,
-        source="agent",
+        source=current_user.role,
         event_type="UPDATE",
         label=label,
         detail=(body.detail or "").strip() or None,
@@ -395,6 +416,64 @@ def add_sos_update(
         "label": event.label, "detail": event.detail,
         "actor_name": event.actor_name, "event_time": event.event_time,
     }
+
+
+def _sos_note_or_404(db: Session, current_user, note_id: int):
+    note = db.query(CrewSosNote).filter(CrewSosNote.id == note_id).first()
+    if not note:
+        raise HTTPException(status_code=404, detail="SOS note not found")
+    sos = db.query(CrewSos).filter(CrewSos.id == note.sos_id).first()
+    if not sos or not _agent_may_handle(db, current_user, sos):
+        raise HTTPException(status_code=404, detail="SOS note not found")
+    if current_user.role == "agent":
+        if note.author_user_id != current_user.id:
+            raise HTTPException(status_code=404, detail="SOS note not found")
+    if (sos.status or "ACTIVE").upper() in {"CLOSED", "CANCELLED"}:
+        raise HTTPException(
+            status_code=409,
+            detail="Notes are locked for a terminal SOS alert",
+        )
+    return note
+
+
+@router.patch("/notes/{note_id}")
+def edit_sos_note(
+    note_id: int,
+    body: SosNoteIn,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if current_user.role not in {"superadmin", "agent"}:
+        raise HTTPException(status_code=403, detail="Only superadmins or agents can edit notes")
+    note = _sos_note_or_404(db, current_user, note_id)
+    text_value = body.note.strip()
+    if not text_value:
+        raise HTTPException(status_code=400, detail="Note is required")
+    note.note = text_value
+    note.last_edited_by_user_id = current_user.id
+    note.edited_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(note)
+    return {
+        "id": note.id, "author_name": note.author_name,
+        "note": note.note, "created_at": note.created_at,
+        "last_edited_by_user_id": note.last_edited_by_user_id,
+        "edited_at": note.edited_at,
+    }
+
+
+@router.delete("/notes/{note_id}")
+def delete_sos_note(
+    note_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if current_user.role not in {"superadmin", "agent"}:
+        raise HTTPException(status_code=403, detail="Only superadmins or agents can delete notes")
+    note = _sos_note_or_404(db, current_user, note_id)
+    db.delete(note)
+    db.commit()
+    return {"deleted": True, "id": note_id}
 
 
 @router.post("/{sos_id}/notes")
@@ -414,6 +493,7 @@ def add_sos_note(
         raise HTTPException(status_code=400, detail="Note is required")
     note = CrewSosNote(
         sos_id=sos.id, note=text_value,
+        author_user_id=current_user.id,
         author_name=getattr(current_user, "name", None),
     )
     db.add(note)
@@ -422,6 +502,8 @@ def add_sos_note(
     return {
         "id": note.id, "author_name": note.author_name,
         "note": note.note, "created_at": note.created_at,
+        "last_edited_by_user_id": note.last_edited_by_user_id,
+        "edited_at": note.edited_at,
     }
 
 
@@ -456,7 +538,10 @@ def _sos_manual_event_or_404(db: Session, current_user, event_id: int):
     if not sos or not _agent_may_handle(db, current_user, sos):
         raise HTTPException(status_code=404, detail="Timeline entry not found")
 
-    if (event.source or "system") != "agent":
+    source = event.source or "system"
+    if source not in {"agent", "superadmin"}:
+        raise HTTPException(status_code=404, detail="Timeline entry not found")
+    if current_user.role == "agent" and source != "agent":
         raise HTTPException(status_code=404, detail="Timeline entry not found")
 
     # Same rule the creator applies: once an alert is closed or cancelled its
@@ -467,7 +552,7 @@ def _sos_manual_event_or_404(db: Session, current_user, event_id: int):
     return event
 
 
-def _sos_timeline_out(event) -> dict:
+def _sos_timeline_out(event, viewer_role: str) -> dict:
     return {
         "id": event.id,
         "source": event.source,
@@ -476,7 +561,10 @@ def _sos_timeline_out(event) -> dict:
         "detail": event.detail,
         "actor_name": event.actor_name,
         "event_time": event.event_time,
-        "editable": (event.source or "system") == "agent",
+        "editable": (
+            (event.source or "system") in {"agent", "superadmin"}
+            and (viewer_role == "superadmin" or (event.source or "system") == "agent")
+        ),
     }
 
 
@@ -505,7 +593,7 @@ def edit_sos_timeline_entry(
         event.event_type = event_type
     db.commit()
     db.refresh(event)
-    return _sos_timeline_out(event)
+    return _sos_timeline_out(event, current_user.role)
 
 
 @router.delete("/timeline/{event_id}")

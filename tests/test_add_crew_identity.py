@@ -235,6 +235,131 @@ class AddCrewIdentityTests(unittest.TestCase):
         self.db.refresh(first)
         self.assertEqual(first.name, "Ravi Kumar")
 
+    def test_resolution_is_audited_and_only_authorizes_the_same_identity(self):
+        from app.api.v1.routes_superadmin import (
+            IdentityConflictResolutionIn,
+            get_identity_conflict,
+            list_identity_conflicts,
+            resolve_identity_conflict,
+        )
+        from app.db.models.crew_identity_conflict import CrewIdentityConflictAudit
+
+        passport = _uniq("QUEUE").replace("-", "")
+        selected = self.add_profile(passport=passport, name="Ravi Kumar")
+        self.add_profile(passport=passport, nationality="PH", name="Other Person")
+        superadmin = User(
+            email=f"{_uniq('superadmin')}@example.com",
+            hashed_password="x",
+            role="superadmin",
+        )
+        self.db.add(superadmin)
+        self.db.flush()
+
+        with self.assertRaises(HTTPException) as first_conflict:
+            self.add(self.body(passport_number=passport, name="Ravi Kumar"))
+        detail = first_conflict.exception.detail
+        conflict_id = detail["identity_conflict_id"]
+
+        queue = list_identity_conflicts(
+            status_filter="OPEN", page=1, limit=50,
+            db=self.db, current_user=superadmin,
+        )
+        self.assertIn(conflict_id, [item["id"] for item in queue["items"]])
+        resolved = resolve_identity_conflict(
+            conflict_id=conflict_id,
+            body=IdentityConflictResolutionIn(
+                expected_version=detail["version"],
+                action="SELECT_PROFILE",
+                crew_profile_id=selected.id,
+                evidence_type="passport_scan",
+                evidence_reference="DOC-123",
+                reason="Verified against the signed passport scan",
+            ),
+            db=self.db,
+            current_user=superadmin,
+        )
+        self.assertEqual(resolved["status"], "RESOLVED")
+        self.assertEqual(resolved["version"], detail["version"] + 1)
+        self.assertEqual(resolved["selected_profile_id"], selected.id)
+        self.assertEqual(len(resolved["audits"]), 1)
+        self.assertEqual(resolved["vessel"]["id"], self.vessel.id)
+        self.assertEqual(resolved["candidates"][0]["id"], selected.id)
+        self.assertEqual(resolved["resolution"]["action"], "SELECT_PROFILE")
+        self.assertEqual(
+            self.db.query(CrewIdentityConflictAudit).filter(
+                CrewIdentityConflictAudit.conflict_id == conflict_id
+            ).count(),
+            1,
+        )
+        self.assertEqual(
+            get_identity_conflict(
+                conflict_id=conflict_id, db=self.db, current_user=superadmin
+            )["audits"][0]["actor_user_id"],
+            superadmin.id,
+        )
+
+        mapped = self.add(self.body(passport_number=passport, name="Ravi Kumar"))
+        assignment = self.db.query(CrewAssignment).filter(
+            CrewAssignment.vessel_crew_id == mapped.id
+        ).one()
+        self.assertEqual(assignment.crew_profile_id, selected.id)
+
+        # The decision is fingerprinted. Reusing the passport with a different
+        # identity opens a new queue item rather than silently linking the
+        # profile selected for Ravi.
+        with self.assertRaises(HTTPException) as stale_decision:
+            self.add(self.body(passport_number=passport, name="Different Name"))
+        self.assertNotEqual(
+            stale_decision.exception.detail["identity_conflict_id"], conflict_id
+        )
+        self.assertIn("identity", stale_decision.exception.detail["message"])
+
+    def test_identity_conflict_queue_is_superadmin_only_and_versioned(self):
+        from app.api.v1.routes_superadmin import (
+            IdentityConflictResolutionIn,
+            list_identity_conflicts,
+            resolve_identity_conflict,
+        )
+
+        passport = _uniq("STALE").replace("-", "")
+        selected = self.add_profile(passport=passport, name="Ravi Kumar")
+        self.add_profile(passport=passport, nationality="PH", name="Other Person")
+        with self.assertRaises(HTTPException) as conflict:
+            self.add(self.body(passport_number=passport))
+        conflict_id = conflict.exception.detail["identity_conflict_id"]
+
+        with self.assertRaises(HTTPException) as forbidden:
+            list_identity_conflicts(
+                status_filter="OPEN", page=1, limit=50,
+                db=self.db, current_user=self.agent,
+            )
+        self.assertEqual(forbidden.exception.status_code, 403)
+
+        superadmin = User(
+            email=f"{_uniq('superadmin')}@example.com",
+            hashed_password="x", role="superadmin",
+        )
+        self.db.add(superadmin)
+        self.db.flush()
+        with self.assertRaises(HTTPException) as stale:
+            resolve_identity_conflict(
+                conflict_id=conflict_id,
+                body=IdentityConflictResolutionIn(
+                    expected_version=999,
+                    action="SELECT_PROFILE",
+                    crew_profile_id=selected.id,
+                    evidence_type="passport_scan",
+                    reason="Verified against source documents",
+                ),
+                db=self.db,
+                current_user=superadmin,
+            )
+        self.assertEqual(stale.exception.status_code, 409)
+        self.assertEqual(
+            stale.exception.detail["current_version"],
+            conflict.exception.detail["version"],
+        )
+
     def test_nationality_is_required_at_the_api_boundary(self):
         with self.assertRaises(ValidationError):
             CrewMemberIn(

@@ -18,8 +18,8 @@ from sqlalchemy import inspect, text
 from app.db.session import engine
 
 
-PREVIOUS_HEADS = {"o6p7q8r9s0t1"}
-EXPECTED_HEAD = "r9s0t1u2v3w4"
+PREVIOUS_HEADS = {"r9s0t1u2v3w4"}
+EXPECTED_HEAD = "s0t1u2v3w4x5"
 
 # These records predate Release A and require evidence-backed Release C work.
 # They are not referenced by the schema constraints added in this migration.
@@ -364,6 +364,9 @@ def main(argv=None):
         shore_pass_columns = {
             row["name"] for row in inspector.get_columns("shore_passes")
         }
+        sos_note_columns = {
+            row["name"] for row in inspector.get_columns("crew_sos_notes")
+        }
         indexes = {
             row["name"] for row in inspector.get_indexes("cab_bookings")
         }
@@ -375,6 +378,9 @@ def main(argv=None):
         }
         shore_pass_indexes = {
             row["name"] for row in inspector.get_indexes("shore_passes")
+        }
+        sos_note_indexes = {
+            row["name"] for row in inspector.get_indexes("crew_sos_notes")
         }
         identity_indexes = (
             {
@@ -406,6 +412,11 @@ def main(argv=None):
                 shore_pass_columns
             ):
                 failures.append("shore pass assignment context is missing")
+            required_sos_note_columns = {
+                "author_user_id", "last_edited_by_user_id", "edited_at",
+            }
+            if not required_sos_note_columns.issubset(sos_note_columns):
+                failures.append("SOS note authorship columns are missing")
             for name, existing in (
                 ("uq_cab_bookings_crew_idempotency_key", indexes),
                 ("uq_crew_assignments_active_profile", assignment_indexes),
@@ -416,6 +427,7 @@ def main(argv=None):
                 ("uq_driver_magic_links_booking_id", link_indexes),
                 ("ix_shore_passes_crew_assignment_id", shore_pass_indexes),
                 ("ix_shore_passes_vessel_call_id", shore_pass_indexes),
+                ("ix_crew_sos_notes_author_user_id", sos_note_indexes),
                 ("ix_crew_identity_conflicts_queue", identity_indexes),
                 ("ix_crew_identity_conflicts_identity", identity_indexes),
                 ("uq_crew_identity_conflicts_open_identity", identity_indexes),

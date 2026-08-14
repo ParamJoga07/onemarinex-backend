@@ -23,7 +23,7 @@ def test_assignment_scoped_release_stays_on_the_single_linear_graph():
     config.set_main_option("script_location", str(ROOT / "alembic"))
     script = ScriptDirectory.from_config(config)
 
-    assert script.get_heads() == ["r9s0t1u2v3w4"]
+    assert script.get_heads() == ["s0t1u2v3w4x5"]
     assert (
         script.get_revision("r9s0t1u2v3w4").down_revision
         == "o6p7q8r9s0t1"
@@ -63,8 +63,8 @@ def test_assignment_snapshot_backfill_precedes_unique_indexes():
 def test_preflight_supports_only_the_previous_and_new_heads_and_is_read_only():
     source = PREFLIGHT.read_text()
 
-    assert 'EXPECTED_HEAD = "r9s0t1u2v3w4"' in source
-    assert 'PREVIOUS_HEADS = {"o6p7q8r9s0t1"}' in source
+    assert 'EXPECTED_HEAD = "s0t1u2v3w4x5"' in source
+    assert 'PREVIOUS_HEADS = {"r9s0t1u2v3w4"}' in source
     assert "duplicate_active_profiles" in source
     assert "duplicate_pending_passports" in source
     assert "duplicate_magic_links" in source
@@ -86,6 +86,8 @@ def test_preflight_supports_only_the_previous_and_new_heads_and_is_read_only():
     assert "shore pass assignment context is missing" in source
     assert "ix_shore_passes_crew_assignment_id" in source
     assert "ix_shore_passes_vessel_call_id" in source
+    assert "SOS note authorship columns are missing" in source
+    assert "ix_crew_sos_notes_author_user_id" in source
     assert "booking.crew_assignment_id IS DISTINCT FROM sos.crew_assignment_id" in source
     assert "lower(trim(sos.vessel)) <> lower(trim(call.vessel_name))" in source
     assert "NOT EXISTS" in source

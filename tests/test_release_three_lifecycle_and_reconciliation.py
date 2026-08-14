@@ -27,10 +27,12 @@ from app.api.v1.routes_vessels import (
 from app.db.models.agent_profile import AgentProfile
 from app.db.models.event_context_reconciliation import EventContextReconciliation
 from app.db.models.incident import Incident, IncidentStatus, IncidentType
+from app.db.models.report_snapshot import ReportSnapshot
 from app.db.models.user import User
 from app.db.models.vessel import Vessel
 from app.db.session import engine
 from app.services.historical_context import active_vessel_call, finish_vessel_call
+from app.services.report_snapshots import canonical_payload, create_report_snapshot
 from app.services.vessel_lifecycle import (
     effective_vessel_status,
     synchronize_vessel_lifecycle,
@@ -261,6 +263,83 @@ def test_reconciliation_queue_filters_and_paginates_in_database(db):
     assert page["vessel_call_total"] >= len(page["vessel_calls"])
 
 
+def test_ambiguous_reconciliation_candidates_never_guess_and_snapshot_stays_frozen(db):
+    """Candidate discovery is read-only; an audited choice cannot rewrite an old PDF."""
+
+    _agent_a, agency_a, vessel_a, call_a = _agent_and_vessel(db)
+    _agent_b, _agency_b, _vessel_b, call_b = _agent_and_vessel(db)
+    incident = Incident(
+        incident_id=_uniq("INC"),
+        type=IncidentType.CREW,
+        title="Ambiguous historical event",
+        description="Two historical vessel calls require reviewed evidence.",
+        status=IncidentStatus.ACTIVE,
+        context_resolution="unresolved",
+    )
+    admin = User(
+        email=f"{_uniq('admin')}@example.com",
+        hashed_password="x",
+        role="superadmin",
+    )
+    db.add_all([incident, admin])
+    db.flush()
+
+    frozen_payload = {
+        "report": "incident",
+        "incident_id": incident.incident_id,
+        "vessel": "Unresolved at generation time",
+    }
+    snapshot = create_report_snapshot(
+        db,
+        report_kind="incident",
+        source_id=incident.id,
+        source_reference=incident.incident_id,
+        agency_id=agency_a.id,
+        vessel_call_id=None,
+        generated_by_user_id=admin.id,
+        payload=frozen_payload,
+    )
+    db.flush()
+    original_payload = dict(snapshot.payload)
+    original_digest = snapshot.payload_sha256
+
+    queue = list_unresolved_historical_context(
+        record_kind="incident",
+        record_limit=500,
+        record_offset=0,
+        vessel_call_limit=500,
+        vessel_call_offset=0,
+        db=db,
+        current_user=admin,
+    )
+    queued = next(row for row in queue["records"] if row["record_id"] == incident.id)
+    candidate_ids = {row["id"] for row in queue["vessel_calls"]}
+    assert {call_a.id, call_b.id}.issubset(candidate_ids)
+    assert queued["current_context"]["vessel_call_id"] is None
+    assert incident.vessel_call_id is None
+    assert incident.context_resolution == "unresolved"
+
+    reconcile_historical_context(
+        record_kind="incident",
+        record_id=incident.id,
+        body=HistoricalContextResolutionIn(
+            vessel_call_id=call_a.id,
+            evidence_type="manual_document",
+            evidence_reference="SIGNED-MANIFEST-1",
+            notes="Signed historical manifest confirms the selected vessel call.",
+            expected_context=queued["current_context"],
+        ),
+        db=db,
+        current_user=admin,
+    )
+    assert incident.vessel_id == vessel_a.id
+    assert incident.vessel_call_id == call_a.id
+    stored = db.query(ReportSnapshot).filter(ReportSnapshot.id == snapshot.id).one()
+    assert stored.payload == original_payload
+    assert stored.payload_sha256 == original_digest
+    assert canonical_payload(stored.payload)[1] == original_digest
+
+
 def test_reconciliation_rejects_conflicting_crew_assignment(db):
     _agent, _agency, _vessel, selected_call = _agent_and_vessel(db)
     _other_agent, _other_agency, _other_vessel, assignment_call = _agent_and_vessel(db)
@@ -313,6 +392,50 @@ def test_reconciliation_notes_are_trimmed_before_length_validation():
             evidence_type="manual_document",
             notes="          short          ",
         )
+
+
+def test_reconciliation_rejects_stale_expected_context(db):
+    _agent, _agency, _vessel, call = _agent_and_vessel(db)
+    incident = Incident(
+        incident_id=_uniq("INC"),
+        type=IncidentType.CREW,
+        title="Legacy event changed while under review",
+        description="The stale review must not overwrite newer ownership.",
+        status=IncidentStatus.ACTIVE,
+        context_resolution="unresolved",
+    )
+    admin = User(email=f"{_uniq('admin')}@example.com", hashed_password="x", role="superadmin")
+    db.add_all([incident, admin])
+    db.flush()
+
+    with pytest.raises(HTTPException) as stale:
+        reconcile_historical_context(
+            record_kind="incident",
+            record_id=incident.id,
+            body=HistoricalContextResolutionIn(
+                vessel_call_id=call.id,
+                evidence_type="manual_document",
+                notes="Signed historical document reviewed by the operator.",
+                expected_context={
+                    "vessel_id": 999999,
+                    "vessel_call_id": None,
+                    "agency_id": None,
+                    "crew_assignment_id": None,
+                    "port_id": None,
+                    "context_resolution": "unresolved",
+                },
+            ),
+            db=db,
+            current_user=admin,
+        )
+
+    assert stale.value.status_code == 409
+    assert stale.value.detail["current_context"]["vessel_id"] is None
+    assert incident.vessel_call_id is None
+    assert not db.query(EventContextReconciliation).filter(
+        EventContextReconciliation.record_kind == "incident",
+        EventContextReconciliation.record_id == incident.id,
+    ).count()
 
 
 def test_vessel_creation_rejects_client_supplied_lifecycle_status():

@@ -12,6 +12,8 @@ from app.api.v1.routes_restaurants import get_restaurants
 from app.api.v1.routes_superadmin import (
     VendorCreate,
     VendorUpdate,
+    create_place,
+    get_vendors,
     update_place,
 )
 from app.db.models.port import Port
@@ -134,6 +136,65 @@ class VendorCommissionRankingTests(unittest.TestCase):
 
         self.assertEqual([result["name"] for result in results], ["High", "Low"])
         self.assertTrue(all("commission_percentage" not in result for result in results))
+
+    def test_working_days_round_trip_for_one_several_and_all_days(self):
+        """Superadmin create/edit/read uses one canonical weekday contract."""
+
+        admin = SimpleNamespace(role="superadmin")
+        all_days = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+        cases = (
+            ("One Day", ["Mon"], "Mon", ["Mon"]),
+            ("Several Days", "Tue, Thu, Sat", ["Tue", "Thu", "Sat"], ["Tue", "Thu", "Sat"]),
+            ("All Days", "All Days", all_days, all_days),
+        )
+
+        for suffix, create_days, edit_days, expected in cases:
+            created = create_place(
+                payload=VendorCreate(
+                    name=f"Working Days {suffix}",
+                    category="pub",
+                    location_name="Port Road",
+                    distance_from_port=1,
+                    rating=0,
+                    lat=17.7,
+                    lng=83.3,
+                    port_id=self.port_id,
+                    phone="9999999999",
+                    email=f"{suffix.lower().replace(' ', '-')}@example.com",
+                    other_information={
+                        "open_time": "09:00",
+                        "close_time": "18:00",
+                        "working_days": create_days,
+                    },
+                ),
+                db=self.db,
+                current_user=admin,
+            )
+            self.assertEqual(created.other_information["working_days"], expected)
+            read_created = get_vendors(
+                vendor_id=created.id,
+                db=self.db,
+                current_user=admin,
+            )
+            self.assertEqual(read_created[0].other_information["working_days"], expected)
+
+            updated = update_place(
+                vendor_id=created.id,
+                payload=VendorUpdate(other_information={
+                    "open_time": "10:00",
+                    "close_time": "19:00",
+                    "working_days": edit_days,
+                }),
+                db=self.db,
+                current_user=admin,
+            )
+            self.assertEqual(updated.other_information["working_days"], expected)
+            read_updated = get_vendors(
+                vendor_id=created.id,
+                db=self.db,
+                current_user=admin,
+            )
+            self.assertEqual(read_updated[0].other_information["working_days"], expected)
 
 
 if __name__ == "__main__":
