@@ -122,7 +122,8 @@ def resolve_verified_crew_profile(
         )
 
     stored_nationality = normalize_nationality(profile.nationality, strict=False)
-    if stored_nationality and stored_nationality != nationality:
+    proposed_nationality = normalize_nationality(nationality, strict=False)
+    if stored_nationality and stored_nationality != proposed_nationality:
         raise CrewIdentityConflict(
             "The passport matches an account with a different nationality; "
             "Superadmin identity reconciliation is required"

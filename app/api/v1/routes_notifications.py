@@ -313,7 +313,7 @@ def _recipient_context(db: Session, current_user):
     return port_name, vessel_name, vessel_ids
 
 
-def _visible_notifications(db: Session, current_user) -> List[Notification]:
+def _visible_notifications_query(db: Session, current_user):
     port_name, vessel_name, vessel_ids = _recipient_context(db, current_user)
     query = db.query(Notification)
     targeted_audiences = {"single_vessel", "all_agent_vessels"}
@@ -362,8 +362,12 @@ def _visible_notifications(db: Session, current_user) -> List[Notification]:
             query = query.filter(Notification.port_name.is_(None))
         query = query.filter(legacy_audience, Notification.vessel.is_(None))
 
+    return query
+
+
+def _visible_notifications(db: Session, current_user) -> List[Notification]:
     return (
-        query
+        _visible_notifications_query(db, current_user)
         .order_by(Notification.created_at.desc(), Notification.id.desc())
         .limit(500)
         .all()
@@ -415,16 +419,19 @@ def get_unread_count(
     if current_user.role not in ["crew", "agent"]:
         raise HTTPException(status_code=403, detail="Only crew or agents can view notifications")
 
-    notification_ids = [item.id for item in _visible_notifications(db, current_user)]
-    if not notification_ids:
-        return {"count": 0}
-
-    read_ids = db.query(NotificationRead.notification_id).filter(
-        NotificationRead.user_id == current_user.id,
-        NotificationRead.notification_id.in_(notification_ids),
-    ).all()
-    read_set = {row[0] for row in read_ids}
-    return {"count": len(notification_ids) - len(read_set)}
+    count = (
+        _visible_notifications_query(db, current_user)
+        .outerjoin(
+            NotificationRead,
+            and_(
+                NotificationRead.notification_id == Notification.id,
+                NotificationRead.user_id == current_user.id,
+            ),
+        )
+        .filter(NotificationRead.id.is_(None))
+        .count()
+    )
+    return {"count": count}
 
 
 @router.post("/{notification_id}/read")
@@ -436,7 +443,12 @@ def mark_notification_read(
     if current_user.role not in ["crew", "agent"]:
         raise HTTPException(status_code=403, detail="Only crew or agents can mark notifications")
 
-    if notification_id not in {item.id for item in _visible_notifications(db, current_user)}:
+    visible = (
+        _visible_notifications_query(db, current_user)
+        .filter(Notification.id == notification_id)
+        .first()
+    )
+    if visible is None:
         raise HTTPException(status_code=404, detail="Notification not found")
 
     existing = db.query(NotificationRead).filter(

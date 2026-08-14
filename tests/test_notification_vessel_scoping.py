@@ -23,8 +23,10 @@ from app.api.v1.routes_notifications import (
     NotificationUpdateIn,
     create_notification,
     delete_notification,
+    get_unread_count,
     list_notifications_admin,
     list_notifications_for_crew,
+    mark_notification_read,
     update_notification,
 )
 from app.db.models.user import User
@@ -265,6 +267,44 @@ class NotificationVesselScopingTests(unittest.TestCase):
         )
 
         self.assertEqual([item.title for item in visible], ["Relevant older notice"])
+
+    def test_unread_and_read_authorization_include_visible_rows_older_than_feed_limit(self):
+        crew_user = User(
+            email=_uniq("crew") + "@example.com", hashed_password="x", role="crew"
+        )
+        self.db.add(crew_user)
+        self.db.flush()
+        profile = CrewProfile(
+            user_id=crew_user.id, full_name="Crew", rank="able_seaman",
+            nationality="IN", hpid=_uniq("HP"), current_port=self.PORT,
+            vessel=self.vessel_a.name,
+        )
+        manifest = VesselCrew(
+            vessel_id=self.vessel_a.id, name="Crew", rank="able_seaman",
+            hp_id=profile.hpid,
+        )
+        self.db.add_all([profile, manifest])
+        self.db.flush()
+        assignment_for_manifest(self.db, self.vessel_a, manifest, profile=profile)
+        notices = [
+            Notification(
+                title=f"Relevant {index}", message="For this crew",
+                audience_type="single_vessel", target_vessel_ids=[self.vessel_a.id],
+            )
+            for index in range(501)
+        ]
+        self.db.add_all(notices)
+        self.db.flush()
+        crew = SimpleNamespace(id=crew_user.id, role="crew")
+
+        self.assertEqual(get_unread_count(db=self.db, current_user=crew), {"count": 501})
+        self.assertEqual(
+            mark_notification_read(
+                notification_id=notices[0].id, db=self.db, current_user=crew,
+            ),
+            {"status": "ok"},
+        )
+        self.assertEqual(get_unread_count(db=self.db, current_user=crew), {"count": 500})
 
     def test_crew_who_changed_ship_stop_receiving_the_old_ships_notices(self):
         """The reported leak: notices reaching vessels they were not sent to.

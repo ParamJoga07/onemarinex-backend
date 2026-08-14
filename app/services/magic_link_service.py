@@ -185,6 +185,10 @@ def create_or_refresh_magic_link(
         )
         if magic_link is None:
             raise exc
+        magic_link.itinerary_stops = stops
+        if magic_link.created_by_aggregator_id is None:
+            magic_link.created_by_aggregator_id = aggregator_id
+        db.commit()
     db.refresh(magic_link)
     return magic_link
 

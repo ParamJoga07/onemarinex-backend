@@ -337,6 +337,19 @@ def test_profile_and_shore_pass_require_and_preserve_exact_assignment(db):
     assert eligibility["crew_assignment_id"] == assignment_a.id
     assert eligibility["agent_name"] == "Agency Alpha"
 
+    with pytest.raises(HTTPException) as missing_port:
+        generate_shorepass(
+            GenerateShorePassIn(
+                crew_assignment_id=assignment_a.id,
+                port_name="port_test",
+            ),
+            db=db,
+            current_user=crew_user,
+        )
+    assert missing_port.value.status_code == 409
+
+    assignment_a.vessel_call.port_name = "port_test"
+    db.flush()
     generated = generate_shorepass(
         GenerateShorePassIn(
             crew_assignment_id=assignment_a.id,

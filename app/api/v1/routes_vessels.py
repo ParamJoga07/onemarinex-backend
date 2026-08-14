@@ -426,7 +426,7 @@ def _ensure_crew_shore_pass(
         crew_assignment_id=assignment.id,
         vessel_call_id=assignment.vessel_call_id,
         agent_name=f"{port_display} Port Authority",
-        shore_pass_id=f"SP-{port_code}-{vessel_code}-{uuid.uuid4().hex[:4].upper()}",
+        shore_pass_id=f"SP-{port_code}-{vessel_code}-{uuid.uuid4().hex[:8].upper()}",
         port_name=pass_port,
         vessel_name=pass_vessel,
         is_verified=False,
@@ -1091,6 +1091,10 @@ def add_crew_member(vessel_id: int, body: CrewMemberIn, current_user: User = Dep
         # Mapping is server-owned and may legitimately change from Pending to
         # Mapped after the crew member creates an account.
         crew.status = "Mapped" if profile else "Pending"
+        if body.shore_pass_eligible is not None:
+            crew.shore_pass_eligible = body.shore_pass_eligible
+        if body.shore_pass_valid_upto is not None:
+            crew.shore_pass_valid_upto = body.shore_pass_valid_upto
     else:
         crew = VesselCrew(
             vessel_id=vessel.id,

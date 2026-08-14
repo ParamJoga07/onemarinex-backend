@@ -150,6 +150,26 @@ class AddCrewIdentityTests(unittest.TestCase):
         )
         self.assertEqual(second.passport_number, normalize_passport_number(passport))
 
+    def test_identical_retry_updates_shore_pass_settings(self):
+        passport = _uniq("R").replace("-", "")
+        self.add_profile(passport=passport)
+        first = self.add(self.body(passport_number=passport, shore_pass_eligible=True))
+        valid_upto = datetime.now(timezone.utc) + timedelta(days=1)
+
+        second = self.add(self.body(
+            passport_number=passport,
+            shore_pass_eligible=False,
+            shore_pass_valid_upto=valid_upto,
+        ))
+
+        self.assertEqual(second.id, first.id)
+        self.assertFalse(second.shore_pass_eligible)
+        self.assertEqual(second.shore_pass_valid_upto, valid_upto)
+        assignment = self.db.query(CrewAssignment).filter(
+            CrewAssignment.vessel_crew_id == second.id
+        ).one()
+        self.assertFalse(assignment.shore_pass_eligible)
+
     def test_shared_passport_is_rejected_for_identity_reconciliation(self):
         passport = _uniq("DUP").replace("-", "")
         self.add_profile(passport=passport, name="First Person")

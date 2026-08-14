@@ -361,6 +361,7 @@ class EligibleCrewAssignmentOut(BaseModel):
     agency_id: Optional[int] = None
     agency_name: Optional[str] = None
     port_id: Optional[int] = None
+    port_code: Optional[str] = None
     port_name: Optional[str] = None
     started_at: datetime
     emergency_email: Optional[str] = None
@@ -396,6 +397,7 @@ def list_eligible_crew_assignments(
                 agency_id=row.vessel_call.agency_id,
                 agency_name=row.vessel_call.agency_name,
                 port_id=row.vessel_call.port_id,
+                port_code=(row.vessel_call.port.code if row.vessel_call.port else None),
                 port_name=row.vessel_call.port_name,
                 started_at=row.started_at,
                 emergency_email=row.emergency_email,
@@ -738,7 +740,7 @@ def sync_crew_manifest_helper(profile: CrewProfile, db: Session):
                 if not existing_pass:
                     port_code = port_to_use.replace("port_", "")[:3].upper()
                     vessel_code = vessel.name.replace(" ", "")[:3].upper()
-                    random_suffix = uuid.uuid4().hex[:4].upper()
+                    random_suffix = uuid.uuid4().hex[:8].upper()
                     shore_pass_id = f"SP-{port_code}-{vessel_code}-{random_suffix}"
                     
                     port_display = port_to_use.replace("port_", "").replace("_", " ").title()
@@ -1387,7 +1389,7 @@ def generate_shorepass(
     if assignment is None:
         raise HTTPException(status_code=409, detail="No active vessel assignment is available")
     call = _assignment_call_or_conflict(assignment)
-    port = call.port_name or body.port_name
+    port = call.port_name
     vessel = call.vessel_name
     if not vessel:
         raise HTTPException(
@@ -1398,6 +1400,8 @@ def generate_shorepass(
     # operational context.
     if body.vessel_name and body.vessel_name.strip().lower() != vessel.strip().lower():
         raise HTTPException(status_code=409, detail="Vessel does not match selected assignment")
+    if body.port_name and port and body.port_name.strip().lower() != port.strip().lower():
+        raise HTTPException(status_code=409, detail="Port does not match selected assignment")
     agency_name = call.agency_name
 
     if not port:
@@ -1416,7 +1420,7 @@ def generate_shorepass(
     # Build unique shore pass ID: port code + vessel code + random
     port_code = port.replace("port_", "")[:3].upper()          # e.g. "SIN"
     vessel_code = vessel.replace("vessel_", "V")[:3].upper()   # e.g. "V1"
-    random_suffix = uuid.uuid4().hex[:4].upper()
+    random_suffix = uuid.uuid4().hex[:8].upper()
     shore_pass_id = f"SP-{port_code}-{vessel_code}-{random_suffix}"
 
     # Issue once for legacy profiles that do not yet have an HPID. Existing
@@ -2177,6 +2181,7 @@ def book_cab(
     # Resolve retries before checking availability or broadcasting to
     # providers. A retry may arrive after the port window changed, but must
     # still receive the booking originally created for this action.
+    server_generated_idempotency_key = not bool(body.idempotency_key)
     idempotency_key = (
         body.idempotency_key.strip()
         if body.idempotency_key
@@ -2526,7 +2531,7 @@ def book_cab(
                 ),
                 agent_number=raced_booking.agent_number,
             )
-        if raced_booking is None or idempotency_key.startswith("legacy-"):
+        if raced_booking is None or server_generated_idempotency_key:
             logger.exception(
                 "Booking creation failed with a non-idempotency integrity error"
             )
