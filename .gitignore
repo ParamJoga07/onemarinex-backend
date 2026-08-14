@@ -26,6 +26,7 @@ scripts/*
 !scripts/preflight_release_zero.py
 !scripts/preflight_release_one.py
 !scripts/preflight_release_four.py
+!scripts/reconcile_confirmed_assignment_records.py
 !scripts/preflight_assignment_scoped_operations.py
 apply_port_id_migration.py
 migrations/
