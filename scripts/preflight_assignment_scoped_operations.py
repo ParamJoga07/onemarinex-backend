@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
-"""Read-only pre/postflight for assignment-scoped operations migration."""
+"""Read-only pre/postflight for assignment-scoped operations migration.
 
+Historical findings that are unrelated to the migration's constraints remain
+visible, but do not block the prevention release.  Use ``--strict-historical``
+after the separately approved repair release to require those counters to be
+zero as well.
+"""
+
+import argparse
 from pathlib import Path
 
 from alembic.config import Config
@@ -13,6 +20,14 @@ from app.db.session import engine
 
 PREVIOUS_HEADS = {"o6p7q8r9s0t1"}
 EXPECTED_HEAD = "r9s0t1u2v3w4"
+
+# These records predate Release A and require evidence-backed Release C work.
+# They are not referenced by the schema constraints added in this migration.
+DEFERRED_HISTORICAL_CHECKS = {
+    "invalid_open_calls",
+    "sos_snapshot_context_mismatches",
+    "duplicate_equivalent_empty_calls",
+}
 
 
 CHECKS = {
@@ -225,8 +240,20 @@ IDENTITY_CONFLICT_CHECKS = {
 }
 
 
-def main():
+def _is_blocking_finding(name: str, *, strict_historical: bool) -> bool:
+    return strict_historical or name not in DEFERRED_HISTORICAL_CHECKS
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--strict-historical",
+        action="store_true",
+        help="require deferred historical-repair counters to be zero",
+    )
+    args = parser.parse_args(argv)
     failures = []
+    deferred_findings = []
     with engine.connect() as connection:
         root = Path(__file__).resolve().parents[1]
         config = Config(str(root / "alembic.ini"))
@@ -244,7 +271,12 @@ def main():
             value = connection.execute(text(query)).scalar_one()
             print(f"{name}: {value}")
             if value:
-                failures.append(name)
+                if _is_blocking_finding(
+                    name, strict_historical=args.strict_historical
+                ):
+                    failures.append(name)
+                else:
+                    deferred_findings.append(name)
         inspector = inspect(connection)
         tables = set(inspector.get_table_names())
         identity_tables = {
@@ -394,12 +426,17 @@ def main():
             ):
                 if name not in existing:
                     failures.append(f"missing unique index {name}")
+    if deferred_findings:
+        print("\nDEFERRED HISTORICAL FINDINGS — Release C verification required")
+        for finding in deferred_findings:
+            print(f"- {finding}")
+        print("Run with --strict-historical after approved repairs.")
     if failures:
         print("\nBLOCKED")
         for failure in failures:
             print(f"- {failure}")
         return 1
-    print("\nREADY — assignment-scoped operations preflight passed")
+    print("\nREADY — assignment-scoped operations migration preflight passed")
     return 0
 
 

@@ -5,6 +5,10 @@ from pathlib import Path
 from alembic.config import Config
 from alembic.script import ScriptDirectory
 
+from scripts.preflight_assignment_scoped_operations import (
+    _is_blocking_finding,
+)
+
 
 ROOT = Path(__file__).resolve().parents[1]
 MIGRATION = (
@@ -89,6 +93,25 @@ def test_preflight_supports_only_the_previous_and_new_heads_and_is_read_only():
         token in source.upper()
         for token in ("UPDATE ", "DELETE ", "INSERT ", "ALTER ", "DROP ")
     )
+
+
+def test_preflight_defers_only_evidence_backed_historical_repairs():
+    deferred = {
+        "invalid_open_calls",
+        "sos_snapshot_context_mismatches",
+        "duplicate_equivalent_empty_calls",
+    }
+
+    for finding in deferred:
+        assert not _is_blocking_finding(finding, strict_historical=False)
+        assert _is_blocking_finding(finding, strict_historical=True)
+
+    for finding in {
+        "duplicate_active_profiles",
+        "assignment_event_mismatches",
+        "unresolved_agent_visible_events",
+    }:
+        assert _is_blocking_finding(finding, strict_historical=False)
 
 
 def test_identity_queue_is_created_in_its_final_shape():
