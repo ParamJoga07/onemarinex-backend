@@ -17,65 +17,20 @@ whatever the port had configured. The agency's own number lives on
 when an agent edits it — and that is what belongs here.
 """
 from typing import Optional
-
-from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 
-def vessel_for_crew(db: Session, crew) -> Optional[object]:
-    """The vessel whose manifest lists this crew member, or None.
-
-    HPID first, then passport — the same ladder used elsewhere, because an HPID
-    regenerated from a differently-spelled nationality will not match while the
-    passport still does. Falls back to the ship named on the profile, which is
-    all a crew member who has not yet been put on a manifest can offer.
-    """
-    from app.db.models.vessel import Vessel
-    from app.db.models.vessel_crew import VesselCrew
-
-    if crew is None:
-        return None
-
-    identity = []
-    if crew.hpid:
-        identity.append(func.upper(func.trim(VesselCrew.hp_id)) == crew.hpid.strip().upper())
-    if crew.passport_number:
-        identity.append(
-            func.upper(func.trim(VesselCrew.passport_number))
-            == crew.passport_number.strip().upper()
-        )
-
-    if identity:
-        match = (
-            db.query(Vessel)
-            .join(VesselCrew, VesselCrew.vessel_id == Vessel.id)
-            .filter(or_(*identity))
-            .first()
-        )
-        if match:
-            return match
-
-    if crew.vessel:
-        return (
-            db.query(Vessel)
-            .filter(func.upper(func.trim(Vessel.name)) == crew.vessel.strip().upper())
-            .first()
-        )
-    return None
-
-
-def support_number_for_crew(db: Session, crew) -> Optional[str]:
+def support_number_for_assignment(db: Session, assignment) -> Optional[str]:
     """The agency's contact number for this crew member's vessel.
 
     Returns None rather than a placeholder when the agency has not set one: on
     a contact row an invented number is worse than an honest blank.
     """
-    from app.db.models.user import User
-
-    vessel = vessel_for_crew(db, crew)
-    if vessel is None or not vessel.agent_id:
+    call = getattr(assignment, "vessel_call", None) if assignment else None
+    if call is None or call.agency_id is None:
         return None
-    agent = db.query(User).filter(User.id == vessel.agent_id).first()
-    profile = getattr(agent, "agent_profile", None) if agent else None
+    from app.db.models.agent_profile import AgentProfile
+
+    profile = db.query(AgentProfile).filter(AgentProfile.id == call.agency_id).first()
     number = getattr(profile, "support_number", None) if profile else None
     return (number or "").strip() or None

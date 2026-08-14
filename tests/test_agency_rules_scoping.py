@@ -29,6 +29,7 @@ from app.db.models.user import User
 from app.db.models.vessel import Vessel
 from app.db.models.vessel_crew import VesselCrew
 from app.db.session import engine
+from app.services.historical_context import assignment_for_manifest
 
 PORT = "port_rules_scope_test"
 
@@ -82,14 +83,24 @@ class AgencyRulesScopingTests(unittest.TestCase):
         self.db.add(user)
         self.db.flush()
         hpid = _uniq("HP")
-        self.db.add_all([
-            CrewProfile(user_id=user.id, full_name="Crew", rank="able_seaman",
-                        nationality="IN", hpid=hpid, current_port=PORT,
-                        vessel=vessel.name),
-            VesselCrew(vessel_id=vessel.id, name="Crew", rank="able_seaman",
-                       hp_id=hpid),
-        ])
+        profile = CrewProfile(
+            user_id=user.id,
+            full_name="Crew",
+            rank="able_seaman",
+            nationality="IN",
+            hpid=hpid,
+            current_port=PORT,
+            vessel=vessel.name,
+        )
+        manifest = VesselCrew(
+            vessel_id=vessel.id,
+            name="Crew",
+            rank="able_seaman",
+            hp_id=hpid,
+        )
+        self.db.add_all([profile, manifest])
         self.db.flush()
+        assignment_for_manifest(self.db, vessel, manifest, profile=profile)
         return SimpleNamespace(id=user.id, role="crew")
 
     def _save_rules(self, agent, title):

@@ -421,7 +421,9 @@ def serialize_booking(booking: CabBooking) -> Dict[str, Any]:
             "id": booking.crew.id if booking.crew else None,
             "name": booking.crew.full_name if booking.crew else None,
             "hp_id": booking.crew.hpid if booking.crew else None,
-            "vessel": booking.crew.vessel if booking.crew else None,
+            "vessel": (
+                booking.vessel_call.vessel_name if booking.vessel_call else None
+            ),
             # The contact number lives on the linked user, not the profile —
             # admins/agents need it to reach the crew about a ride.
             "mobile_number": (
