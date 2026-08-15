@@ -306,6 +306,9 @@ class ManifestSaveTests(unittest.TestCase):
         self.assertEqual(saved["FJ917654"], "UA")
         self.assertEqual(saved["Z5262WB"], "IN")
         self.assertEqual(saved["P1234567"], "PH")
+        self.db.refresh(self.vessel)
+        self.assertEqual(self.vessel.crew_count, 3)
+        self.assertEqual(self.vessel.total_crew, 3)
 
     def test_an_unrecognised_nationality_names_the_crew_member_and_the_value(self):
         """The agent has to be told which cell to correct."""

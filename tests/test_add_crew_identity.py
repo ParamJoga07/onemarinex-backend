@@ -149,6 +149,9 @@ class AddCrewIdentityTests(unittest.TestCase):
             1,
         )
         self.assertEqual(second.passport_number, normalize_passport_number(passport))
+        self.db.refresh(self.vessel)
+        self.assertEqual(self.vessel.crew_count, 1)
+        self.assertEqual(self.vessel.total_crew, 1)
 
     def test_identical_retry_updates_shore_pass_settings(self):
         passport = _uniq("R").replace("-", "")

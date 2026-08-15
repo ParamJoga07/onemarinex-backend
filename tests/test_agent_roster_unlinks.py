@@ -111,6 +111,9 @@ class AgentRosterUnlinkTests(unittest.TestCase):
         ).one()
         self.assertEqual(event.actor_user_id, self.agent.id)
         self.assertEqual(event.subject_hpid, self.profile.hpid)
+        self.db.refresh(self.vessel)
+        self.assertEqual(self.vessel.crew_count, 0)
+        self.assertEqual(self.vessel.total_crew, 0)
 
     def test_agent_cannot_unlink_another_agents_crew(self):
         with self.assertRaises(HTTPException) as ctx:

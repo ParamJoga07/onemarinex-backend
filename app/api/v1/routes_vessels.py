@@ -94,8 +94,9 @@ class VesselIn(BaseModel):
     berth_assignment: Optional[str] = None
     flag: Optional[str] = None
     agency_name: Optional[str] = None
-    crew_count: Optional[int] = 0
-    total_crew: Optional[int] = 0
+    # Accepted for backwards compatibility; roster operations own this value.
+    crew_count: Optional[int] = None
+    total_crew: Optional[int] = None
     eta: Optional[datetime] = None
     etd: Optional[datetime] = None
     status: Literal["Active"] = "Active"
@@ -434,6 +435,16 @@ def _ensure_crew_shore_pass(
     ))
 
 
+def _refresh_vessel_crew_count(db: Session, vessel: Vessel) -> int:
+    """Refresh the legacy count cache from the authoritative current roster."""
+    db.flush()
+    total = db.query(func.count(VesselCrew.id)).filter(
+        VesselCrew.vessel_id == vessel.id
+    ).scalar() or 0
+    vessel.crew_count = total
+    return total
+
+
 def _save_manifest_rows(db: Session, vessel: Vessel, rows, port: Optional[str]) -> int:
     """Upsert parsed manifest rows onto a vessel's crew list.
 
@@ -600,6 +611,7 @@ def _save_manifest_rows(db: Session, vessel: Vessel, rows, port: Optional[str]) 
         )
         saved += 1
 
+    _refresh_vessel_crew_count(db, vessel)
     db.commit()
     return saved
 
@@ -751,6 +763,8 @@ def vessel_out(vessel: Vessel) -> VesselOut:
     return output.model_copy(
         update={
             "agency_name": agency_name,
+            "crew_count": vessel.total_crew,
+            "total_crew": vessel.total_crew,
             "status": effective_vessel_status(vessel),
         }
     )
@@ -771,10 +785,6 @@ def create_vessel(body: VesselIn, current_user: User = Depends(get_current_user)
     if current_user.role not in ["agent", "superadmin"]:
         raise HTTPException(status_code=403, detail="Not authorized to create vessels")
     
-    c_count = body.crew_count if body.crew_count is not None else 0
-    if body.total_crew is not None:
-        c_count = body.total_crew
-
     resolved_agency = body.agency_name
     if not resolved_agency and current_user.role == "agent":
         if hasattr(current_user, "agent_profile") and current_user.agent_profile:
@@ -788,7 +798,7 @@ def create_vessel(body: VesselIn, current_user: User = Depends(get_current_user)
         berth_assignment=body.berth_assignment,
         flag=body.flag,
         agency_name=resolved_agency,
-        crew_count=c_count,
+        crew_count=0,
         eta=body.eta,
         etd=body.etd,
         status="Active"
@@ -828,11 +838,6 @@ def update_vessel(vessel_id: int, body: VesselIn, current_user: User = Depends(g
     vessel.flag = body.flag
     if body.agency_name is not None:
         vessel.agency_name = body.agency_name
-    
-    c_count = body.crew_count if body.crew_count is not None else 0
-    if body.total_crew is not None:
-        c_count = body.total_crew
-    vessel.crew_count = c_count
     
     vessel.eta = body.eta
     vessel.etd = body.etd
@@ -1129,6 +1134,7 @@ def add_crew_member(vessel_id: int, body: CrewMemberIn, current_user: User = Dep
         agency_name=agency_name,
     )
 
+    _refresh_vessel_crew_count(db, vessel)
     db.commit()
     db.refresh(crew)
     return crew
@@ -1324,12 +1330,19 @@ def unlink_crew_from_vessel(
 ):
     """Remove one manifest association while preserving account and history."""
     if current_user.role == "agent":
-        vessel = db.query(Vessel).filter(
-            Vessel.id == vessel_id,
-            Vessel.agent_id == current_user.id,
-        ).first()
+        vessel = (
+            db.query(Vessel)
+            .filter(Vessel.id == vessel_id, Vessel.agent_id == current_user.id)
+            .with_for_update()
+            .first()
+        )
     elif current_user.role == "superadmin":
-        vessel = db.query(Vessel).filter(Vessel.id == vessel_id).first()
+        vessel = (
+            db.query(Vessel)
+            .filter(Vessel.id == vessel_id)
+            .with_for_update()
+            .first()
+        )
     else:
         raise HTTPException(
             status_code=403, detail="Only agents or superadmins can remove crew"
@@ -1357,6 +1370,7 @@ def unlink_crew_from_vessel(
     ))
     end_manifest_assignment(db, crew)
     db.delete(crew)
+    _refresh_vessel_crew_count(db, vessel)
     db.commit()
     return RosterUnlinkOut(
         action="crew_unlinked", vessel_id=vessel.id, crew_id=crew_id
