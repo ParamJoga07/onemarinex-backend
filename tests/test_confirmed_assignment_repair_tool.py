@@ -41,6 +41,7 @@ def test_confirmed_repairs_audit_bookings_and_require_an_actor_on_commit():
     assert 'role != "superadmin"' in source
     assert "PROD-AUDIT-2026-08-12-COMMON-LUCK-140" in source
     assert "PROD-AUDIT-2026-08-12-SERENITY-EMPTY-CALLS" in source
+    assert "AGENCY-PENDING-CHANGES-2026-08-15-KR-SONS-CAB-1C57B8D1" in source
 
 
 def test_kona_repair_keeps_snapshot_labels_with_corrected_ids():
@@ -95,7 +96,7 @@ def test_confirmed_repair_tool_guards_the_audited_record_set():
     assert "PROD-AUDIT-2026-08-12-KONA" in source
 
 
-def test_confirmed_repair_tool_does_not_guess_ambiguous_records():
+def test_confirmed_repair_tool_keeps_unresolved_records_out_of_scope():
     source = SCRIPT.read_text()
 
     # These records need external evidence and must never be automatic targets.
@@ -107,4 +108,7 @@ def test_confirmed_repair_tool_does_not_guess_ambiguous_records():
     assert "SOS 35" not in source
     assert "SOS 37" not in source
     assert "booking 323" not in source
-    assert "booking 324" not in source
+    assert "KR_SONS_BOOKING_ROW_ID = 324" in source
+    assert '"crew_assignment_id": 56' in source
+    assert '"crew_assignment_id": target_assignment["id"]' in source
+    assert '"context_resolution": "manual_agency_confirmation"' in source
