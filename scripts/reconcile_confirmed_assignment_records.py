@@ -26,8 +26,14 @@ Remove the six empty duplicate Serenity calls after the lifecycle fix::
     PYTHONPATH=. python scripts/reconcile_confirmed_assignment_records.py \
         --scope serenity-empty-calls --actor-user-id <SUPERADMIN_USER_ID> --apply
 
+Repoint the agency-confirmed KR & Sons booking to Serenity call 131::
+
+    PYTHONPATH=. python scripts/reconcile_confirmed_assignment_records.py \
+        --scope kr-sons-serenity-booking \
+        --actor-user-id <SUPERADMIN_USER_ID> --apply
+
 Run and verify each scope separately in the documented order. Dry runs issue no
-UPDATE, INSERT, or DELETE statements. No Jim Ming, ambiguous booking,
+UPDATE, INSERT, or DELETE statements. No Jim Ming, still-ambiguous booking,
 duplicate-identity, or ambiguous SOS record is changed by this tool.
 """
 
@@ -64,6 +70,10 @@ SNAPSHOT_FIELDS = {
 INVALID_COMMON_LUCK_CALL_ID = 140
 SERENITY_KEEP_CALL_ID = 131
 SERENITY_EMPTY_CALL_IDS = (132, 135, 136, 137, 138, 139)
+KR_SONS_BOOKING_ROW_ID = 324
+KR_SONS_EVIDENCE_REFERENCE = (
+    "AGENCY-PENDING-CHANGES-2026-08-15-KR-SONS-CAB-1C57B8D1"
+)
 
 EXPECTED_BOOKINGS = {
     325: {"booking_id": "CAB-5C562625", "vessel_id": 71, "vessel_call_id": 140,
@@ -82,6 +92,19 @@ EXPECTED_INCIDENTS = {
          "agency_id": None, "crew_assignment_id": None, "crew_profile_id": 8},
     85: {"trip_id": "CAB-5A007A12", "vessel_id": 71, "vessel_call_id": 140,
          "agency_id": None, "crew_assignment_id": None, "crew_profile_id": 8},
+}
+EXPECTED_KR_SONS_BOOKING = {
+    "id": KR_SONS_BOOKING_ROW_ID,
+    "booking_id": "CAB-1C57B8D1",
+    "crew_id": 2,
+    "status": "completed",
+    "vessel_id": 71,
+    "vessel_call_id": 61,
+    "agency_id": 5,
+    "crew_assignment_id": 56,
+    "port_id": None,
+    "port": "port_visakhapatnam",
+    "context_resolution": "vessel_id",
 }
 
 
@@ -316,6 +339,122 @@ def plan_kona(db, *, apply: bool, actor_user_id: int | None = None) -> None:
     })
 
 
+def plan_kr_sons_serenity_booking(
+    db, *, apply: bool, actor_user_id: int | None = None,
+) -> None:
+    booking = _row_dict(db.execute(text("""
+        SELECT * FROM cab_bookings WHERE id = 324 FOR UPDATE
+    """)).one())
+    _assert_exact(booking, EXPECTED_KR_SONS_BOOKING, "booking 324")
+
+    call = _row_dict(db.execute(text("""
+        SELECT id, vessel_id, agency_id, port_id, vessel_name, port_name,
+               ended_at, status
+        FROM vessel_calls WHERE id = 131 FOR UPDATE
+    """)).one())
+    _assert_exact(call, {
+        "id": 131,
+        "vessel_id": 120,
+        "agency_id": 6,
+        "port_id": 37,
+        "vessel_name": "MV SERENITY",
+        "status": "DEPARTED",
+    }, "Serenity call 131")
+    if not call["port_name"] or call["ended_at"] is None:
+        raise RuntimeError("Serenity call 131 has incomplete historical context")
+
+    source_assignment = _row_dict(db.execute(text("""
+        SELECT id, vessel_call_id, crew_profile_id
+        FROM crew_assignments WHERE id = 56 FOR UPDATE
+    """)).one())
+    _assert_exact(source_assignment, {
+        "id": 56,
+        "vessel_call_id": 61,
+        "crew_profile_id": 2,
+    }, "current booking assignment 56")
+
+    target_assignment = _row_dict(db.execute(text("""
+        SELECT ca.id, ca.vessel_call_id, ca.crew_profile_id, ca.vessel_crew_id,
+               ca.hpid,
+               ca.started_at <= booking.created_at AS started_when_booked,
+               (ca.ended_at IS NULL OR booking.created_at <= ca.ended_at)
+                   AS not_ended_when_booked
+        FROM crew_assignments AS ca
+        JOIN cab_bookings AS booking ON booking.id = 324
+        WHERE ca.id = 76
+        FOR UPDATE OF ca
+    """)).one())
+    _assert_exact(target_assignment, {
+        "id": 76,
+        "vessel_call_id": 131,
+        "crew_profile_id": 2,
+        "vessel_crew_id": 88,
+        "hpid": "HP-768947389275-AF-VIS",
+        "started_when_booked": True,
+        "not_ended_when_booked": True,
+    }, "Serenity assignment 76")
+
+    dependent_sos = db.execute(text("""
+        SELECT id FROM crew_sos_requests
+        WHERE cab_booking_id = 324 OR trip_id = 'CAB-1C57B8D1'
+        ORDER BY id
+    """)).scalars().all()
+    dependent_incidents = db.execute(text("""
+        SELECT id FROM incidents
+        WHERE trip_id = 'CAB-1C57B8D1'
+        ORDER BY id
+    """)).scalars().all()
+    if dependent_sos or dependent_incidents:
+        raise RuntimeError(
+            "Booking has dependent safety records; review them before repair: "
+            f"SOS={dependent_sos}, incidents={dependent_incidents}"
+        )
+
+    target = {
+        "vessel_id": call["vessel_id"],
+        "vessel_call_id": call["id"],
+        "agency_id": call["agency_id"],
+        "crew_assignment_id": target_assignment["id"],
+        "port_id": call["port_id"],
+        "port_name": call["port_name"],
+        "context_resolution": "manual_agency_confirmation",
+    }
+    previous = _record_context(booking, "booking")
+    resolved = _resolved_context(target, "booking")
+
+    print("KR & SONS SERENITY BOOKING REPAIR")
+    print("  booking: 324 (CAB-1C57B8D1)")
+    print("  dependent SOS: none")
+    print("  dependent incidents: none")
+    _print_change("booking 324", previous, resolved)
+    if not apply:
+        return
+
+    db.execute(text("""
+        UPDATE cab_bookings
+        SET vessel_id=:vessel_id, vessel_call_id=:vessel_call_id,
+            agency_id=:agency_id, crew_assignment_id=:crew_assignment_id,
+            port_id=:port_id, port=:port_name,
+            context_resolution=:context_resolution
+        WHERE id = 324
+    """), target)
+    _audit_record(
+        db,
+        kind="booking",
+        record_id=KR_SONS_BOOKING_ROW_ID,
+        previous=previous,
+        resolved=resolved,
+        actor_user_id=actor_user_id,
+        evidence_type="agency_confirmation",
+        evidence_reference=KR_SONS_EVIDENCE_REFERENCE,
+        notes=(
+            "KR & Sons confirmed that CAB-1C57B8D1 is the second Serenity "
+            "ride. Production inspection identified Serenity call 131 and "
+            "the matching historical crew assignment 76."
+        ),
+    )
+
+
 def _foreign_key_references(db, *, table: str, row_ids: Iterable[int]) -> list[dict[str, Any]]:
     inspector = inspect(db.get_bind())
     row_ids = list(row_ids)
@@ -500,7 +639,10 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--scope", required=True,
-        choices=("kona", "common-luck-140", "serenity-empty-calls"),
+        choices=(
+            "kona", "common-luck-140", "serenity-empty-calls",
+            "kr-sons-serenity-booking",
+        ),
         help="Exactly one repair scope; run and verify scopes in documented order.",
     )
     parser.add_argument("--apply", action="store_true", help="Commit selected repairs")
@@ -533,8 +675,12 @@ def main() -> int:
             plan_common_luck_140(
                 db, apply=args.apply, actor_user_id=args.actor_user_id,
             )
-        else:
+        elif args.scope == "serenity-empty-calls":
             plan_serenity_duplicates(
+                db, apply=args.apply, actor_user_id=args.actor_user_id,
+            )
+        else:
+            plan_kr_sons_serenity_booking(
                 db, apply=args.apply, actor_user_id=args.actor_user_id,
             )
         if args.apply:
