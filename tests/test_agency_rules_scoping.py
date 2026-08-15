@@ -167,7 +167,35 @@ class AgencyRulesScopingTests(unittest.TestCase):
         """
         self._save_rules(self.agent_a, "Agency A muster")
 
-        self.assertEqual(self._titles_for(self.agent_a), ["Agency A muster"])
+        payload = get_port_rules(port_name=PORT, db=self.db, viewer=self.agent_a)
+
+        self.assertEqual(
+            [rule["title"] for rule in payload["rules"]],
+            ["Agency A muster"],
+        )
+        self.assertEqual(
+            [rule["title"] for rule in payload["port_rules"]],
+            ["Port gate"],
+        )
+
+    def test_contact_only_save_still_returns_the_agencys_rules(self):
+        self._save_rules(self.agent_a, "Agency A muster")
+
+        payload = update_port_rules(
+            port_name=PORT,
+            body=PortRulesIn(helpline_number="+91 90000 11111"),
+            db=self.db,
+            current_user=self.agent_a,
+        )
+
+        self.assertEqual(
+            [rule["title"] for rule in payload["rules"]],
+            ["Agency A muster"],
+        )
+        self.assertEqual(
+            [rule["title"] for rule in payload["port_rules"]],
+            ["Port gate"],
+        )
 
     def test_an_agent_who_has_saved_nothing_sees_an_empty_editor(self):
         self.assertEqual(self._titles_for(self.agent_b), [])

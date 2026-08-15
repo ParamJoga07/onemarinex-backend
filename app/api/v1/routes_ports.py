@@ -62,6 +62,7 @@ class PortRulesIn(BaseModel):
 class PortRulesOut(BaseModel):
     port_name: str
     rules: List[RuleItem]
+    port_rules: List[RuleItem] = Field(default_factory=list)
     opening_time: Optional[str] = None
     closing_time: Optional[str] = None
     working_days: Optional[List[str]] = None
@@ -244,6 +245,7 @@ def get_port_rules(
                 [],
                 crew_assignment_id=crew_assignment_id,
             ),
+            "port_rules": [],
             "opening_time": None,
             "closing_time": None,
             "working_days": None,
@@ -268,14 +270,19 @@ def get_port_rules(
             working_days = [d.strip() for d in working_days.split(",") if d.strip()]
 
     clock = port_clock_snapshot(rules.port_name, rules.timezone)
+    port_rule_items = safe_parse_json(rules.rules, [])
     return {
         "port_name": rules.port_name,
         "rules": _visible_rules(
             db,
             viewer,
-            safe_parse_json(rules.rules, []),
+            port_rule_items,
             crew_assignment_id=crew_assignment_id,
         ),
+        # Keep the port-wide rules separate so an agent can display them
+        # without loading them into the agency-owned editor and saving them
+        # back as agency rules.
+        "port_rules": port_rule_items,
         "opening_time": rules.opening_time,
         "closing_time": rules.closing_time,
         "working_days": working_days,
@@ -451,13 +458,22 @@ def update_port_rules(
             working_days = [d.strip() for d in working_days.split(",") if d.strip()]
 
     clock = port_clock_snapshot(port_rules.port_name, port_rules.timezone)
+    port_rule_items = safe_parse_json(port_rules.rules, [])
+    response_rules = port_rule_items
+    if is_agent:
+        profile = getattr(current_user, "agent_profile", None)
+        response_rules = (
+            agent_rules
+            if agent_rules is not None
+            else safe_parse_json(getattr(profile, "agency_rules", None), [])
+        )
     return {
         "port_name": port_rules.port_name,
         # An agent gets back the rules they just saved, not the port's. Echoing
         # the port row would make their own rules appear to vanish on save, the
         # way the contact number did.
-        "rules": (agent_rules if agent_rules is not None
-                  else safe_parse_json(port_rules.rules, [])),
+        "rules": response_rules,
+        "port_rules": port_rule_items,
         "opening_time": port_rules.opening_time,
         "closing_time": port_rules.closing_time,
         "working_days": working_days,
