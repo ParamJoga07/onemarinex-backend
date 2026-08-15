@@ -322,16 +322,14 @@ def get_dashboard_data(
             clauses.append(and_(legacy[0], or_(*legacy[1:])))
         return or_(*clauses) if clauses else None
 
-    # Crew ashore: they have actually left the ship and not signed back in.
-    # Counting every pass with no in_time also counted passes that were issued
-    # and never used, so the tile grew with each port call and never fell.
-    crew_in_shore = 0
-    if crew_profile_ids:
-        crew_in_shore = db.query(ShorePass).filter(
-            ShorePass.crew_profile_id.in_(crew_profile_ids),
-            ShorePass.out_time.isnot(None),
-            ShorePass.in_time.is_(None),
-        ).count()
+    # Crew ashore: they have actually left the ship and not come back.
+    #
+    # Shared with the shore leave report, which recognises a started cab trip as
+    # evidence too. Counting open shore passes alone read zero while a trip was
+    # underway with crew off the ship, and counted pass rows rather than people.
+    from app.services.crew_ashore import crew_ashore_count
+
+    crew_in_shore = crew_ashore_count(db, crew_profile_ids)
 
     # Trips (Cab Bookings) — this agent's crew only.
     # "Today" is the port's day, not UTC's: UTC midnight is 05:30 IST, so this
@@ -448,14 +446,8 @@ def get_dashboard_data(
                 CabBooking.status.in_(LIVE_TRIP_STATUSES),
             ).count()
 
-        # 2. Crew Ashore
-        crew_ashore = 0
-        if vessel_crew_ids:
-            crew_ashore = db.query(ShorePass).filter(
-                ShorePass.crew_profile_id.in_(vessel_crew_ids),
-                ShorePass.out_time.isnot(None),
-                ShorePass.in_time.is_(None),
-            ).count()
+        # 2. Crew Ashore — same calculation as the headline tile above.
+        crew_ashore = crew_ashore_count(db, vessel_crew_ids)
 
         # 3. SOS/Incidents of ship — the card says "SOS/Incidents", so count both.
         incidents = 0
