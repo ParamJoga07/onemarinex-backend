@@ -196,6 +196,64 @@ class VendorCommissionRankingTests(unittest.TestCase):
             )
             self.assertEqual(read_updated[0].other_information["working_days"], expected)
 
+    def test_inactive_legacy_weekday_ranges_are_canonicalized_without_activation(self):
+        admin = SimpleNamespace(role="superadmin")
+        vendor = self.add_vendor("Legacy Inactive", "0", 4.0)
+        vendor.status = "Inactive"
+        vendor.other_information = {
+            "open_time": "09:00",
+            "close_time": "18:00",
+            "working_days": "Monday - Sunday",
+        }
+        self.db.commit()
+
+        updated = update_place(
+            vendor_id=vendor.id,
+            payload=VendorUpdate(
+                status="Inactive",
+                other_information=vendor.other_information,
+            ),
+            db=self.db,
+            current_user=admin,
+        )
+
+        self.assertEqual(updated.status, "Inactive")
+        self.assertEqual(
+            updated.other_information["working_days"],
+            ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"],
+        )
+
+    def test_split_and_wrapping_legacy_weekday_ranges_are_supported(self):
+        admin = SimpleNamespace(role="superadmin")
+        cases = (
+            ("Monday - Tuesday, Thursday - Sunday", ["Mon", "Tue", "Thu", "Fri", "Sat", "Sun"]),
+            ("Saturday to Monday", ["Mon", "Sat", "Sun"]),
+        )
+
+        for index, (legacy, expected) in enumerate(cases):
+            created = create_place(
+                payload=VendorCreate(
+                    name=f"Legacy Range {index}",
+                    category="pub",
+                    location_name="Port Road",
+                    distance_from_port=1,
+                    rating=0,
+                    lat=17.7,
+                    lng=83.3,
+                    port_id=self.port_id,
+                    phone="9999999999",
+                    email=f"legacy-range-{index}@example.com",
+                    other_information={
+                        "open_time": "09:00",
+                        "close_time": "18:00",
+                        "working_days": legacy,
+                    },
+                ),
+                db=self.db,
+                current_user=admin,
+            )
+            self.assertEqual(created.other_information["working_days"], expected)
+
 
 if __name__ == "__main__":
     unittest.main()

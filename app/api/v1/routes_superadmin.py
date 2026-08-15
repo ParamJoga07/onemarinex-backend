@@ -1549,8 +1549,9 @@ class SuperAdminVesselCreate(BaseModel):
     flag: Optional[str] = None
     agency_name: Optional[str] = None
     agent_id: Optional[int] = None
-    crew_count: Optional[int] = 0
-    total_crew: Optional[int] = 0
+    # Accepted for backwards compatibility; vessel rosters own this value.
+    crew_count: Optional[int] = None
+    total_crew: Optional[int] = None
     eta: Optional[datetime] = None
     etd: Optional[datetime] = None
     status: Literal["Active"] = "Active"
@@ -1579,10 +1580,6 @@ def create_vessel_superadmin(
     current_user: User = Depends(get_current_user)
 ):
     verify_superadmin(current_user)
-    c_count = body.crew_count if body.crew_count is not None else 0
-    if body.total_crew is not None:
-        c_count = body.total_crew
-
     assigned_agent_id = body.agent_id or current_user.id
     if body.agency_name and is_partnered_agency(body.agency_name):
         # Find agent with matching agency_name if possible
@@ -1599,7 +1596,7 @@ def create_vessel_superadmin(
         berth_assignment=body.berth_assignment,
         flag=body.flag,
         agency_name=body.agency_name or "Other",
-        crew_count=c_count,
+        crew_count=0,
         eta=body.eta,
         etd=body.etd,
         status="Active"
@@ -1736,10 +1733,6 @@ def create_vessel_under_agent(
     if not agent:
         raise HTTPException(status_code=404, detail="Agent user not found")
 
-    c_count = body.crew_count if body.crew_count is not None else 0
-    if body.total_crew is not None:
-        c_count = body.total_crew
-
     vessel = Vessel(
         agent_id=agent.id,
         name=body.name,
@@ -1748,7 +1741,7 @@ def create_vessel_under_agent(
         berth_assignment=body.berth_assignment,
         flag=body.flag,
         agency_name=agent.agent_profile.agency_name if agent.agent_profile else "Other",
-        crew_count=c_count,
+        crew_count=0,
         eta=body.eta,
         etd=body.etd,
         status="Active"

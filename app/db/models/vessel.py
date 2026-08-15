@@ -38,6 +38,10 @@ class Vessel(Base):
 
     @property
     def total_crew(self) -> int:
+        # The current roster is authoritative. crew_count remains only as a
+        # transition fallback for older vessels that have never stored a roster.
+        if self.crew_manifest:
+            return len(self.crew_manifest)
         return self.crew_count or 0
 
     @property
