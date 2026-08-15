@@ -308,6 +308,48 @@ def _existing_manifest_for_add(
     return passport_match or hpid_match
 
 
+def _sync_assignment_eligibility(db: Session, vessel: Vessel, crew: VesselCrew) -> bool:
+    """Carry a manifest eligibility change onto the active crew assignment.
+
+    Eligibility is stored twice: on the manifest row the vessel screen edits,
+    and on the crew assignment that operational reports and the booking check
+    read. Manifest upload and manual crew creation already write both. The
+    eligibility toggle and the general crew edit wrote only the manifest, so an
+    agent could mark eight crew eligible, see eight on the vessel page, and have
+    the report still see whoever the last upload had flagged.
+
+    Returns whether an assignment was found and updated. A vessel between calls
+    has none, and that is not an error — the next call's assignment is built
+    from the manifest, which now holds the corrected value.
+    """
+    from app.services.historical_context import active_vessel_call
+
+    call = active_vessel_call(db, vessel)
+    if call is None:
+        return False
+
+    clauses = [CrewAssignment.vessel_crew_id == crew.id]
+    if crew.hp_id and crew.hp_id.strip():
+        # Older assignments predate vessel_crew_id being carried across.
+        clauses.append(
+            func.upper(func.trim(CrewAssignment.hpid)) == crew.hp_id.strip().upper()
+        )
+
+    assignment = (
+        db.query(CrewAssignment)
+        .filter(
+            CrewAssignment.vessel_call_id == call.id,
+            CrewAssignment.ended_at.is_(None),
+            or_(*clauses),
+        )
+        .first()
+    )
+    if assignment is None:
+        return False
+    assignment.shore_pass_eligible = bool(crew.shore_pass_eligible)
+    return True
+
+
 def _assignment_for_added_crew(
     db: Session,
     vessel: Vessel,
@@ -1163,6 +1205,7 @@ def update_crew_eligibility(
         raise HTTPException(status_code=404, detail="Crew member not found on this vessel")
     
     crew.shore_pass_eligible = body.shore_pass_eligible
+    _sync_assignment_eligibility(db, vessel, crew)
     db.commit()
     db.refresh(crew)
     return crew
@@ -1281,7 +1324,10 @@ def update_crew_member(
         crew.shore_pass_eligible = body.shore_pass_eligible
     if body.shore_pass_valid_upto is not None:
         crew.shore_pass_valid_upto = body.shore_pass_valid_upto
-        
+
+    if body.shore_pass_eligible is not None:
+        _sync_assignment_eligibility(db, vessel, crew)
+
     db.commit()
     db.refresh(crew)
     return crew
