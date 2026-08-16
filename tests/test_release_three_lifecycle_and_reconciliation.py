@@ -86,11 +86,15 @@ def test_release_three_stays_on_the_single_linear_graph():
     assert script.get_revision("o6p7q8r9s0t1").down_revision == "n5o6p7q8r9s0"
 
 
-def test_status_uses_server_time_and_24_hour_departing_window():
+def test_status_uses_server_time_and_five_hour_departing_window():
     now = datetime(2026, 8, 12, 12, tzinfo=timezone.utc)
-    vessel = Vessel(status="Active", etd=now + timedelta(hours=25))
+    vessel = Vessel(status="Active", etd=now + timedelta(hours=6))
     assert effective_vessel_status(vessel, now=now) == "Active"
+    # A whole day out is now well clear of departure, where it used to already
+    # read as Departing.
     vessel.etd = now + timedelta(hours=24)
+    assert effective_vessel_status(vessel, now=now) == "Active"
+    vessel.etd = now + timedelta(hours=5)
     assert effective_vessel_status(vessel, now=now) == "Departing"
     vessel.etd = now
     assert effective_vessel_status(vessel, now=now) == "Departed"
