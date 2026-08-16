@@ -822,6 +822,87 @@ class VesselPublicOut(BaseModel):
 
 # --- Routes ---
 
+def _vessel_by_imo(db: Session, imo_number):
+    """The canonical vessel for an IMO, compared without spacing or case.
+
+    Agents type the IMO by hand and it arrives as "9617741", "IMO 9617741" or
+    " 9617741 ". Comparing raw strings would miss the match and let the unique
+    constraint reject the insert instead.
+    """
+    compact = "".join((imo_number or "").upper().split())
+    if not compact:
+        return None
+
+    # Match the value as typed, and the same value with an "IMO" prefix added
+    # or removed — but only when what remains is the number itself. Stripping
+    # the three letters unconditionally would corrupt any identifier that
+    # merely begins with them rather than being prefixed by them.
+    candidates = {compact}
+    if compact.startswith("IMO"):
+        rest = compact[3:].lstrip("-:.")
+        if rest.isdigit():
+            candidates.add(rest)
+    elif compact.isdigit():
+        candidates.add(f"IMO{compact}")
+
+    return (
+        db.query(Vessel)
+        .filter(
+            func.replace(func.upper(func.trim(Vessel.imo_number)), " ", "").in_(
+                sorted(candidates)
+            )
+        )
+        .first()
+    )
+
+
+def _start_return_call(db: Session, vessel: Vessel, body, *, agent_id, agency_name):
+    """Open a fresh port call for a vessel that has sailed and come back.
+
+    The vessel master keeps its identity — same row, same id, same history. The
+    voyage details belong to the new call and are refreshed from the request.
+
+    Overlapping open calls are refused. Two live calls for one hull would split
+    its crew, trips and reports across both with nothing to say which is
+    current, so an agent who submits twice is told what is already open rather
+    than quietly given a duplicate.
+    """
+    from app.services.historical_context import active_vessel_call
+    from app.services.vessel_lifecycle import synchronize_vessel_lifecycle
+
+    open_call = active_vessel_call(db, vessel, create=False)
+    if open_call is not None:
+        started = open_call.started_at.strftime("%d %b %Y") if open_call.started_at else "an earlier date"
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"{vessel.name} (IMO {vessel.imo_number}) already has an open "
+                f"port call at {open_call.port_name or 'this port'} since "
+                f"{started}. Close that call before starting another."
+            ),
+        )
+
+    vessel.name = body.name or vessel.name
+    vessel.vessel_type = body.vessel_type or vessel.vessel_type
+    vessel.berth_assignment = body.berth_assignment
+    vessel.flag = body.flag or vessel.flag
+    if agency_name:
+        vessel.agency_name = agency_name
+    vessel.eta = body.eta
+    vessel.etd = body.etd
+    # Reopening is what makes a call creatable again: active_vessel_call
+    # refuses to manufacture one for a departed or unassigned vessel.
+    vessel.agent_id = agent_id
+    vessel.status = "Active"
+    db.flush()
+
+    active_vessel_call(db, vessel)
+    synchronize_vessel_lifecycle(db, [vessel])
+    db.commit()
+    db.refresh(vessel)
+    return vessel
+
+
 @router.post("/", response_model=VesselOut, status_code=status.HTTP_201_CREATED)
 def create_vessel(body: VesselIn, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     if current_user.role not in ["agent", "superadmin"]:
@@ -831,6 +912,18 @@ def create_vessel(body: VesselIn, current_user: User = Depends(get_current_user)
     if not resolved_agency and current_user.role == "agent":
         if hasattr(current_user, "agent_profile") and current_user.agent_profile:
             resolved_agency = current_user.agent_profile.agency_name
+
+    # A ship that comes back is the same ship. IMO identifies one canonical
+    # vessel for its lifetime, so a return visit reuses that record and opens a
+    # new port call against it — it does not create a second vessel, which the
+    # unique IMO constraint would refuse anyway with a message that told the
+    # agent nothing about why.
+    returning = _vessel_by_imo(db, body.imo_number)
+    if returning is not None:
+        return _start_return_call(
+            db, returning, body,
+            agent_id=current_user.id, agency_name=resolved_agency,
+        )
 
     vessel = Vessel(
         agent_id=current_user.id,

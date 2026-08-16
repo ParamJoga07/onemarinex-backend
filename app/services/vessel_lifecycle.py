@@ -8,6 +8,7 @@ from typing import Iterable, Optional
 from sqlalchemy.orm import Session
 
 from app.db.models.vessel import Vessel
+from app.db.models.vessel_call import VesselCall
 
 
 DEPARTING_WINDOW = timedelta(hours=24)
@@ -75,8 +76,24 @@ def synchronize_vessel_lifecycle(
                 )
         elif status in {"Active", "Departing"} and vessel.agent_id is not None:
             if call is None:
-                call = active_vessel_call(db, vessel)
-                changed += 1
+                # Only ever open the *first* call for a vessel that has none —
+                # backfilling records that predate vessel calls.
+                #
+                # A vessel with ended calls has sailed. Its status is derived
+                # from ETD, so pushing that date forward flips it back to
+                # Active and this would silently open a fresh port call: an
+                # agent correcting an ETD would start a new voyage without
+                # asking for one. Returning to port is a deliberate act, and
+                # goes through the returning-vessel path in create_vessel.
+                has_history = (
+                    db.query(VesselCall.id)
+                    .filter(VesselCall.vessel_id == vessel.id)
+                    .first()
+                    is not None
+                )
+                if not has_history:
+                    call = active_vessel_call(db, vessel)
+                    changed += 1
             if call is not None:
                 if call.status != status.upper():
                     changed += 1
