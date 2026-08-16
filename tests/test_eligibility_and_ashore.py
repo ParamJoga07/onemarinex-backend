@@ -194,8 +194,11 @@ class EligibilitySyncTests(_Base):
 
 
 class CrewAshoreTests(_Base):
-    def _trip(self, crew, *, status, started=True, passengers=None):
+    def _trip(self, crew, *, status, started=True, passengers=None, seats=None):
         now = datetime.now(timezone.utc)
+        # seats left as None keeps the model default of 1: one booker, nobody
+        # unaccounted for.
+        extra = {} if seats is None else {"num_passengers": seats}
         booking = CabBooking(
             booking_id=_uniq("CAB"), crew_id=crew.profile.id,
             pickup_address="Gate", pickup_lat=0, pickup_lng=0,
@@ -204,6 +207,7 @@ class CrewAshoreTests(_Base):
             estimated_price=100, distance_km=5, status=status,
             crew_member_ids=passengers,
             trip_started_at=(now - timedelta(hours=1)) if started else None,
+            **extra,
         )
         self.db.add(booking)
         self.db.flush()
@@ -278,6 +282,58 @@ class CrewAshoreTests(_Base):
             self.db, [booker.profile.id, rider.profile.id], extra_people=people)
 
         self.assertEqual(count, 2)
+
+    def test_a_cab_puts_every_seat_ashore_not_just_the_booker(self):
+        """The tile has to agree with the report, which counts seats.
+
+        Most of a ship's company has no account and a group booking names only
+        the person who made it, so counting identities alone showed one crew
+        ashore beside a report reading eight for the same vessel and day. An
+        agent had no way to tell which of the two was lying.
+        """
+        member = self.crew()
+        self._trip(member, status=BookingStatus.ON_TRIP, seats=4)
+
+        self.assertEqual(self._count([member]), 4)
+
+    def test_named_riders_are_not_counted_twice_as_seats(self):
+        """Four seats, all four named: four people, not eight."""
+        booker = self.crew()
+        riders = [self.crew() for _ in range(3)]
+        self._trip(booker, status=BookingStatus.ON_TRIP, seats=4,
+                   passengers=[r.assignment.hpid for r in riders])
+
+        from app.services.crew_ashore import crew_ashore_count
+
+        by_hpid = {r.assignment.hpid: r.profile.id for r in riders}
+
+        def people(trip):
+            found = {trip.crew_id} if trip.crew_id else set()
+            for hpid in (trip.crew_member_ids or []):
+                if hpid in by_hpid:
+                    found.add(by_hpid[hpid])
+            return found
+
+        count = crew_ashore_count(
+            self.db,
+            [booker.profile.id] + [r.profile.id for r in riders],
+            extra_people=people,
+        )
+
+        self.assertEqual(count, 4)
+
+    def test_seats_on_a_trip_that_never_started_put_nobody_ashore(self):
+        member = self.crew()
+        self._trip(member, status=BookingStatus.DRIVER_ASSIGNED,
+                   started=False, seats=4)
+
+        self.assertEqual(self._count([member]), 0)
+
+    def test_seats_come_back_when_the_trip_completes(self):
+        member = self.crew()
+        self._trip(member, status=BookingStatus.COMPLETED, seats=4)
+
+        self.assertEqual(self._count([member]), 0)
 
 
 if __name__ == "__main__":
