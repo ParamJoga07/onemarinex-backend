@@ -47,6 +47,46 @@ def effective_vessel_status(
     return "Active"
 
 
+def _reopen_call_closed_by_the_clock(
+    db: Session,
+    vessel: Vessel,
+    now: datetime,
+):
+    """The vessel's last call, if this function closed it at the old ETD.
+
+    `finish_vessel_call` stamps `ended_at` with the vessel's ETD, so a call
+    whose end is exactly its own recorded ETD was closed by time passing rather
+    than by anyone declaring the ship gone. When that ETD is later extended,
+    the departure it recorded never happened and the call is reopened.
+
+    Anything else is left alone: a call ended at some other moment was closed
+    deliberately, and ARCHIVED or REASSIGNED calls are terminal regardless.
+    """
+    last = (
+        db.query(VesselCall)
+        .filter(VesselCall.vessel_id == vessel.id)
+        .order_by(VesselCall.id.desc())
+        .first()
+    )
+    if last is None or last.ended_at is None:
+        return None
+    if str(last.status or "").upper() != "DEPARTED":
+        return None
+
+    ended_at = _aware_utc(last.ended_at)
+    call_etd = _aware_utc(last.etd)
+    if ended_at is None or call_etd is None or ended_at != call_etd:
+        return None
+    # Only while the new ETD genuinely puts the ship back in port.
+    if _aware_utc(vessel.etd) is None or _aware_utc(vessel.etd) <= now:
+        return None
+
+    last.ended_at = None
+    last.etd = vessel.etd
+    last.status = "ACTIVE"
+    return last
+
+
 def synchronize_vessel_lifecycle(
     db: Session,
     vessels: Iterable[Vessel],
@@ -76,24 +116,39 @@ def synchronize_vessel_lifecycle(
                 )
         elif status in {"Active", "Departing"} and vessel.agent_id is not None:
             if call is None:
-                # Only ever open the *first* call for a vessel that has none —
-                # backfilling records that predate vessel calls.
+                # The ship is in port with no open call. Two different causes,
+                # and only one of them may open anything.
                 #
-                # A vessel with ended calls has sailed. Its status is derived
-                # from ETD, so pushing that date forward flips it back to
-                # Active and this would silently open a fresh port call: an
-                # agent correcting an ETD would start a new voyage without
-                # asking for one. Returning to port is a deliberate act, and
-                # goes through the returning-vessel path in create_vessel.
-                has_history = (
-                    db.query(VesselCall.id)
-                    .filter(VesselCall.vessel_id == vessel.id)
-                    .first()
-                    is not None
-                )
-                if not has_history:
-                    call = active_vessel_call(db, vessel)
+                # A call this same function closed because the clock passed the
+                # ETD is reopened when that ETD moves forward. The ship never
+                # left — the departure was the estimate expiring, and extending
+                # it says so. Leaving it closed stranded the vessel as Active
+                # with no call at all, which is a state nothing else can use:
+                # crew, trips and reports all hang off the call.
+                #
+                # Otherwise only ever open the *first* call for a vessel that
+                # has none, backfilling records that predate vessel calls. A
+                # vessel whose call was ended deliberately — departed by hand,
+                # archived, reassigned — has sailed, and returning to port is a
+                # deliberate act that goes through create_vessel.
+                #
+                # Either way this never creates a *second* call for a voyage
+                # that is still the same one, which is what made an edited ETD
+                # duplicate a vessel's crew roster.
+                reopened = _reopen_call_closed_by_the_clock(db, vessel, current)
+                if reopened is not None:
+                    call = reopened
                     changed += 1
+                else:
+                    has_history = (
+                        db.query(VesselCall.id)
+                        .filter(VesselCall.vessel_id == vessel.id)
+                        .first()
+                        is not None
+                    )
+                    if not has_history:
+                        call = active_vessel_call(db, vessel)
+                        changed += 1
             if call is not None:
                 if call.status != status.upper():
                     changed += 1

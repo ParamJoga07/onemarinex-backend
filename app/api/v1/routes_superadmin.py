@@ -1588,6 +1588,21 @@ def create_vessel_superadmin(
         if prof:
             assigned_agent_id = prof.user_id
 
+    # A ship that comes back is the same ship, whoever adds it. The agent path
+    # has reused the canonical vessel since the returning-vessel work; this one
+    # still built a second Vessel unconditionally, so the unique IMO index
+    # rejected the insert and the handler below reported "Vessel IMO possibly
+    # already exists" — which named no vessel, offered no next step, and left
+    # the superadmin unable to record the new call at all.
+    from app.api.v1.routes_vessels import _start_return_call, _vessel_by_imo
+
+    returning = _vessel_by_imo(db, body.imo_number)
+    if returning is not None:
+        return _start_return_call(
+            db, returning, body,
+            agent_id=assigned_agent_id, agency_name=body.agency_name,
+        )
+
     vessel = Vessel(
         agent_id=assigned_agent_id,
         name=body.name,

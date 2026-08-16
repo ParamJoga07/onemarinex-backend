@@ -75,4 +75,37 @@ def crew_ashore_count(
     *,
     extra_people=None,
 ) -> int:
-    return len(crew_ashore_ids(db, crew_profile_ids, extra_people=extra_people))
+    """How many crew are ashore, counting the seats a cab could not name.
+
+    The shore leave report counts a booking as putting `num_passengers` people
+    ashore, because most of a ship's company has no account and group bookings
+    name nobody but the booker. This tile has to agree with it: an agent seeing
+    "1 crew ashore" beside a report reading "8 went ashore" for the same vessel
+    and the same day has no way to tell which is lying.
+
+    Named crew are counted by identity, so someone with both an open pass and a
+    running trip is one person. Only the remainder of each trip's seats is added
+    on top, which is the same `max(named, num_passengers)` the report applies.
+    """
+    named = crew_ashore_ids(db, crew_profile_ids, extra_people=extra_people)
+
+    ids = [i for i in crew_profile_ids if i]
+    if not ids:
+        return len(named)
+
+    unnamed_seats = 0
+    running = db.query(CabBooking).filter(
+        CabBooking.crew_id.in_(ids),
+        CabBooking.status.notin_(list(_ENDED_TRIP_STATUSES)),
+    ).all()
+    for trip in running:
+        if not (trip.trip_started_at or trip.started_at):
+            continue
+        on_this_trip = (
+            len({person for person in extra_people(trip) if person})
+            if extra_people is not None
+            else (1 if trip.crew_id else 0)
+        )
+        unnamed_seats += max(0, (trip.num_passengers or 0) - on_this_trip)
+
+    return len(named) + unnamed_seats
