@@ -11,7 +11,7 @@ from app.db.models.vessel import Vessel
 from app.db.models.vessel_call import VesselCall
 
 
-DEPARTING_WINDOW = timedelta(hours=24)
+DEPARTING_WINDOW = timedelta(hours=5)
 
 
 def _aware_utc(value: Optional[datetime]) -> Optional[datetime]:

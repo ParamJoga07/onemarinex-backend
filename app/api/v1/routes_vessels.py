@@ -816,6 +816,11 @@ class VesselPublicOut(BaseModel):
     name: str
     agency_name: Optional[str] = "Other"
     has_partnered_agency: bool = False
+    # The port the vessel is currently calling at. Crew pick a vessel by name,
+    # and two ships in different ports can share one, so the caller needs this
+    # to tell them apart.
+    port_code: Optional[str] = None
+    port_name: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -1008,25 +1013,56 @@ def get_public_vessels(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    from app.db.models.port import Port
+    from app.db.models.vessel_call import VesselCall
     from app.services.vessel_lifecycle import effective_vessel_status
+
+    # Where each vessel is. A vessel row carries no port of its own — the port
+    # belongs to the call — so `port_code` could not filter anything and was
+    # silently ignored, offering crew every active ship in every port.
+    #
+    # port_id is the reliable side; port_name is the legacy free string written
+    # before the foreign key existed, and matches ports.code for current rows.
+    open_calls = (
+        db.query(VesselCall.vessel_id, Port.code, Port.name, VesselCall.port_name)
+        .outerjoin(Port, Port.id == VesselCall.port_id)
+        .filter(VesselCall.ended_at.is_(None))
+        .order_by(VesselCall.id.asc())
+        .all()
+    )
+    port_of = {}
+    for vessel_id, code, name, legacy_name in open_calls:
+        # Ascending, so the newest open call is written last and wins. A vessel
+        # should only ever have one, but a legacy duplicate must not decide this.
+        port_of[vessel_id] = (code or legacy_name, name or legacy_name)
+
+    wanted = (port_code or "").strip()
 
     vessels = db.query(Vessel).filter(Vessel.agent_id.isnot(None)).all()
     out = []
     for v in vessels:
         if effective_vessel_status(v) not in {"Active", "Departing"}:
             continue
+        vessel_port_code, vessel_port_name = port_of.get(v.id, (None, None))
+        # An unfiltered request still answers with everything, as before. A
+        # request naming a port drops vessels elsewhere, and also those with no
+        # open call to place them — an unplaced ship is not in the caller's port.
+        if wanted and (vessel_port_code or "").lower() != wanted.lower():
+            continue
         agency = v.agency_name
         if not agency and v.agent and hasattr(v.agent, "agent_profile") and v.agent.agent_profile:
             agency = v.agent.agent_profile.agency_name
         if not agency:
             agency = "Other"
-        
+
         has_partnered = is_partnered_agency(agency)
         out.append(VesselPublicOut(
             id=v.id,
             name=v.name,
             agency_name=agency,
-            has_partnered_agency=has_partnered
+            has_partnered_agency=has_partnered,
+            port_code=vessel_port_code,
+            port_name=vessel_port_name,
         ))
     return out
 
