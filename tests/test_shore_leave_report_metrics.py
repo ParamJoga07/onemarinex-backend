@@ -126,20 +126,25 @@ class ShoreLeaveAverageTests(unittest.TestCase):
         ))
         self.db.flush()
 
-    def trip_for(self, crew, started, completed, created=None, passengers=None):
+    def trip_for(self, crew, started, completed, created=None, passengers=None,
+                 seats=None, status=BookingStatus.COMPLETED):
+        # seats left as None keeps the model default of 1, which is one booker
+        # and nobody unaccounted for.
+        extra = {} if seats is None else {"num_passengers": seats}
         self.db.add(CabBooking(
             booking_id=_uniq("CAB"), crew_id=crew.id,
             pickup_address="Gate", pickup_lat=0, pickup_lng=0,
             drop_address="City", drop_lat=0, drop_lng=0,
             vehicle_type="ac", vehicle_name="Sedan",
             estimated_price=100, distance_km=5,
-            status=BookingStatus.COMPLETED,
+            status=status,
             agency_id=self.agent_profile.id,
             vessel_id=self.vessel.id,
             context_resolution="vessel_id",
             created_at=created or started,
             trip_started_at=started, trip_completed_at=completed,
             crew_member_ids=passengers,
+            **extra,
         ))
         self.db.flush()
 
@@ -484,6 +489,203 @@ class TripReportingDayTests(ShoreLeaveAverageTests):
         self.assertEqual(result.crew_went_ashore, 0)
         self.assertEqual(result.still_ashore, 0)
         self.assertIsNone(result.average_duration_minutes)
+
+
+class ResolvedSafetyRecordTests(ShoreLeaveAverageTests):
+    """`Outstanding issues` counts SOS alerts and incidents as one ledger.
+
+    The resolved figure beside it counted incidents only, so a closed SOS was
+    held against the day as raised and never shown as answered.
+    """
+
+    def sos(self, status):
+        from app.db.models.crew_sos import CrewSos
+
+        self.db.add(CrewSos(
+            agency_id=self.agent_profile.id, vessel_id=self.vessel.id,
+            status=status, created_at=_at(11),
+        ))
+        self.db.flush()
+
+    def incident(self, status):
+        from app.db.models.incident import Incident, IncidentStatus, IncidentType
+
+        self.db.add(Incident(
+            type=IncidentType.CREW, title="Test", description="Test",
+            status=status, agency_id=self.agent_profile.id,
+            vessel_id=self.vessel.id, created_at=_at(11),
+        ))
+        self.db.flush()
+        return IncidentStatus
+
+    def test_a_closed_sos_counts_as_resolved(self):
+        from app.db.models.incident import IncidentStatus
+
+        self.sos("CLOSED")
+        self.incident(IncidentStatus.RESOLVED)
+
+        result = self.report()
+
+        self.assertEqual(result.sos_raised, 1)
+        self.assertEqual(result.incidents_reported, 1)
+        self.assertEqual(result.safety_resolved, 2)
+        self.assertEqual(result.outstanding_issues, 0)
+
+    def test_an_open_sos_is_not_resolved_and_stays_outstanding(self):
+        from app.db.models.incident import IncidentStatus
+
+        self.sos("ACTIVE")
+        self.incident(IncidentStatus.RESOLVED)
+
+        result = self.report()
+
+        self.assertEqual(result.safety_resolved, 1)
+        self.assertEqual(result.outstanding_issues, 1)
+
+    def test_a_cancelled_sos_counts_as_resolved(self):
+        self.sos("CANCELLED")
+
+        result = self.report()
+
+        self.assertEqual(result.safety_resolved, 1)
+        self.assertEqual(result.outstanding_issues, 0)
+
+    def test_the_incident_only_figure_is_left_untouched(self):
+        """Snapshots frozen before this fall back to it, so it must not move."""
+        from app.db.models.incident import IncidentStatus
+
+        self.sos("CLOSED")
+        self.incident(IncidentStatus.RESOLVED)
+
+        result = self.report()
+
+        self.assertEqual(result.incidents_resolved, 1)
+
+
+class SeatsTakenTests(ShoreLeaveAverageTests):
+    """Crew a booking paid for but named nowhere still went ashore.
+
+    Most of a manifest has no HeyPorts account, and `crew_member_ids` is only
+    filled in when the booking crew typed their shipmates' IDs by hand. Counting
+    only the people the system could name reported two crew ashore against two
+    four-seat cabs, which is the KR & Sons defect: eight seats, two names.
+    """
+
+    def test_a_four_seat_cab_puts_four_ashore(self):
+        booker = self.crew()
+
+        self.trip_for(booker, started=_at(10), completed=_at(12), seats=4)
+
+        result = self.report()
+
+        self.assertEqual(result.crew_went_ashore, 4)
+
+    def test_the_unnamed_seats_come_back_when_the_trip_completes(self):
+        booker = self.crew()
+
+        self.trip_for(booker, started=_at(10), completed=_at(12), seats=4)
+
+        result = self.report()
+
+        self.assertEqual(result.returned_safely, 4)
+        self.assertEqual(result.still_ashore, 0)
+        self.assertTrue(result.all_returned)
+
+    def test_the_kr_and_sons_shape(self):
+        """Two completed four-seat cabs on a 24-crew ship: eight ashore."""
+        for _ in range(2):
+            self.trip_for(self.crew(), started=_at(10), completed=_at(13), seats=4)
+        for _ in range(22):
+            self.manifest_only_crew()
+
+        result = self.report()
+
+        self.assertEqual(result.crew_onboard, 24)
+        self.assertEqual(result.crew_went_ashore, 8)
+        self.assertEqual(result.returned_safely, 8)
+        self.assertEqual(result.completed_trips, 2)
+        self.assertEqual(result.shore_leave_utilisation_pct, 33)
+
+    def test_seats_carry_the_trips_own_time_into_the_average(self):
+        """Four people in a cab for two hours is four two-hour departures.
+
+        Not one — the average answers "how long was a crew member ashore", so
+        every seat has to bring its own time or the figure means nothing.
+        """
+        booker = self.crew()
+
+        self.trip_for(booker, started=_at(10), completed=_at(12), seats=4)
+
+        result = self.report()
+
+        self.assertEqual(result.average_duration_minutes, 120)
+
+    def test_seats_on_a_running_trip_are_still_ashore(self):
+        booker = self.crew()
+
+        self.trip_for(
+            booker, started=_at(10), completed=None, seats=3,
+            status=BookingStatus.ON_TRIP,
+        )
+
+        result = self.report()
+
+        self.assertEqual(result.crew_went_ashore, 3)
+        self.assertEqual(result.still_ashore, 3)
+        self.assertFalse(result.all_returned)
+
+    def test_a_cancelled_booking_takes_nobody_ashore_however_many_seats(self):
+        booker = self.crew()
+
+        self.trip_for(
+            booker, started=_at(10), completed=_at(12), seats=4,
+            status=BookingStatus.CANCELLED,
+        )
+
+        result = self.report()
+
+        self.assertEqual(result.crew_went_ashore, 0)
+
+    def test_naming_more_crew_than_seats_does_not_subtract_anyone(self):
+        """A booker who under-declared the seat count still took three ashore."""
+        booker = self.crew()
+        one = self.crew()
+        two = self.crew()
+
+        self.trip_for(
+            booker, started=_at(10), completed=_at(12), seats=1,
+            passengers=[one.hpid, two.hpid],
+        )
+
+        result = self.report()
+
+        self.assertEqual(result.crew_went_ashore, 3)
+
+    def test_named_passengers_are_not_double_counted_as_seats(self):
+        """Four seats, all four named: four people, not eight."""
+        booker = self.crew()
+        others = [self.crew().hpid for _ in range(3)]
+
+        self.trip_for(
+            booker, started=_at(10), completed=_at(12), seats=4,
+            passengers=others,
+        )
+
+        result = self.report()
+
+        self.assertEqual(result.crew_went_ashore, 4)
+
+    def test_utilisation_never_exceeds_the_whole_crew(self):
+        """Seats count journeys, so a crew riding twice can outnumber itself."""
+        booker = self.crew()
+
+        self.trip_for(booker, started=_at(8), completed=_at(9), seats=4)
+        self.trip_for(booker, started=_at(18), completed=_at(19), seats=4)
+
+        result = self.report()
+
+        self.assertGreater(result.crew_went_ashore, result.eligible_for_shore_leave)
+        self.assertEqual(result.shore_leave_utilisation_pct, 100)
 
 
 if __name__ == "__main__":

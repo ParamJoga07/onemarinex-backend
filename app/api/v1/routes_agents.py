@@ -978,6 +978,13 @@ class ShoreLeaveReportOut(BaseModel):
     sos_raised: int
     incidents_reported: int
     incidents_resolved: int
+    # Resolved SOS alerts and resolved incidents together. `outstanding_issues`
+    # has always counted both as open, so reporting only resolved *incidents*
+    # beside it left the two halves of the same ledger disagreeing.
+    #
+    # `incidents_resolved` is kept as it was so report snapshots frozen before
+    # this still read correctly; only the printed tile moved to the pair.
+    safety_resolved: int = 0
     outstanding_issues: int
 
     all_returned: bool
@@ -1142,6 +1149,24 @@ def shore_leave_report(
     # a driver: crew sitting aboard with a pending booking have not left the
     # ship, and counting them as ashore also left them counted as never
     # returning, since there is no trip for them to finish.
+    #
+    # A cab also carries crew nothing names. `num_passengers` is what the agent
+    # booked seats for; `crew_member_ids` is filled in only when the booking
+    # crew typed their shipmates' HeyPorts IDs, and most of the fleet has no
+    # account to have an ID with. Counting only the people the system can name
+    # reported two crew ashore against two four-seat cabs — eight seats — and
+    # that undercount is the reported defect, not a data-entry mistake by the
+    # agency.
+    #
+    # So the seats a booking cannot account for by name are counted as people
+    # anyway, one anonymous departure each, sharing the trip's own times. They
+    # flow through returns, still-ashore and crew-hours identically, which is
+    # what keeps "8 went / 8 returned" consistent with the average.
+    #
+    # This counts journeys, not distinct bodies: four crew taking one cab out
+    # and another back are eight seats and read as eight. Nothing in a booking
+    # distinguishes that from two cabs of four, so the figure is an upper bound
+    # on how many went ashore, exact only when each crew member rides once.
     departures: List[tuple] = []
     for p in passes:
         if p.out_time:
@@ -1155,8 +1180,12 @@ def shore_leave_report(
         finished = t.status == BookingStatus.COMPLETED
         if not start and not finished:
             continue
-        for person in _trip_crew(t):
+        named = _trip_crew(t)
+        for person in named:
             departures.append((person, start, end, finished))
+        unnamed_seats = max(0, (t.num_passengers or 0) - len(named))
+        for seat in range(unnamed_seats):
+            departures.append((f"seat:{t.id}:{seat}", start, end, finished))
 
     ashore_crew = {person for person, _, _, _ in departures if person is not None}
     crew_went_ashore = len(ashore_crew)
@@ -1257,6 +1286,7 @@ def shore_leave_report(
     unresolved_sos = sum(
         1 for sos in day_sos if str(sos.status or "").upper() not in {"CLOSED", "CANCELLED"}
     )
+    resolved_sos = len(day_sos) - unresolved_sos
 
     return ShoreLeaveReportOut(
         vessel_name=call.vessel_name,
@@ -1272,8 +1302,11 @@ def shore_leave_report(
         generated_at=datetime.utcnow(),
         crew_onboard=len(roster),
         eligible_for_shore_leave=eligible_count,
+        # Seats are counted per journey, so a crew that rides more than once can
+        # exceed the eligible roster. The printed report should not claim 133%.
         shore_leave_utilisation_pct=(
-            round(crew_went_ashore * 100 / eligible_count) if eligible_count else 0
+            min(100, round(crew_went_ashore * 100 / eligible_count))
+            if eligible_count else 0
         ),
         crew_went_ashore=crew_went_ashore,
         completed_trips=completed_trips,
@@ -1283,6 +1316,7 @@ def shore_leave_report(
         sos_raised=len(day_sos),
         incidents_reported=len(day_incidents),
         incidents_resolved=resolved_incidents,
+        safety_resolved=resolved_sos + resolved_incidents,
         outstanding_issues=still_ashore + unresolved_sos + (len(day_incidents) - resolved_incidents),
         # Drives the "operation successfully completed" checklist. Anyone still
         # ashore means the day is not closed out, whatever else looks fine.
