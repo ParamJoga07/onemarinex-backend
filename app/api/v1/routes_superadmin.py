@@ -1632,7 +1632,6 @@ def update_vessel_superadmin(
     if not vessel:
         raise HTTPException(status_code=404, detail="Vessel not found")
 
-    original_agent_id = vessel.agent_id
     vessel.name = body.name
     vessel.imo_number = body.imo_number
     vessel.vessel_type = body.vessel_type
@@ -1640,31 +1639,33 @@ def update_vessel_superadmin(
     vessel.flag = body.flag
     if body.agency_name is not None:
         vessel.agency_name = body.agency_name
-        if is_partnered_agency(body.agency_name):
-            from app.db.models.agent_profile import AgentProfile
-            prof = db.query(AgentProfile).filter(AgentProfile.agency_name == body.agency_name).first()
-            if prof:
-                vessel.agent_id = prof.user_id
 
+    # Only an explicitly chosen agent moves the vessel. This used to also infer
+    # agent_id from agency_name, and the edit form resubmits that name whether
+    # or not it changed — so correcting an ETD could silently look like a
+    # reassignment.
     if body.agent_id:
         vessel.agent_id = body.agent_id
 
     vessel.eta = body.eta
     vessel.etd = body.etd
 
-    from app.services.historical_context import (
-        active_vessel_call,
-        finish_vessel_call,
-        refresh_active_vessel_call,
-    )
+    from app.services.historical_context import refresh_active_vessel_call
     from app.services.vessel_lifecycle import synchronize_vessel_lifecycle
 
-    if vessel.agent_id != original_agent_id:
-        finish_vessel_call(db, vessel, status="REASSIGNED")
-        db.flush()
-        active_vessel_call(db, vessel)
-    else:
-        refresh_active_vessel_call(db, vessel)
+    # Editing never opens or closes a port call.
+    #
+    # This previously read a changed agent_id as a reassignment: it finished the
+    # current call and opened a new one, so editing an ETD started a fresh port
+    # call. On an archived vessel it was worse — archiving nulls agent_id, so
+    # the condition always fired, and because a call cannot be manufactured for
+    # a departed vessel the old call was closed with nothing opened in its
+    # place, leaving the vessel with no active call at all.
+    #
+    # Moving a vessel between agencies is a real event that does need a new
+    # call, but it is a deliberate transition, not a side effect of saving a
+    # form.
+    refresh_active_vessel_call(db, vessel)
     synchronize_vessel_lifecycle(db, [vessel])
 
     try:
