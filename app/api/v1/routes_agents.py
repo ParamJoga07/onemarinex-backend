@@ -5,7 +5,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 from sqlalchemy.orm import Session
 from sqlalchemy import and_, func, cast, String, or_
 from typing import Optional
-from datetime import datetime, timedelta, date as _date
+from datetime import datetime, timedelta, date as _date, timezone as dt_timezone
 
 from app.db.session import get_db
 from app.db.models.agent_profile import AgentProfile
@@ -991,15 +991,17 @@ class ShoreLeaveReportOut(BaseModel):
     incidents: List[Dict[str, Any]] = []
 
 
-@router.get("/reports/shore-leave/{vessel_id}", response_model=ShoreLeaveReportOut)
-def shore_leave_report(
-    vessel_id: int,
-    report_date: Optional[str] = None,
-    vessel_call_id: Optional[int] = None,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    """Figures for one vessel's shore leave on one day."""
+def _resolve_report_call(db, current_user, vessel_id, vessel_call_id):
+    """The vessel and call a report may cover, scoped to the signed-in agency.
+
+    Shared by the report and by the calendar beside it so the two cannot answer
+    to different scoping rules — a duplicated copy of this is how one agency
+    ends up reading another's call.
+
+    Returns the agent profile, vessel, call, and whether the caller named an
+    exact call: a named call reports only what belongs to it, while the
+    fallback also sweeps in records that predate call ownership.
+    """
     if current_user.role != "agent":
         raise HTTPException(status_code=403, detail="Only agents can generate reports")
 
@@ -1008,6 +1010,7 @@ def shore_leave_report(
     ).first()
     if not agent_profile:
         raise HTTPException(status_code=403, detail="Agent profile not found")
+
     strict_call_scope = vessel_call_id is not None
     call = None
     if vessel_call_id is not None:
@@ -1035,6 +1038,115 @@ def shore_leave_report(
                 call = active_vessel_call(db, vessel)
     if not vessel or not call:
         raise HTTPException(status_code=404, detail="Vessel call not found")
+    return agent_profile, vessel, call, strict_call_scope
+
+
+class ShoreLeaveActiveDaysOut(BaseModel):
+    """Which days of a call recorded anything, so the agent need not hunt.
+
+    The report covers one calendar day at the port and says nothing about the
+    others, so a call whose trips all ran on the 11th prints zeros on every
+    other date — indistinguishable from a report that is failing to fetch. On
+    one production call, 29 of its 31 days were empty.
+    """
+    dates: List[str] = []
+    latest: Optional[str] = None
+    timezone: Optional[str] = None
+
+
+@router.get("/reports/shore-leave/{vessel_id}/active-days",
+            response_model=ShoreLeaveActiveDaysOut)
+def shore_leave_active_days(
+    vessel_id: int,
+    vessel_call_id: Optional[int] = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """The port-local dates this call recorded shore leave or safety activity."""
+    agent_profile, vessel, call, strict_call_scope = _resolve_report_call(
+        db, current_user, vessel_id, vessel_call_id
+    )
+
+    from app.db.models.port_rule import PortRule
+    from app.services.port_time import as_port_local, resolve_port_timezone
+
+    configured = db.query(PortRule.timezone).filter(
+        PortRule.port_name == (call.port_name or agent_profile.assigned_port)
+    ).first()
+    zone_name, zone = resolve_port_timezone(
+        call.port_name or agent_profile.assigned_port,
+        configured[0] if configured else None,
+    )
+
+    def _local_date(value):
+        # Some columns are naive; those are stored as UTC, so they have to be
+        # made aware before converting or the port offset is applied twice.
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=dt_timezone.utc)
+        return as_port_local(value, zone).date().isoformat()
+
+    booking_scope = [CabBooking.vessel_call_id == call.id]
+    if not strict_call_scope:
+        booking_scope.append(CabBooking.vessel_id == vessel.id)
+
+    days = set()
+    for trip in db.query(CabBooking).filter(or_(*booking_scope)).all():
+        if trip.status == BookingStatus.CANCELLED:
+            continue
+        stamp = _local_date(trip.trip_started_at or trip.started_at or trip.created_at)
+        if stamp:
+            days.add(stamp)
+
+    from app.services import crew_linkage
+
+    roster = crew_linkage.vessel_call_roster(db, call)
+    if roster.profile_ids:
+        for (out_time,) in db.query(ShorePass.out_time).filter(
+            ShorePass.crew_profile_id.in_(roster.profile_ids),
+            ShorePass.out_time.isnot(None),
+        ).all():
+            stamp = _local_date(out_time)
+            if stamp:
+                days.add(stamp)
+
+    sos_scope = (CrewSos.vessel_call_id == call.id
+                 if strict_call_scope else CrewSos.vessel_id == vessel.id)
+    for (created,) in db.query(CrewSos.created_at).filter(
+        CrewSos.agency_id == agent_profile.id, sos_scope
+    ).all():
+        stamp = _local_date(created)
+        if stamp:
+            days.add(stamp)
+
+    incident_scope = (Incident.vessel_call_id == call.id
+                      if strict_call_scope else Incident.vessel_id == vessel.id)
+    for (created,) in db.query(Incident.created_at).filter(
+        Incident.agency_id == agent_profile.id, incident_scope
+    ).all():
+        stamp = _local_date(created)
+        if stamp:
+            days.add(stamp)
+
+    ordered = sorted(days)
+    return ShoreLeaveActiveDaysOut(
+        dates=ordered, latest=ordered[-1] if ordered else None, timezone=zone_name,
+    )
+
+
+@router.get("/reports/shore-leave/{vessel_id}", response_model=ShoreLeaveReportOut)
+def shore_leave_report(
+    vessel_id: int,
+    report_date: Optional[str] = None,
+    vessel_call_id: Optional[int] = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Figures for one vessel's shore leave on one day."""
+    agent_profile, vessel, call, strict_call_scope = _resolve_report_call(
+        db, current_user, vessel_id, vessel_call_id
+    )
 
     # The reporting day is the port's calendar day. report_date arrives as the
     # agent typed it, on their calendar — not UTC's. The window is returned as
