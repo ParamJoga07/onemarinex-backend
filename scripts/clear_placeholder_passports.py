@@ -14,6 +14,12 @@ What this does, and deliberately does not do
 It sets those values to NULL. Postgres permits many NULLs under a unique index,
 so that alone unblocks the constraint.
 
+By default it clears only outright placeholders — `NOT_PROVIDED`, `U`, and the
+like — which carry no information to lose. A value that fails only for want of a
+digit, such as `AANTRRC`, may be a real passport typed wrongly; clearing it
+destroys the only clue to what it should have been, so it is reported for
+correction instead. `--all-invalid` clears those too.
+
 **It does not touch HPIDs.** An HPID derived from a placeholder is ugly —
 `HP-U-IN-VIS` — but it is also the key that manifests, assignments, shore passes
 and bookings were written against. Reissuing it to make it prettier would orphan
@@ -38,10 +44,32 @@ import app.db.base  # noqa: F401 — registers every model on Base
 from app.db.session import SessionLocal
 from app.db.models.crew_profile import CrewProfile
 from app.services.crew_identity import (
+    MINIMUM_PASSPORT_LENGTH,
+    PLACEHOLDER_PASSPORTS,
     CrewIdentityConflict,
     normalize_passport_number,
     validate_passport_number,
 )
+
+
+def _is_placeholder(value) -> bool:
+    """Whether the value was typed to skip the field rather than to identify.
+
+    `NOT_PROVIDED` and `U` are placeholders on their face and carry no
+    information to lose. A value that fails only for want of a digit —
+    `AANTRRC`, `Hbbsxll` — is a different case: it may be a real passport typed
+    wrongly, and clearing it destroys the only remaining clue to what it should
+    have been.
+    """
+    passport = normalize_passport_number(value)
+    if not passport:
+        return True
+    stripped = "".join(character for character in passport if character.isalnum())
+    return (
+        passport in PLACEHOLDER_PASSPORTS
+        or stripped in PLACEHOLDER_PASSPORTS
+        or len(stripped) < MINIMUM_PASSPORT_LENGTH
+    )
 
 
 def _linked_record_counts(db, profile):
@@ -64,6 +92,9 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--apply", action="store_true",
                         help="write the changes; otherwise report only")
+    parser.add_argument("--all-invalid", action="store_true",
+                        help="also clear invalid values that collide with "
+                             "nothing, which the constraint does not require")
     args = parser.parse_args()
 
     db = SessionLocal()
@@ -89,6 +120,12 @@ def main() -> int:
                 groups[key].append(profile)
         colliding = {k: v for k, v in groups.items() if len(v) > 1}
 
+        placeholders = [(p, r) for p, r in unusable
+                        if _is_placeholder(p.passport_number)]
+        maybe_typos = [(p, r) for p, r in unusable
+                       if not _is_placeholder(p.passport_number)]
+        targets = unusable if args.all_invalid else placeholders
+
         print(f"{len(profiles)} crew profile(s).")
         print(f"{len(unusable)} hold a value that cannot be a passport.")
         print(f"{len(colliding)} passport value(s) are used by more than one "
@@ -98,28 +135,45 @@ def main() -> int:
             print("Nothing to clear. A unique constraint can be added.")
             return 0
 
-        for profile, reason in unusable:
-            counts = _linked_record_counts(db, profile)
-            shares = len(groups[normalize_passport_number(profile.passport_number)])
-            print(f"  profile {profile.id:<6} hpid {profile.hpid or '-':<26} "
-                  f"{(profile.full_name or '-')[:24]:<24} "
-                  f"passport {str(profile.passport_number)[:16]:<16} — {reason}")
-            print(f"      shared with {shares - 1} other account(s); "
-                  f"{counts['assignments']} assignment(s), {counts['passes']} pass(es), "
-                  f"{counts['bookings']} booking(s) keep pointing at this HPID")
+        def _describe(rows, heading):
+            if not rows:
+                return
+            print(heading)
+            for profile, reason in rows:
+                counts = _linked_record_counts(db, profile)
+                shares = len(groups[normalize_passport_number(profile.passport_number)])
+                print(f"  profile {profile.id:<6} hpid {profile.hpid or '-':<26} "
+                      f"{(profile.full_name or '-')[:24]:<24} "
+                      f"passport {str(profile.passport_number)[:16]:<16} — {reason}")
+                print(f"      shared with {shares - 1} other account(s); "
+                      f"{counts['assignments']} assignment(s), {counts['passes']} pass(es), "
+                      f"{counts['bookings']} booking(s) keep pointing at this HPID")
+            print()
 
-        print(f"\nThe HPID is left alone in every case — it is what those "
-              f"records were written against.")
+        _describe(placeholders, "Placeholders — these will be cleared:")
+        _describe(maybe_typos, "Possibly a real passport typed wrongly — left "
+                               "alone unless --all-invalid:")
+
+        if maybe_typos and not args.all_invalid:
+            print("Ask those crew for their passport and correct it, rather "
+                  "than clearing the only clue to what it should say.\n")
+
+        print("The HPID is left alone in every case — it is what those "
+              "records were written against.")
+
+        if not targets:
+            print("\nNo placeholders to clear.")
+            return 0
 
         if not args.apply:
-            print(f"\nDry run. Re-run with --apply to clear {len(unusable)} "
+            print(f"\nDry run. Re-run with --apply to clear {len(targets)} "
                   f"passport value(s) to NULL.")
             return 0
 
-        for profile, _ in unusable:
+        for profile, _ in targets:
             profile.passport_number = None
         db.commit()
-        print(f"\nCleared {len(unusable)} passport value(s).")
+        print(f"\nCleared {len(targets)} passport value(s).")
 
         remaining = defaultdict(int)
         for profile in db.query(CrewProfile).all():
