@@ -50,6 +50,72 @@ def normalized_passport_expression(column):
     return func.replace(func.upper(func.trim(column)), " ", "")
 
 
+# Values that were typed to get past the field rather than to identify anyone.
+# Production holds accounts under "U" and "NOT_PROVIDED", and because the HPID
+# is derived from the passport, those became permanent identities: HP-U-IN-VIS,
+# HP-NOT_PROVIDED-IN-MUM. Worse, they collide — three different people share
+# "U" — which is why manifest matching cannot trust a passport on its own.
+PLACEHOLDER_PASSPORTS = frozenset({
+    "NOTPROVIDED", "NOT_PROVIDED", "NOTAVAILABLE", "NOTGIVEN",
+    "NA", "N/A", "NIL", "NONE", "NULL", "UNKNOWN", "TEST", "TESTING",
+    "DUMMY", "SAMPLE", "PENDING", "TBD", "TBA", "-", "--", "---",
+    "0", "00", "000", "0000", "00000", "000000",
+})
+
+# Real passport numbers run to six characters or more; the shortest national
+# formats are six. Anything shorter is a keystroke, not an identifier.
+MINIMUM_PASSPORT_LENGTH = 5
+
+
+def validate_passport_number(value: Optional[str]) -> str:
+    """The canonical form of a passport that could plausibly identify someone.
+
+    Registration performed no check at all, so these values arrived through
+    sign-up and then propagated into HPIDs. Rejecting them at the door is what
+    makes a uniqueness rule reachable: the existing duplicates are entirely
+    placeholder values, not people who registered twice.
+    """
+    passport = normalize_passport_number(value)
+    if not passport:
+        raise CrewIdentityConflict("A passport number is required")
+
+    stripped = "".join(character for character in passport if character.isalnum())
+    if passport in PLACEHOLDER_PASSPORTS or stripped in PLACEHOLDER_PASSPORTS:
+        raise CrewIdentityConflict(
+            "Enter the passport number shown on your passport"
+        )
+    if len(stripped) < MINIMUM_PASSPORT_LENGTH:
+        raise CrewIdentityConflict(
+            "That passport number is too short to be valid"
+        )
+    if not any(character.isdigit() for character in stripped):
+        raise CrewIdentityConflict(
+            "A passport number contains at least one digit"
+        )
+    return passport
+
+
+def passport_already_registered(
+    db: Session,
+    passport: str,
+    *,
+    exclude_profile_id: Optional[int] = None,
+) -> Optional[CrewProfile]:
+    """The account already holding this passport, if there is one.
+
+    One passport is one person, so a second account under it is either the same
+    person registering twice — who should recover the first — or a passport
+    typed wrongly. Neither is resolved by creating the account.
+    """
+    query = db.query(CrewProfile).filter(
+        normalized_passport_expression(CrewProfile.passport_number)
+        == normalize_passport_number(passport)
+    )
+    if exclude_profile_id is not None:
+        query = query.filter(CrewProfile.id != exclude_profile_id)
+    return query.order_by(CrewProfile.id).first()
+
+
 def resolve_verified_crew_profile(
     db: Session,
     *,

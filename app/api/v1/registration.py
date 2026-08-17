@@ -190,6 +190,32 @@ def register_crew(body: CrewRegistrationIn, db: Session = Depends(get_db)):
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
+    # A passport is the one identifier that is genuinely one per person, and it
+    # becomes part of the HPID, so a placeholder typed here follows someone
+    # around permanently. Sign-up checked the email and the mobile number and
+    # nothing else, which is how accounts under "U" and "NOT_PROVIDED" exist —
+    # three different people share the first of those.
+    passport = None
+    if body.passport_number is not None and str(body.passport_number).strip():
+        from app.services.crew_identity import (
+            CrewIdentityConflict,
+            passport_already_registered,
+            validate_passport_number,
+        )
+
+        try:
+            passport = validate_passport_number(body.passport_number)
+        except CrewIdentityConflict as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if passport_already_registered(db, passport) is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "An account already exists for this passport number. "
+                    "Sign in instead, or reset the password on that account."
+                ),
+            )
+
     # 1. Create User
     user = User(
         name=body.full_name,
@@ -207,7 +233,8 @@ def register_crew(body: CrewRegistrationIn, db: Session = Depends(get_db)):
         full_name=body.full_name,
         rank=normalize_rank(body.rank) or "other",
         nationality=nationality,
-        passport_number=body.passport_number,
+        # Canonical form, so a later comparison is not defeated by spacing.
+        passport_number=passport,
         date_of_birth=body.date_of_birth
     )
     db.add(crew_profile)
@@ -215,7 +242,7 @@ def register_crew(body: CrewRegistrationIn, db: Session = Depends(get_db)):
 
     # 3. Generate HPID using Passport Number
     crew_profile.hpid = generate_unique_hpid(
-        db, body.passport_number, nationality, "port_general",
+        db, passport, nationality, "port_general",
         unique_fallback=user.id, exclude_profile_id=crew_profile.id,
     )
     
