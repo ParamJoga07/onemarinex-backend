@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Preview or apply the server-authoritative 24-hour ETD lifecycle."""
+"""Preview or apply the server-authoritative ETD lifecycle.
+
+The departing window is whatever `DEPARTING_WINDOW` says; naming a duration
+here only invited it to go stale, which it did.
+"""
 
 import argparse
 from datetime import datetime, timezone
@@ -12,6 +16,7 @@ from app.db.models.vessel import Vessel  # noqa: E402
 from app.db.models.vessel_call import VesselCall  # noqa: E402
 from app.db.session import SessionLocal  # noqa: E402
 from app.services.vessel_lifecycle import (  # noqa: E402
+    call_closed_by_the_clock,
     effective_vessel_status,
     synchronize_vessel_lifecycle,
 )
@@ -43,7 +48,19 @@ def main() -> int:
                 call_changes.append((vessel.id, "close active vessel call"))
             elif status in {"Active", "Departing"} and vessel.agent_id is not None:
                 if call is None:
-                    call_changes.append((vessel.id, "create active vessel call"))
+                    # A vessel with history no longer has a call manufactured
+                    # for it. Either the departure the clock recorded is undone,
+                    # or nothing happens — and the preview has to say which,
+                    # because this script writes to production.
+                    reopen = call_closed_by_the_clock(db, vessel, now)
+                    if reopen is not None:
+                        call_changes.append(
+                            (vessel.id, f"reopen call {reopen.id} (ETD moved forward)")
+                        )
+                    elif not db.query(VesselCall.id).filter(
+                        VesselCall.vessel_id == vessel.id
+                    ).first():
+                        call_changes.append((vessel.id, "create first vessel call"))
                 elif call.status != status.upper():
                     call_changes.append((vessel.id, f"call status -> {status.upper()}"))
         for vessel_id, name, before, after in changes:

@@ -47,10 +47,10 @@ def effective_vessel_status(
     return "Active"
 
 
-def _reopen_call_closed_by_the_clock(
+def call_closed_by_the_clock(
     db: Session,
     vessel: Vessel,
-    now: datetime,
+    now: Optional[datetime] = None,
 ):
     """The vessel's last call, if this function closed it at the old ETD.
 
@@ -61,7 +61,12 @@ def _reopen_call_closed_by_the_clock(
 
     Anything else is left alone: a call ended at some other moment was closed
     deliberately, and ARCHIVED or REASSIGNED calls are terminal regardless.
+
+    Asking is separated from reopening so a dry run can report what an apply
+    would do. A preview that has to guess at this drifts from the real thing,
+    which on a script that writes to production is worse than no preview.
     """
+    current = _aware_utc(now) or datetime.now(timezone.utc)
     last = (
         db.query(VesselCall)
         .filter(VesselCall.vessel_id == vessel.id)
@@ -78,9 +83,17 @@ def _reopen_call_closed_by_the_clock(
     if ended_at is None or call_etd is None or ended_at != call_etd:
         return None
     # Only while the new ETD genuinely puts the ship back in port.
-    if _aware_utc(vessel.etd) is None or _aware_utc(vessel.etd) <= now:
+    vessel_etd = _aware_utc(vessel.etd)
+    if vessel_etd is None or vessel_etd <= current:
         return None
+    return last
 
+
+def _reopen_call_closed_by_the_clock(db: Session, vessel: Vessel, now: datetime):
+    """Reopen the call `call_closed_by_the_clock` identifies, if there is one."""
+    last = call_closed_by_the_clock(db, vessel, now)
+    if last is None:
+        return None
     last.ended_at = None
     last.etd = vessel.etd
     last.status = "ACTIVE"
