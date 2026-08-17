@@ -22,6 +22,7 @@ from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 import app.db.base  # noqa: F401 — registers every model on Base
+from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
 from app.api.v1.routes_agents import shore_leave_report
@@ -489,6 +490,89 @@ class TripReportingDayTests(ShoreLeaveAverageTests):
         self.assertEqual(result.crew_went_ashore, 0)
         self.assertEqual(result.still_ashore, 0)
         self.assertIsNone(result.average_duration_minutes)
+
+
+class ActiveDaysTests(ShoreLeaveAverageTests):
+    """Which days of a call hold anything, so the agent need not hunt for them.
+
+    The report covers one calendar day and says nothing about the others, so a
+    call whose trips all ran on one date prints zeros on every other — which
+    looks exactly like a report that is failing to fetch. On one production
+    call, 29 of its 31 days were empty.
+    """
+
+    def days(self):
+        from app.api.v1.routes_agents import shore_leave_active_days
+        return shore_leave_active_days(
+            vessel_id=self.vessel.id, db=self.db, current_user=self.agent)
+
+    def test_a_day_with_a_completed_trip_is_listed(self):
+        self.trip_for(self.crew(), started=_at(10), completed=_at(12))
+
+        result = self.days()
+
+        self.assertIn(REPORT_DATE, result.dates)
+        self.assertEqual(result.latest, REPORT_DATE)
+
+    def test_a_call_with_nothing_on_it_lists_no_days(self):
+        self.crew()
+
+        result = self.days()
+
+        self.assertEqual(result.dates, [])
+        self.assertIsNone(result.latest)
+
+    def test_a_cancelled_booking_does_not_make_a_day_look_busy(self):
+        """It is the emptiest kind of day: a cab nobody took."""
+        self.trip_for(self.crew(), started=_at(10), completed=_at(12),
+                      status=BookingStatus.CANCELLED)
+
+        result = self.days()
+
+        self.assertEqual(result.dates, [])
+
+    def test_a_shore_pass_alone_marks_its_day(self):
+        """Crew who walked out on a pass are activity, with no cab involved."""
+        self.pass_for(self.crew(), out=_at(9), back=_at(17))
+
+        result = self.days()
+
+        self.assertEqual(result.dates, [REPORT_DATE])
+
+    def test_the_latest_day_is_the_one_worth_opening(self):
+        self.trip_for(self.crew(), started=_at(10, day=4), completed=_at(11, day=4))
+        self.trip_for(self.crew(), started=_at(10), completed=_at(11))
+
+        result = self.days()
+
+        self.assertEqual(result.dates, ["2026-03-04", REPORT_DATE])
+        self.assertEqual(result.latest, REPORT_DATE)
+
+    def test_days_are_reported_on_the_ports_clock(self):
+        """A trip at 01:00 port time is the previous day in UTC.
+
+        Reporting the UTC date here would send the agent to a day the report
+        itself considers empty, which is the whole defect restated.
+        """
+        self.trip_for(self.crew(), started=_at(1), completed=_at(2))
+
+        result = self.days()
+
+        self.assertEqual(result.dates, [REPORT_DATE])
+        self.assertEqual(result.timezone, "Asia/Kolkata")
+
+    def test_another_agencys_vessel_is_refused(self):
+        from app.api.v1.routes_agents import shore_leave_active_days
+
+        with self.assertRaises(HTTPException) as ctx:
+            shore_leave_active_days(
+                vessel_id=self.vessel.id, db=self.db,
+                current_user=SimpleNamespace(
+                    id=self.agent_user.id + 99_000, role="agent",
+                    agent_profile=None),
+            )
+
+        self.assertEqual(ctx.exception.status_code, 403)
 
 
 class ResolvedSafetyRecordTests(ShoreLeaveAverageTests):
