@@ -963,6 +963,11 @@ class ShoreLeaveReportOut(BaseModel):
     agency_name: Optional[str] = None
     agency_logo_url: Optional[str] = None
     report_date: str
+    # The span the figures cover, on the port's clock. `report_date` stays the
+    # last day of it, so a sheet printed before this existed still reads the
+    # same and frozen snapshots keep their meaning.
+    period_start: Optional[str] = None
+    period_end: Optional[str] = None
     generated_at: datetime
 
     crew_onboard: int
@@ -1041,121 +1046,83 @@ def _resolve_report_call(db, current_user, vessel_id, vessel_call_id):
     return agent_profile, vessel, call, strict_call_scope
 
 
-class ShoreLeaveActiveDaysOut(BaseModel):
-    """Which days of a call recorded anything, so the agent need not hunt.
+def _call_reporting_window(call):
+    """From the ship's arrival to now, or to its departure once it has sailed.
 
-    The report covers one calendar day at the port and says nothing about the
-    others, so a call whose trips all ran on the 11th prints zeros on every
-    other date — indistinguishable from a report that is failing to fetch. On
-    one production call, 29 of its 31 days were empty.
+    An agent sends this report when the vessel leaves, so it has to describe the
+    whole port call: generated on the 20th for a call that ran the 10th to the
+    15th, it covers those six days and stops there.
+
+    The start is the *earliest* of the arrival, the moment the call opened and
+    the row's creation, rather than the ETA alone. Those normally agree; when
+    they do not, taking the earliest is what guarantees no record falls before
+    the window and silently vanishes from the report.
+
+    The end is capped both ways — never past the departure, never into the
+    future — so a call still alongside reports up to this moment and a departed
+    one stops at its ETD.
     """
-    dates: List[str] = []
-    latest: Optional[str] = None
-    timezone: Optional[str] = None
+    now = datetime.now(dt_timezone.utc)
 
-
-@router.get("/reports/shore-leave/{vessel_id}/active-days",
-            response_model=ShoreLeaveActiveDaysOut)
-def shore_leave_active_days(
-    vessel_id: int,
-    vessel_call_id: Optional[int] = None,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    """The port-local dates this call recorded shore leave or safety activity."""
-    agent_profile, vessel, call, strict_call_scope = _resolve_report_call(
-        db, current_user, vessel_id, vessel_call_id
-    )
-
-    from app.db.models.port_rule import PortRule
-    from app.services.port_time import as_port_local, resolve_port_timezone
-
-    configured = db.query(PortRule.timezone).filter(
-        PortRule.port_name == (call.port_name or agent_profile.assigned_port)
-    ).first()
-    zone_name, zone = resolve_port_timezone(
-        call.port_name or agent_profile.assigned_port,
-        configured[0] if configured else None,
-    )
-
-    def _local_date(value):
-        # Some columns are naive; those are stored as UTC, so they have to be
-        # made aware before converting or the port offset is applied twice.
+    def _aware(value):
         if value is None:
             return None
-        if value.tzinfo is None:
-            value = value.replace(tzinfo=dt_timezone.utc)
-        return as_port_local(value, zone).date().isoformat()
+        return value.replace(tzinfo=dt_timezone.utc) if value.tzinfo is None else value
 
-    booking_scope = [CabBooking.vessel_call_id == call.id]
-    if not strict_call_scope:
-        booking_scope.append(CabBooking.vessel_id == vessel.id)
+    candidates = [_aware(call.eta), _aware(call.started_at), _aware(call.created_at)]
+    start = min([value for value in candidates if value is not None], default=None)
 
-    days = set()
-    for trip in db.query(CabBooking).filter(or_(*booking_scope)).all():
-        if trip.status == BookingStatus.CANCELLED:
-            continue
-        stamp = _local_date(trip.trip_started_at or trip.started_at or trip.created_at)
-        if stamp:
-            days.add(stamp)
-
-    from app.services import crew_linkage
-
-    roster = crew_linkage.vessel_call_roster(db, call)
-    if roster.profile_ids:
-        for (out_time,) in db.query(ShorePass.out_time).filter(
-            ShorePass.crew_profile_id.in_(roster.profile_ids),
-            ShorePass.out_time.isnot(None),
-        ).all():
-            stamp = _local_date(out_time)
-            if stamp:
-                days.add(stamp)
-
-    sos_scope = (CrewSos.vessel_call_id == call.id
-                 if strict_call_scope else CrewSos.vessel_id == vessel.id)
-    for (created,) in db.query(CrewSos.created_at).filter(
-        CrewSos.agency_id == agent_profile.id, sos_scope
-    ).all():
-        stamp = _local_date(created)
-        if stamp:
-            days.add(stamp)
-
-    incident_scope = (Incident.vessel_call_id == call.id
-                      if strict_call_scope else Incident.vessel_id == vessel.id)
-    for (created,) in db.query(Incident.created_at).filter(
-        Incident.agency_id == agent_profile.id, incident_scope
-    ).all():
-        stamp = _local_date(created)
-        if stamp:
-            days.add(stamp)
-
-    ordered = sorted(days)
-    return ShoreLeaveActiveDaysOut(
-        dates=ordered, latest=ordered[-1] if ordered else None, timezone=zone_name,
-    )
+    finished = _aware(call.ended_at) or _aware(call.etd)
+    end = min(finished, now) if finished is not None else now
+    if start is None:
+        start = end
+    if end < start:
+        # A call whose dates disagree still has to report something rather than
+        # an empty window that would read as "nothing happened".
+        end = now if now >= start else start
+    return start, end
 
 
 @router.get("/reports/shore-leave/{vessel_id}", response_model=ShoreLeaveReportOut)
 def shore_leave_report(
     vessel_id: int,
-    report_date: Optional[str] = None,
     vessel_call_id: Optional[int] = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Figures for one vessel's shore leave on one day."""
+    """Everything one vessel's shore leave has amounted to so far this call.
+
+    The report used to cover a single calendar day, which is not what an agent
+    sends. They send it once, when the ship leaves, and it has to account for
+    the whole port call — so a report generated on the 20th of a call that ran
+    the 10th to the 15th describes those six days, not the 20th.
+
+    Reporting one day also made every quiet date print a sheet of zeros
+    indistinguishable from a broken report, which is what "data is not being
+    fetched" turned out to mean: the trips were on a day nobody had selected.
+    """
     agent_profile, vessel, call, strict_call_scope = _resolve_report_call(
         db, current_user, vessel_id, vessel_call_id
     )
 
-    # The reporting day is the port's calendar day. report_date arrives as the
-    # agent typed it, on their calendar — not UTC's. The window is returned as
-    # UTC instants, which is what every timestamp column is compared against.
-    from app.services.port_time import agent_port_day
-    try:
-        day_start, day_end, resolved_date = agent_port_day(db, current_user, report_date)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="report_date must be YYYY-MM-DD")
+    period_start, period_end = _call_reporting_window(call)
+    day_start, day_end = period_start, period_end
+
+    # The printed dates are the port's calendar, not UTC's — the same clock the
+    # ETA and ETD on the sheet are shown against.
+    from app.db.models.port_rule import PortRule
+    from app.services.port_time import as_port_local, resolve_port_timezone
+
+    _configured = db.query(PortRule.timezone).filter(
+        PortRule.port_name == (call.port_name or agent_profile.assigned_port)
+    ).first()
+    _zone_name, _zone = resolve_port_timezone(
+        call.port_name or agent_profile.assigned_port,
+        _configured[0] if _configured else None,
+    )
+    period_start_label = as_port_local(period_start, _zone).date().isoformat()
+    period_end_label = as_port_local(period_end, _zone).date().isoformat()
+    resolved_date = period_end_label
 
     # The manifest decides who is aboard; an account is only how their own
     # records are found. Counting by crew profile alone dropped anyone who had
@@ -1411,6 +1378,8 @@ def shore_leave_report(
         agency_name=call.agency_name,
         agency_logo_url=agent_profile.agency_logo_url if agent_profile else None,
         report_date=resolved_date,
+        period_start=period_start_label,
+        period_end=period_end_label,
         generated_at=datetime.utcnow(),
         crew_onboard=len(roster),
         eligible_for_shore_leave=eligible_count,
@@ -1448,7 +1417,6 @@ def shore_leave_report(
 @router.post("/reports/shore-leave/{vessel_id}/snapshots")
 def create_shore_leave_report_snapshot(
     vessel_id: int,
-    report_date: Optional[str] = None,
     vessel_call_id: Optional[int] = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
@@ -1459,7 +1427,6 @@ def create_shore_leave_report_snapshot(
 
     report = shore_leave_report(
         vessel_id=vessel_id,
-        report_date=report_date,
         vessel_call_id=vessel_call_id,
         db=db,
         current_user=current_user,
