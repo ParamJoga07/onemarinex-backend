@@ -83,11 +83,37 @@ def plan(db):
             c for c in calls
             if _key(c.vessel_name) == _key(sos.vessel) and _contains(c, sos.created_at)
         ]
+        if len(matches) > 1:
+            matches = _narrow_by_assignment(db, sos, matches) or matches
         if len(matches) == 1:
             planned.append((sos, call, matches[0]))
         else:
             blocked.append((sos, call, matches))
     return mismatched, planned, blocked
+
+
+def _narrow_by_assignment(db, sos, matches):
+    """The calls this alert's own crew member was actually signed onto.
+
+    A ship can have two calls whose port times overlap — a visit that was never
+    closed, and the real one. MT. BABYLON has exactly that, so six alerts have
+    two candidate calls on time alone.
+
+    Who was on the ship settles it better than when the alert was raised: an
+    agent put this crew member on one of those calls and not the other. Where
+    the assignments say the same thing as the clock, that is a real answer;
+    where the crew member is on both, or on neither, this narrows nothing and
+    the alert stays with a person.
+    """
+    if not sos.crew_profile_id:
+        return []
+    assigned_call_ids = {
+        row.vessel_call_id for row in db.query(CrewAssignment).filter(
+            CrewAssignment.crew_profile_id == sos.crew_profile_id,
+            CrewAssignment.vessel_call_id.in_([c.id for c in matches]),
+        ).all()
+    }
+    return [c for c in matches if c.id in assigned_call_ids]
 
 
 def apply_plan(db, planned):
@@ -143,9 +169,19 @@ def main():
                 print(f"      -> no call named '{sos.vessel}' covers "
                       f"{sos.created_at}; left alone")
             else:
-                ids = ", ".join(str(c.id) for c in matches)
-                print(f"      -> {len(matches)} calls cover it ({ids}); "
-                      f"a person must choose. Left alone")
+                print(f"      -> raised {sos.created_at}; {len(matches)} calls "
+                      f"cover it and the crew member's assignments do not "
+                      f"separate them. Left alone:")
+                for c in matches:
+                    start = c.started_at or c.created_at or c.eta
+                    end = c.ended_at or c.etd
+                    assigned = db.query(CrewAssignment).filter(
+                        CrewAssignment.vessel_call_id == c.id,
+                        CrewAssignment.crew_profile_id == sos.crew_profile_id,
+                    ).count() if sos.crew_profile_id else 0
+                    print(f"           call {c.id:<5} {c.status or '?':<10} "
+                          f"{start} -> {end or 'open'}"
+                          f"{'   crew is assigned to this one' if assigned else ''}")
 
         print()
         print(RULE)
