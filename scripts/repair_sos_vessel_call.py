@@ -81,7 +81,9 @@ def plan(db):
     for sos, call in mismatched:
         matches = [
             c for c in calls
-            if _key(c.vessel_name) == _key(sos.vessel) and _contains(c, sos.created_at)
+            if _key(c.vessel_name) == _key(sos.vessel)
+            and _contains(c, sos.created_at)
+            and _can_own(sos, c)
         ]
         if len(matches) > 1:
             matches = _narrow_by_assignment(db, sos, matches) or matches
@@ -90,6 +92,28 @@ def plan(db):
         else:
             blocked.append((sos, call, matches))
     return mismatched, planned, blocked
+
+
+def _can_own(sos, call):
+    """Whether this call could hold this alert at all.
+
+    Not a preference between candidates — a constraint. A ship name can belong
+    to two vessel records: MT BABYLON exists as IMO 9379519, an empty shell
+    with no agency and no crew, and as IMO 985478, which carries the port, the
+    22 crew and the incidents. Both have an open call, so both cover the alerts
+    on name and time alone.
+
+    A safety record belongs to an agency. Moving one onto a call with no agency
+    would delete it from every agent screen, since those queries all filter on
+    agency_id, and moving it onto another agency's call would hand them a record
+    that is not theirs. So a candidate call must carry an agency, and where the
+    alert names one they must be the same agency.
+    """
+    if call.agency_id is None:
+        return False
+    if sos.agency_id is not None and call.agency_id != sos.agency_id:
+        return False
+    return True
 
 
 def _narrow_by_assignment(db, sos, matches):
