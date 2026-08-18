@@ -40,7 +40,7 @@ def _uniq(prefix):
     return f"{prefix}-{uuid.uuid4().hex[:10]}"
 
 
-class RepairSosVesselCallTests(unittest.TestCase):
+class _Base(unittest.TestCase):
     def setUp(self):
         self.connection = engine.connect()
         self.trans = self.connection.begin()
@@ -112,6 +112,8 @@ class RepairSosVesselCallTests(unittest.TestCase):
         self.db.flush()
         return sos
 
+
+class RepairSosVesselCallTests(_Base):
     def test_an_alert_moves_to_the_ship_it_names(self):
         moment = NOW - timedelta(days=8)
         babylon_call = self._call(
@@ -215,3 +217,157 @@ class RepairSosVesselCallTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AssignmentTiebreakTests(_Base):
+    """Two calls of the same ship cover an alert; who was aboard decides.
+
+    MT. BABYLON has a visit that was never closed alongside the real one, so
+    six production alerts have two candidate calls on time alone. An agent put
+    the crew member on one of them, and that is a better answer than the clock.
+    """
+
+    def _two_overlapping_babylon_calls(self):
+        first = self._call(self.babylon, start=NOW - timedelta(days=10),
+                           end=NOW - timedelta(days=6))
+        second = self._call(self.babylon, start=NOW - timedelta(days=9),
+                            end=NOW - timedelta(days=7))
+        return first, second
+
+    def _assign(self, call):
+        row = CrewAssignment(
+            vessel_call_id=call.id, crew_profile_id=self.crew.id,
+            crew_name="Test Crew", rank="Third Officer",
+        )
+        self.db.add(row)
+        self.db.flush()
+        return row
+
+    def test_the_call_the_crew_member_was_on_wins(self):
+        _stale, real = self._two_overlapping_babylon_calls()
+        self._assign(real)
+        jim_ming_call = self._call(self.jim_ming, start=NOW - timedelta(days=3),
+                                   end=None)
+        sos = self._sos(names="MT. BABYLON", stamped_with=jim_ming_call,
+                        created=NOW - timedelta(days=8))
+
+        _mismatched, planned, blocked = plan(self.db)
+        self.assertEqual(blocked, [])
+        self.assertEqual(len(planned), 1)
+        apply_plan(self.db, planned)
+        self.assertEqual(sos.vessel_call_id, real.id)
+
+    def test_being_on_both_calls_settles_nothing(self):
+        first, second = self._two_overlapping_babylon_calls()
+        self._assign(first)
+        self._assign(second)
+        jim_ming_call = self._call(self.jim_ming, start=NOW - timedelta(days=3),
+                                   end=None)
+        sos = self._sos(names="MT. BABYLON", stamped_with=jim_ming_call,
+                        created=NOW - timedelta(days=8))
+
+        _mismatched, planned, blocked = plan(self.db)
+        self.assertEqual(planned, [])
+        self.assertEqual(len(blocked), 1)
+        apply_plan(self.db, planned)
+        self.assertEqual(sos.vessel_call_id, jim_ming_call.id)
+
+    def test_being_on_neither_call_settles_nothing(self):
+        self._two_overlapping_babylon_calls()
+        jim_ming_call = self._call(self.jim_ming, start=NOW - timedelta(days=3),
+                                   end=None)
+        sos = self._sos(names="MT. BABYLON", stamped_with=jim_ming_call,
+                        created=NOW - timedelta(days=8))
+
+        _mismatched, planned, blocked = plan(self.db)
+        self.assertEqual(planned, [])
+        self.assertEqual(len(blocked), 1)
+        apply_plan(self.db, planned)
+        self.assertEqual(sos.vessel_call_id, jim_ming_call.id)
+
+    def test_an_assignment_cannot_override_the_clock(self):
+        """A call that does not cover the alert never becomes a candidate."""
+        far_off = self._call(self.babylon, start=NOW - timedelta(days=40),
+                             end=NOW - timedelta(days=38))
+        self._assign(far_off)
+        jim_ming_call = self._call(self.jim_ming, start=NOW - timedelta(days=3),
+                                   end=None)
+        sos = self._sos(names="MT. BABYLON", stamped_with=jim_ming_call,
+                        created=NOW - timedelta(days=8))
+
+        _mismatched, planned, blocked = plan(self.db)
+        self.assertEqual(planned, [])
+        self.assertEqual(len(blocked), 1)
+        apply_plan(self.db, planned)
+        self.assertEqual(sos.vessel_call_id, jim_ming_call.id)
+
+
+class CallMustBeAbleToOwnTests(_Base):
+    """A ship name can belong to two vessel records; only one can hold the alert.
+
+    MT BABYLON exists twice in production — IMO 9379519, an empty shell with no
+    agency and no crew, and IMO 985478, which carries the port, the crew and
+    the incidents. Both have an open call covering the alerts, so name and time
+    cannot separate them. Ownership can: a safety record belongs to an agency,
+    and a call with none would swallow it.
+    """
+
+    def _other_agency(self):
+        user = User(email=_uniq("agent2") + "@example.com",
+                    hashed_password="x", role="agent")
+        self.db.add(user)
+        self.db.flush()
+        profile = AgentProfile(
+            user_id=user.id, agency_name=_uniq("Other"), location="Port",
+            assigned_port="port_test",
+        )
+        self.db.add(profile)
+        self.db.flush()
+        return profile
+
+    def _twin(self, name):
+        """A second vessel record for the same ship, as the duplicate has."""
+        v = Vessel(
+            agent_id=None, name=name, imo_number=_uniq("IMO"),
+            vessel_type="Tanker", status="Active",
+            eta=NOW - timedelta(days=12), etd=NOW + timedelta(days=2),
+        )
+        self.db.add(v)
+        self.db.flush()
+        return v
+
+    def test_a_call_with_no_agency_is_not_a_candidate(self):
+        shell = self._twin("MT BABYLON")
+        orphan = self._call(shell, start=NOW - timedelta(days=12), end=None)
+        orphan.agency_id = None
+        self.db.flush()
+        real = self._call(self.babylon, start=NOW - timedelta(days=9),
+                          end=NOW - timedelta(days=7))
+        jim_ming_call = self._call(self.jim_ming, start=NOW - timedelta(days=3),
+                                   end=None)
+        sos = self._sos(names="MT. BABYLON", stamped_with=jim_ming_call,
+                        created=NOW - timedelta(days=8))
+
+        _mismatched, planned, blocked = plan(self.db)
+        self.assertEqual(blocked, [])
+        self.assertEqual(len(planned), 1)
+        apply_plan(self.db, planned)
+        self.assertEqual(sos.vessel_call_id, real.id)
+
+    def test_an_alert_never_moves_to_another_agencys_call(self):
+        other = self._other_agency()
+        theirs = self._call(self.babylon, start=NOW - timedelta(days=10),
+                            end=NOW - timedelta(days=6))
+        theirs.agency_id = other.id
+        self.db.flush()
+        jim_ming_call = self._call(self.jim_ming, start=NOW - timedelta(days=3),
+                                   end=None)
+        sos = self._sos(names="MT. BABYLON", stamped_with=jim_ming_call,
+                        created=NOW - timedelta(days=8))
+
+        _mismatched, planned, blocked = plan(self.db)
+        self.assertEqual(planned, [])
+        self.assertEqual(len(blocked), 1)
+        self.assertEqual(blocked[0][2], [])
+        apply_plan(self.db, planned)
+        self.assertEqual(sos.vessel_call_id, jim_ming_call.id)
