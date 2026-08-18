@@ -11,6 +11,7 @@ from app.db.session import get_db
 from app.db.models.vendors import Vendors
 from app.api.v1.routes_auth import get_current_user
 from app.db.models.user import User
+from app.services.port_time import normalize_working_days
 from app.services.vendor_ranking import (
     apply_vendor_commission_ranking,
     vendor_category_text,
@@ -76,7 +77,11 @@ class PubOut(BaseModel):
     about: Optional[str] = None
     open_time: Optional[str] = None
     close_time: Optional[str] = None
-    working_days: Optional[str] = None
+    # A list, because that is what the vendor form stores. It was declared a
+    # string, and a vendor whose working days had been normalised to the
+    # seven-day array made the whole response fail validation — so the endpoint
+    # 500'd and the crew screen showed "No pubs found in this area".
+    working_days: Optional[List[str]] = None
 
     class Config:
         from_attributes = True
@@ -117,7 +122,7 @@ def get_pubs(
             about=other.get("about") or other.get("description") or "",
             open_time=other.get("open_time"),
             close_time=other.get("close_time"),
-            working_days=other.get("working_days"),
+            working_days=normalize_working_days(other.get("working_days")),
         ))
     return results
 
