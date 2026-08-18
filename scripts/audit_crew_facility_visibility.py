@@ -44,10 +44,40 @@ CREW_FILTERS = {
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, help="port_id the crew would send")
+    parser.add_argument("--crew", help="a crew email: resolve their port the way "
+                                       "their own screens do, and report what "
+                                       "they would actually see")
     args = parser.parse_args()
 
     db = SessionLocal()
     try:
+        if args.crew:
+            # Replay the resolution the crew screens perform: read the profile,
+            # take current_port, and match it against ports.code. A mismatch
+            # there sends no port_id at all, which quietly widens the list
+            # rather than narrowing it — worth seeing plainly.
+            from app.db.models.crew_profile import CrewProfile
+            from app.db.models.port import Port
+            from app.db.models.user import User
+
+            user = db.query(User).filter(
+                func.lower(User.email) == args.crew.strip().lower()).first()
+            profile = db.query(CrewProfile).filter(
+                CrewProfile.user_id == user.id).first() if user else None
+            if profile is None:
+                print(f"No crew profile for {args.crew!r}.")
+                return 1
+            port = db.query(Port).filter(Port.code == profile.current_port).first()
+            print(f"{args.crew}")
+            print(f"  current_port on the profile : {profile.current_port!r}")
+            print(f"  matches ports.code          : "
+                  f"{'yes, port_id ' + str(port.id) if port else 'NO MATCH'}")
+            if port is None:
+                print("  -> the screens send no port_id, so no port filter is "
+                      "applied and every active vendor is returned.")
+            args.port = port.id if port else None
+            print()
+
         print("Every vendor, as stored:\n")
         rows = (
             db.query(Vendors.category, Vendors.status, Vendors.port_id,
