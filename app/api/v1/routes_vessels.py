@@ -890,6 +890,26 @@ def _start_return_call(db: Session, vessel: Vessel, body, *, agent_id, agency_na
             ),
         )
 
+    # The previous voyage's crew list does not come back with the ship.
+    #
+    # Opening a call materialises an assignment for every manifest row the
+    # vessel holds, which is right for a reassignment — same voyage, new agency,
+    # same people aboard — and wrong for a return visit weeks later, when the
+    # crew have rotated. MV JIM MING 82 came back and its new call arrived
+    # carrying everyone from the two before it.
+    #
+    # Clearing them loses no history. A finished call's roster lives in its own
+    # crew_assignments rows, which carry their own name, rank, HPID and
+    # eligibility rather than reading through to the manifest, and that is what
+    # the report and every historical view already read. The foreign key back to
+    # the manifest is ON DELETE SET NULL precisely so this is survivable.
+    departed_manifest = db.query(VesselCrew).filter(
+        VesselCrew.vessel_id == vessel.id
+    ).all()
+    for row in departed_manifest:
+        db.delete(row)
+    db.flush()
+
     vessel.name = body.name or vessel.name
     vessel.vessel_type = body.vessel_type or vessel.vessel_type
     vessel.berth_assignment = body.berth_assignment
