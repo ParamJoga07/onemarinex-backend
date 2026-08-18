@@ -6,6 +6,7 @@ from pydantic import BaseModel
 from app.db.session import get_db
 from app.db.models.vendors import Vendors
 from app.api.v1.routes_auth import get_current_user
+from app.services.port_time import normalize_working_days
 from app.services.vendor_ranking import (
     apply_vendor_commission_ranking,
     vendor_category_text,
@@ -30,7 +31,9 @@ class FacilityOut(BaseModel):
     about: str = ""
     open_time: Optional[str] = None
     close_time: Optional[str] = None
-    working_days: Optional[str] = None
+    # See routes_pubs: stored as a list, and declaring it a string took the
+    # whole Massage & Wellness response down with it.
+    working_days: Optional[List[str]] = None
     facilities: Optional[List[str]] = None
     menu_items: Optional[List[str]] = None
     best_for: Optional[str] = None
@@ -65,7 +68,7 @@ def _vendor_to_facility(v: Vendors) -> FacilityOut:
         about=other.get("about") or other.get("description") or "",
         open_time=other.get("open_time"),
         close_time=other.get("close_time"),
-        working_days=other.get("working_days"),
+        working_days=normalize_working_days(other.get("working_days")),
         facilities=other.get("facilities", []),
         menu_items=v.menu_items or [],
         best_for=other.get("best_for", ""),
