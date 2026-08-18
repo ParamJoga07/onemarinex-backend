@@ -24,6 +24,8 @@ import argparse
 import sys
 from collections import defaultdict
 
+from types import SimpleNamespace
+
 import app.db.base  # noqa: F401 — registers every model on Base
 from sqlalchemy import func
 
@@ -39,6 +41,59 @@ CREW_FILTERS = {
     "Massage & Wellness": ("in", ["massage", "wellness"]),
     "Shopping & Utility": ("in", ["shopping", "utility"]),
 }
+
+
+def _crew_endpoints():
+    """The functions the crew screens actually call.
+
+    Imported inside the function so this script still reports the stored data
+    even if one of the route modules cannot be imported.
+    """
+    from app.api.v1.routes_facilities import (
+        get_massage_wellness, get_shopping_utility,
+    )
+    from app.api.v1.routes_pubs import get_pubs
+
+    return (
+        ("Pubs", lambda db, user, port: get_pubs(
+            port_id=port, db=db, current_user=user)),
+        ("Massage & Wellness", lambda db, user, port: get_massage_wellness(
+            port_id=port, db=db, current_user=user)),
+        ("Shopping & Utility", lambda db, user, port: get_shopping_utility(
+            port_id=port, db=db, current_user=user)),
+    )
+
+
+def _blame_the_vendor(db, label, port_id):
+    """Name the row the response model refuses, and why.
+
+    One bad vendor takes the whole list down with it, so the useful answer is
+    which one — not that the category is broken.
+    """
+    mode, wanted = CREW_FILTERS[label]
+    query = db.query(Vendors).filter(Vendors.status == "Active")
+    if mode == "ilike":
+        query = query.filter(vendor_category_text().ilike(wanted[0]))
+    else:
+        query = query.filter(vendor_category_text().in_(wanted))
+    if port_id is not None:
+        query = query.filter(Vendors.port_id == port_id)
+
+    from app.api.v1.routes_facilities import _vendor_to_facility
+
+    blamed = 0
+    for vendor in query.all():
+        try:
+            _vendor_to_facility(vendor)
+        except Exception as exc:  # noqa: BLE001
+            blamed += 1
+            print(f"      vendor {vendor.id:<5} "
+                  f"{(vendor.name or '-')[:32]:<32} {type(exc).__name__}")
+            for line in str(exc).splitlines()[:6]:
+                print(f"          {line.strip()}")
+    if not blamed:
+        print("      No single vendor fails on its own — the failure is in the "
+              "endpoint itself rather than one row.")
 
 
 def main() -> int:
@@ -90,45 +145,22 @@ def main() -> int:
             print(f"  {str(category):<16} {str(status):<10} port {str(port_id):<6} {count}")
 
         print(f"\n{'=' * 74}")
-        for label, (mode, wanted) in CREW_FILTERS.items():
-            query = db.query(Vendors)
-            if mode == "ilike":
-                query = query.filter(vendor_category_text().ilike(wanted[0]))
-            else:
-                query = query.filter(vendor_category_text().in_(wanted))
-            matching_category = query.all()
-
-            active = [v for v in matching_category if v.status == "Active"]
-            visible = active
-            if args.port is not None:
-                visible = [v for v in active if v.port_id == args.port]
-
-            print(f"\n{label}: crew would see {len(visible)}")
-            if len(matching_category) != len(active):
-                for vendor in matching_category:
-                    if vendor.status != "Active":
-                        print(f"    hidden: {vendor.name[:34]:<34} "
-                              f"status is {vendor.status!r}, not 'Active'")
-            if args.port is not None:
-                for vendor in active:
-                    if vendor.port_id != args.port:
-                        print(f"    hidden: {vendor.name[:34]:<34} "
-                              f"is on port {vendor.port_id}, not {args.port}")
-
-            # Anything whose category looks like this one but does not match the
-            # filter — the case and wording traps.
-            near = []
-            for vendor in db.query(Vendors).all():
-                text = str(vendor.category or "")
-                if vendor in matching_category:
-                    continue
-                if any(word in text.lower() for word in wanted):
-                    near.append(vendor)
-            for vendor in near:
-                reason = ("category is case-sensitive here"
-                          if mode == "in" else "category must be the exact word")
-                print(f"    MISSED: {vendor.name[:34]:<34} "
-                      f"category {str(vendor.category)!r} — {reason}")
+        # Call the endpoints themselves rather than re-implementing their
+        # filters. A query returning rows proves nothing if the response model
+        # then refuses one of them: the endpoint 500s, the screen shows its
+        # empty state, and a database-level audit reports everything is fine.
+        viewer = SimpleNamespace(id=0, role="crew")
+        for label, call in _crew_endpoints():
+            try:
+                rows = call(db, viewer, args.port)
+            except Exception as exc:  # noqa: BLE001 — seeing it is the point
+                print(f"\n{label}: the endpoint FAILED — {type(exc).__name__}")
+                print(f"    {str(exc).splitlines()[0]}")
+                print("    A crew member sees the empty state for this. The "
+                      "vendor responsible:")
+                _blame_the_vendor(db, label, args.port)
+                continue
+            print(f"\n{label}: crew would see {len(rows)}")
 
         print(f"\n{'=' * 74}")
         if args.port is None:
