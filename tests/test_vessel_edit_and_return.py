@@ -30,7 +30,9 @@ from types import SimpleNamespace
 from app.db.models.agent_profile import AgentProfile
 from app.db.models.user import User
 from app.db.models.vessel import Vessel
+from app.db.models.crew_assignment import CrewAssignment
 from app.db.models.vessel_call import VesselCall
+from app.db.models.vessel_crew import VesselCrew
 from app.db.session import engine
 
 
@@ -355,6 +357,81 @@ class ReturningVesselTests(_Base):
 
         self.assertEqual(ctx.exception.status_code, 409)
         self.assertIn("already has an open", ctx.exception.detail)
+
+    def crew_on(self, vessel, *, name=None, eligible=True):
+        row = VesselCrew(
+            vessel_id=vessel.id, name=name or _uniq("Crew"), rank="able_seaman",
+            hp_id=_uniq("HP"), nationality="IN", shore_pass_eligible=eligible,
+        )
+        self.db.add(row)
+        self.db.flush()
+        return row
+
+    def manifest(self, vessel):
+        return self.db.query(VesselCrew).filter(
+            VesselCrew.vessel_id == vessel.id).all()
+
+    def assignments_on(self, call):
+        return self.db.query(CrewAssignment).filter(
+            CrewAssignment.vessel_call_id == call.id).all()
+
+    def test_a_returning_vessel_does_not_bring_back_the_old_crew(self):
+        """The reported defect on MV JIM MING 82.
+
+        Opening a call materialises an assignment for every manifest row the
+        vessel holds. On a return visit weeks later that handed the new call
+        everyone from the voyages before it.
+        """
+        first = self.vessel(status="Departed", agent=False)
+        old_call = self.call_for(first, ended=True)
+        self.crew_on(first)
+        self.crew_on(first)
+
+        returned = self._add(imo=first.imo_number)
+
+        new_call = self.open_calls(returned)[0]
+        self.assertEqual(self.assignments_on(new_call), [])
+        self.assertEqual(self.manifest(returned), [])
+
+    def test_the_finished_calls_roster_survives(self):
+        """Clearing the manifest must not erase who sailed on the last voyage.
+
+        A finished call keeps its own crew_assignments, which carry the name,
+        rank and HPID themselves rather than reading through to the manifest.
+        """
+        first = self.vessel(status="Departed", agent=False)
+        old_call = self.call_for(first, ended=True)
+        row = self.crew_on(first, name="ESCARPE DENNIS RAMAL")
+        self.db.add(CrewAssignment(
+            vessel_call_id=old_call.id, vessel_crew_id=row.id,
+            crew_name=row.name, hpid=row.hp_id, rank=row.rank,
+            shore_pass_eligible=True, started_at=NOW - timedelta(days=3),
+            ended_at=NOW - timedelta(days=1),
+        ))
+        self.db.flush()
+
+        self._add(imo=first.imo_number)
+
+        kept = self.assignments_on(old_call)
+        self.assertEqual([a.crew_name for a in kept], ["ESCARPE DENNIS RAMAL"])
+        # The manifest row is gone, so the link is nulled rather than dangling.
+        self.assertIsNone(kept[0].vessel_crew_id)
+
+    def test_a_reassignment_still_carries_the_crew(self):
+        """Same voyage, new agency — those people are still aboard.
+
+        Only a return visit starts empty; `active_vessel_call` is shared with
+        reassignment, which must keep the manifest it already has.
+        """
+        from app.services.historical_context import active_vessel_call
+
+        vessel = self.vessel()
+        self.crew_on(vessel)
+        self.crew_on(vessel)
+
+        call = active_vessel_call(self.db, vessel)
+
+        self.assertEqual(len(self.assignments_on(call)), 2)
 
     def test_a_genuinely_new_imo_still_creates_a_vessel(self):
         before = self.db.query(Vessel).count()
