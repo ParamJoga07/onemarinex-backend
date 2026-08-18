@@ -1,13 +1,19 @@
-"""The vessel list a crew member picks from after choosing their port.
+"""The vessel list a crew member picks from.
 
-`port_code` was accepted by the endpoint and never read, so choosing a port
-changed nothing: crew were offered every active vessel in every port. A vessel
-row carries no port of its own — the port belongs to the open call — which is
-why the filter could not be a plain column comparison and was left unbuilt.
+It offers every vessel the platform knows, whatever its port and whether or not
+it has sailed. Filtering it to the caller's port and to ships still alongside
+was doing authorisation's job badly: crew could not find their vessel if an
+agent had not onboarded it yet, or if it had just departed, and were left with
+nothing to select.
 
-That mattered twice over, because the selection is resolved by vessel *name*.
-Two ships sharing a name in different ports were indistinguishable in the list,
-and the first one listed won.
+Choosing a vessel grants nothing. The shore leave card and every booking
+resolve through the crew assignment, so the list can be honest about what
+exists and let that decide.
+
+Archived is the one exclusion — it means removed from operations, not sailed.
+
+Each vessel carries its port and status so the caller can label them, which is
+also what tells two ships sharing a name apart.
 
 Runs against the configured database inside a transaction that is always
 rolled back.
@@ -84,26 +90,13 @@ class PublicVesselListingTests(unittest.TestCase):
             self.db.flush()
         return vessel
 
-    def listing(self, port_code=None):
+    def listing(self):
         from app.api.v1.routes_vessels import get_public_vessels
 
-        return get_public_vessels(
-            port_code=port_code, current_user=self.viewer, db=self.db,
-        )
+        return get_public_vessels(current_user=self.viewer, db=self.db)
 
-    def test_only_vessels_in_the_requested_port_are_offered(self):
-        """The reported defect: the port choice did nothing."""
-        here, elsewhere = self.port(), self.port()
-        mine = self.vessel_at(here)
-        theirs = self.vessel_at(elsewhere)
-
-        offered = {v.id for v in self.listing(port_code=here.code)}
-
-        self.assertIn(mine.id, offered)
-        self.assertNotIn(theirs.id, offered)
-
-    def test_an_unfiltered_request_still_offers_every_port(self):
-        """Callers that never sent a port must keep working."""
+    def test_vessels_in_every_port_are_offered(self):
+        """A crew member may be standing on a ship at any of them."""
         here, elsewhere = self.port(), self.port()
         mine = self.vessel_at(here)
         theirs = self.vessel_at(elsewhere)
@@ -113,46 +106,55 @@ class PublicVesselListingTests(unittest.TestCase):
         self.assertIn(mine.id, offered)
         self.assertIn(theirs.id, offered)
 
-    def test_a_vessel_with_no_open_call_is_not_in_any_port(self):
-        """Nothing places it, so it belongs to nobody's port list."""
-        here = self.port()
-        unplaced = self.vessel_at(None)
+    def test_a_departed_vessel_is_still_offered(self):
+        """Crew arrive after the paperwork says the ship has gone.
 
-        offered = {v.id for v in self.listing(port_code=here.code)}
+        Hiding it left them selecting nothing at all, which is worse than
+        selecting a ship whose status the list shows them.
+        """
+        gone = self.vessel_at(self.port(), etd=NOW - timedelta(days=1))
 
-        self.assertNotIn(unplaced.id, offered)
+        row = next(v for v in self.listing() if v.id == gone.id)
+
+        self.assertEqual(row.status, "Departed")
+
+    def test_an_archived_vessel_is_not_offered(self):
+        """Archived means taken out of operations, which is not the same."""
+        archived = self.vessel_at(self.port())
+        archived.status = "Archived"
+        self.db.flush()
+
+        self.assertNotIn(archived.id, {v.id for v in self.listing()})
+
+    def test_a_vessel_with_no_agent_is_offered(self):
+        """The reported defect: only agent-onboarded vessels were visible."""
+        unclaimed = self.vessel_at(self.port())
+        unclaimed.agent_id = None
+        self.db.flush()
+
+        self.assertIn(unclaimed.id, {v.id for v in self.listing()})
 
     def test_the_port_is_reported_alongside_each_vessel(self):
         """Crew pick by name, so the caller needs this to tell ships apart."""
         here = self.port()
         vessel = self.vessel_at(here)
 
-        row = next(v for v in self.listing(port_code=here.code)
-                   if v.id == vessel.id)
+        row = next(v for v in self.listing() if v.id == vessel.id)
 
         self.assertEqual(row.port_code, here.code)
         self.assertEqual(row.port_name, here.name)
 
-    def test_two_ships_sharing_a_name_are_split_by_port(self):
-        """The collision the name-keyed dropdown could not survive."""
+    def test_two_ships_sharing_a_name_are_distinguishable_by_port(self):
+        """The list no longer separates them, so it has to label them."""
         here, elsewhere = self.port(), self.port()
         shared = _uniq("MV")
-        mine = self.vessel_at(here, name=shared)
+        self.vessel_at(here, name=shared)
         self.vessel_at(elsewhere, name=shared)
 
-        offered = [v for v in self.listing(port_code=here.code)
-                   if v.name == shared]
+        offered = [v for v in self.listing() if v.name == shared]
 
-        self.assertEqual([v.id for v in offered], [mine.id])
-
-    def test_a_departed_vessel_is_not_offered(self):
-        """Existing behaviour: status is derived from ETD."""
-        here = self.port()
-        gone = self.vessel_at(here, etd=NOW - timedelta(days=1))
-
-        offered = {v.id for v in self.listing(port_code=here.code)}
-
-        self.assertNotIn(gone.id, offered)
+        self.assertEqual(len(offered), 2)
+        self.assertNotEqual(offered[0].port_code, offered[1].port_code)
 
 
 if __name__ == "__main__":

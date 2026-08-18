@@ -137,7 +137,13 @@ def test_read_models_use_server_time_without_mutating_the_database(db):
 
     assert next(row for row in agent_rows if row.id == vessel.id).status == "Departed"
     assert next(row for row in superadmin_rows if row.id == vessel.id).status == "Departed"
-    assert vessel.id not in {row.id for row in public_rows}
+    # The public list now offers departed vessels too, labelled as such, so
+    # crew arriving after the paperwork says the ship has gone still have
+    # something to select. What this test is about is unchanged: the read
+    # models derive that status from server time without writing it.
+    assert next(
+        row for row in public_rows if row.id == vessel.id
+    ).status == "Departed"
     assert next(row for row in history if row["vessel_call_id"] == call.id)["status"] == "DEPARTED"
     assert db.query(Vessel.status).filter(Vessel.id == vessel.id).scalar() == "Active"
     assert call.ended_at is None

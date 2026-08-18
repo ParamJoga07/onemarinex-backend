@@ -258,6 +258,9 @@ class ProfileUpdateIn(BaseModel):
     date_of_birth: Optional[date] = None
     current_port: Optional[str] = None
     vessel: Optional[str] = None
+    # The vessel actually chosen, by id. The name beside it is a label; this is
+    # what the shore leave card resolves against.
+    selected_vessel_id: Optional[int] = None
     data_sharing: Optional[bool] = None
     share_visits: Optional[bool] = None
     safety_tracking: Optional[bool] = None
@@ -297,6 +300,23 @@ class CrewProfileOut(BaseModel):
     agency_name: Optional[str] = None
     has_partnered_agency: bool = False
     vessel_exists: bool = False
+
+    # Which shore leave card to show, decided here rather than reassembled from
+    # several fields by every screen that needs it.
+    #
+    #   APPROVED      an assignment exists and the agent marked them eligible
+    #   NOT_ELIGIBLE  an assignment exists and the agent marked them not
+    #   PENDING       no assignment yet, on a vessel an agency manages — the
+    #                 agent has not uploaded the manifest. Waiting, not allowed
+    #   None          no assignment, on a vessel no agency runs here; there is
+    #                 no shore leave to have a status about
+    #
+    # PENDING is emphatically not an assignment. Bookings and shore passes stay
+    # refused until one exists; the card only says who they are waiting for.
+    shore_leave_status: Optional[str] = None
+    # Cab booking needs an agency to arrange it, so it is locked in exactly the
+    # two states that have one but no permission yet.
+    cab_booking_locked: bool = False
 
     class Config:
         from_attributes = True
@@ -789,6 +809,36 @@ def update_crew_profile(
     
     # Partial update: only update if field is present in request
     update_data = body.model_dump(exclude_unset=True)
+    if "passport_number" in update_data and update_data["passport_number"] is not None:
+        # Registration refuses a passport that identifies nobody, and one that
+        # already belongs to someone. Editing had neither check, so the same
+        # value could simply be typed in here afterwards — which is how one
+        # account ended up holding another person's passport.
+        from app.services.crew_identity import (
+            CrewIdentityConflict,
+            passport_already_registered,
+            validate_passport_number,
+        )
+
+        raw = update_data["passport_number"]
+        if str(raw).strip():
+            try:
+                passport = validate_passport_number(raw)
+            except CrewIdentityConflict as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            owner = passport_already_registered(
+                db, passport, exclude_profile_id=profile.id)
+            if owner is not None:
+                owner_user = db.query(User).filter(User.id == owner.user_id).first()
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"This passport number is already linked to "
+                        f"{owner_user.email if owner_user else 'another account'}. "
+                        f"Please sign in with those credentials."
+                    ),
+                )
+            update_data["passport_number"] = passport
     if "nationality" in update_data:
         try:
             update_data["nationality"] = normalize_nationality(update_data["nationality"], strict=True)
@@ -831,12 +881,36 @@ def get_crew_profile(
 
     output = CrewProfileOut.model_validate(profile)
     if assignment is None:
+        # No assignment, so the card turns on the vessel they chose. An agency
+        # runs it and has not added them yet — PENDING, and waiting on someone
+        # — or no agency runs it here, in which case shore leave is not a thing
+        # they are waiting for and no card belongs on the screen.
+        #
+        # Resolved from the selected vessel id rather than the profile's vessel
+        # *name*: the list spans every port now, and two ships can share a name.
+        from app.db.models.vessel import Vessel
+
+        selected = (
+            db.query(Vessel).filter(Vessel.id == profile.selected_vessel_id).first()
+            if profile.selected_vessel_id else None
+        )
+        selected_agency = None
+        if selected is not None:
+            selected_agency = selected.agency_name
+            if not selected_agency and selected.agent and getattr(
+                selected.agent, "agent_profile", None
+            ):
+                selected_agency = selected.agent.agent_profile.agency_name
+        agency_managed = is_partnered_agency(selected_agency)
         return output.model_copy(update={
             "mapping_status": "Unmapped",
             "shore_pass_eligible": False,
-            "agency_name": "Other",
-            "has_partnered_agency": False,
-            "vessel_exists": False,
+            "agency_name": selected_agency or "Other",
+            "has_partnered_agency": agency_managed,
+            "vessel_exists": selected is not None,
+            "shore_leave_status": "PENDING" if agency_managed else None,
+            # Waiting on an agent is still not permission to book a cab.
+            "cab_booking_locked": agency_managed,
         })
 
     call = _assignment_call_or_conflict(assignment)
@@ -859,6 +933,11 @@ def get_crew_profile(
         "agency_name": agency_name,
         "has_partnered_agency": is_partnered_agency(agency_name),
         "vessel_exists": vessel is not None,
+        # An assignment exists, so the agent has decided one way or the other.
+        "shore_leave_status": (
+            "APPROVED" if assignment.shore_pass_eligible else "NOT_ELIGIBLE"
+        ),
+        "cab_booking_locked": not assignment.shore_pass_eligible,
     })
 
 class SOSConfigIn(BaseModel):
