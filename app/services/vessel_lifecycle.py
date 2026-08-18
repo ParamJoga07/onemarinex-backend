@@ -167,3 +167,56 @@ def synchronize_vessel_lifecycle(
                     changed += 1
                 call.status = status.upper()
     return changed
+
+
+def current_call_for(db: Session, vessel_id: int) -> Optional[VesselCall]:
+    """The vessel's open call, or its most recent one if none is open.
+
+    Everything an agent sees on a vessel's page belongs to the call the ship is
+    on right now. Falling back to the last call rather than to nothing matters
+    for a ship that has just sailed: its page should still show the call that
+    was, not the whole of its history.
+    """
+    return (
+        db.query(VesselCall)
+        .filter(VesselCall.vessel_id == vessel_id, VesselCall.ended_at.is_(None))
+        .order_by(VesselCall.started_at.desc(), VesselCall.id.desc())
+        .first()
+    ) or (
+        db.query(VesselCall)
+        .filter(VesselCall.vessel_id == vessel_id)
+        .order_by(VesselCall.started_at.desc(), VesselCall.id.desc())
+        .first()
+    )
+
+
+def belongs_to_call(call_id_column, vessel_id_column, created_at_column,
+                    *, vessel_id: int, call: Optional[VesselCall]):
+    """Rows of one call, for tables that carry `vessel_call_id`.
+
+    A ship that returns gets a new call, and the previous call's crew, trips,
+    incidents and SOS alerts must not follow it there — MV JIM MING 82 came
+    back and its page showed everything from calls 131 and 133 alongside the
+    new one.
+
+    Rows stamped with another call are excluded outright. Rows predating the
+    column carry no call at all; they are matched by vessel and admitted only
+    if they happened inside this call's window, so an unattributable record
+    from a year ago does not surface under today's arrival.
+    """
+    from sqlalchemy import and_, or_
+
+    if call is None:
+        # No call ever opened for this ship: nothing can be attributed to one,
+        # so fall back to the vessel and show what there is.
+        return vessel_id_column == vessel_id
+
+    unattributed = [call_id_column.is_(None), vessel_id_column == vessel_id]
+    started = _aware_utc(call.started_at) or _aware_utc(call.created_at)
+    if started is not None:
+        unattributed.append(created_at_column >= started)
+    ended = _aware_utc(call.ended_at)
+    if ended is not None:
+        unattributed.append(created_at_column <= ended)
+
+    return or_(call_id_column == call.id, and_(*unattributed))
