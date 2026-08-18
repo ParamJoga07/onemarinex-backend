@@ -418,6 +418,31 @@ def ensure_port_time_and_sos_context_schema():
         tables = set(inspector.get_table_names())
         statements = []
 
+        if "crew_profiles" in tables:
+            # Which vessel the crew member picked, which is not an assignment.
+            # The shore leave card needs it to tell "waiting on my agent" from
+            # "no agency runs this ship", and it has to survive a refresh.
+            crew_columns = {
+                column["name"] for column in inspector.get_columns("crew_profiles")
+            }
+            if "selected_vessel_id" not in crew_columns:
+                statements.append(
+                    "ALTER TABLE crew_profiles "
+                    "ADD COLUMN IF NOT EXISTS selected_vessel_id INTEGER"
+                )
+            statements.append(
+                "CREATE INDEX IF NOT EXISTS ix_crew_profiles_selected_vessel_id "
+                "ON crew_profiles (selected_vessel_id)"
+            )
+            if "vessels" in tables:
+                statements.append("""
+                DO $$ BEGIN
+                    ALTER TABLE crew_profiles
+                    ADD CONSTRAINT fk_crew_profiles_selected_vessel_id
+                    FOREIGN KEY (selected_vessel_id) REFERENCES vessels(id) ON DELETE SET NULL;
+                EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+                """)
+
         if "port_rules" in tables:
             port_columns = {column["name"] for column in inspector.get_columns("port_rules")}
             if "timezone" not in port_columns:

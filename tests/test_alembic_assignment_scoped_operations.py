@@ -23,7 +23,10 @@ def test_assignment_scoped_release_stays_on_the_single_linear_graph():
     config.set_main_option("script_location", str(ROOT / "alembic"))
     script = ScriptDirectory.from_config(config)
 
-    assert script.get_heads() == ["s0t1u2v3w4x5"]
+    # One head, not a named one: this asserts the graph stays linear, and
+    # pinning whichever revision happened to be last made every later migration
+    # edit this line to say the same thing.
+    assert len(script.get_heads()) == 1
     assert (
         script.get_revision("r9s0t1u2v3w4").down_revision
         == "o6p7q8r9s0t1"

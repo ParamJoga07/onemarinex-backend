@@ -821,6 +821,9 @@ class VesselPublicOut(BaseModel):
     # to tell them apart.
     port_code: Optional[str] = None
     port_name: Optional[str] = None
+    # Active, Departing or Departed. Shown beside the name so a crew member
+    # picking a ship that has sailed knows that is what they are picking.
+    status: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -1009,7 +1012,6 @@ def get_vessels(current_user: User = Depends(get_current_user), db: Session = De
 
 @router.get("/public", response_model=List[VesselPublicOut])
 def get_public_vessels(
-    port_code: Optional[str] = None,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -1018,8 +1020,8 @@ def get_public_vessels(
     from app.services.vessel_lifecycle import effective_vessel_status
 
     # Where each vessel is. A vessel row carries no port of its own — the port
-    # belongs to the call — so `port_code` could not filter anything and was
-    # silently ignored, offering crew every active ship in every port.
+    # belongs to the call — so this is reported rather than filtered on, and the
+    # caller shows it beside the name so two ships sharing one can be told apart.
     #
     # port_id is the reliable side; port_name is the legacy free string written
     # before the foreign key existed, and matches ports.code for current rows.
@@ -1036,19 +1038,25 @@ def get_public_vessels(
         # should only ever have one, but a legacy duplicate must not decide this.
         port_of[vessel_id] = (code or legacy_name, name or legacy_name)
 
-    wanted = (port_code or "").strip()
-
-    vessels = db.query(Vessel).filter(Vessel.agent_id.isnot(None)).all()
+    # Every vessel the platform knows, whoever onboarded it and wherever it is.
+    #
+    # This used to answer with the caller's port only, and only ships still
+    # alongside. Both filters were doing authorisation's job badly: crew could
+    # not find their vessel if an agent had not onboarded it, or if it had just
+    # departed, and were stuck with nothing to select.
+    #
+    # Choosing a vessel here has never granted anything — the shore leave card
+    # and every booking resolve through the crew assignment — so the list can
+    # be honest about what exists and let that decide.
+    #
+    # Archived is still excluded: it means removed from operations, not sailed.
+    vessels = db.query(Vessel).all()
     out = []
     for v in vessels:
-        if effective_vessel_status(v) not in {"Active", "Departing"}:
+        status = effective_vessel_status(v)
+        if status == "Archived":
             continue
         vessel_port_code, vessel_port_name = port_of.get(v.id, (None, None))
-        # An unfiltered request still answers with everything, as before. A
-        # request naming a port drops vessels elsewhere, and also those with no
-        # open call to place them — an unplaced ship is not in the caller's port.
-        if wanted and (vessel_port_code or "").lower() != wanted.lower():
-            continue
         agency = v.agency_name
         if not agency and v.agent and hasattr(v.agent, "agent_profile") and v.agent.agent_profile:
             agency = v.agent.agent_profile.agency_name
@@ -1063,6 +1071,7 @@ def get_public_vessels(
             has_partnered_agency=has_partnered,
             port_code=vessel_port_code,
             port_name=vessel_port_name,
+            status=status,
         ))
     return out
 

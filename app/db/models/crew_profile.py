@@ -18,6 +18,15 @@ class CrewProfile(Base):
     # Professional details
     current_port = Column(String(128), nullable=True)
     vessel = Column(String(128), nullable=True)
+    # The vessel this crew member picked, which is not the same thing as one
+    # they are assigned to. It decides whether a crew member with no assignment
+    # is waiting on an agent-managed ship or aboard one no agency runs here —
+    # two situations the shore leave card has to tell apart. Stored by id
+    # because the list now spans every port and two ships can share a name.
+    selected_vessel_id = Column(
+        Integer, ForeignKey("vessels.id", ondelete="SET NULL"),
+        nullable=True, index=True,
+    )
     ride_otp = Column(String(4), nullable=True) # Lifetime OTP for ride starts
     sos_email = Column(String(255), nullable=True) # SOS Configration ship's email
     
