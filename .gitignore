@@ -29,6 +29,7 @@ scripts/*
 !scripts/reconcile_confirmed_assignment_records.py
 !scripts/preflight_assignment_scoped_operations.py
 !scripts/audit_safety_record_vessel_names.py
+!scripts/repair_sos_vessel_call.py
 apply_port_id_migration.py
 migrations/
 seeds/
