@@ -14,6 +14,7 @@ from app.db.models.vessel import Vessel
 from app.db.models.vessel_crew import VesselCrew
 from app.api.v1.routes_auth import get_current_user
 from app.db.models.user import User
+from app.services.vessel_lifecycle import current_call_for
 from pydantic import BaseModel, Field
 
 router = APIRouter()
@@ -106,10 +107,15 @@ def get_trip_monitoring(
 
     # Get crew profile IDs for this agent's vessels
     vessel_ids = [v.id for v in db.query(Vessel).filter(Vessel.agent_id == current_user.id).all()]
+    call = None
     if vessel_id is not None:
         if vessel_id not in vessel_ids:
             raise HTTPException(status_code=404, detail="Vessel not found")
         vessel_ids = [vessel_id]
+        # One ship means one call: the page asking for it is showing the call
+        # the vessel is on. A returning vessel was carrying its previous calls'
+        # trips into the new one.
+        call = current_call_for(db, vessel_id)
 
     crew_hpids = []
     if vessel_ids:
@@ -145,6 +151,24 @@ def get_trip_monitoring(
             f"cb.agency_id = {int(agency_profile_id)} "
             f"AND cb.vessel_id IN ({vessel_placeholders})"
         )
+    # Trips of this call only. Rows stamped with another call are out; rows from
+    # before the column existed carry no call and are admitted only if they ran
+    # inside this call's window.
+    call_clause = "TRUE"
+    call_params: dict = {}
+    if call is not None:
+        unattributed = ["cb.vessel_call_id IS NULL"]
+        started = call.started_at or call.created_at
+        if started is not None:
+            unattributed.append("cb.created_at >= :call_started")
+            call_params["call_started"] = started
+        if call.ended_at is not None:
+            unattributed.append("cb.created_at <= :call_ended")
+            call_params["call_ended"] = call.ended_at
+        call_clause = (
+            f"(cb.vessel_call_id = {int(call.id)} OR ({' AND '.join(unattributed)}))"
+        )
+
     rows = db.execute(text(f"""
         SELECT cb.id, cb.booking_id, cb.pickup_address, cb.drop_address,
                cb.pickup_lat, cb.pickup_lng, cb.drop_lat, cb.drop_lng,
@@ -157,16 +181,19 @@ def get_trip_monitoring(
         FROM cab_bookings cb
         LEFT JOIN crew_profiles cp ON cb.crew_id = cp.id
         LEFT JOIN crew_assignments ca ON cb.crew_assignment_id = ca.id
-        WHERE ({strong_clause})
-           OR (
+        WHERE (
+            ({strong_clause})
+            OR (
                 cb.agency_id IS NULL
                 AND (
                     cb.vessel_id IN ({vessel_placeholders})
                     OR (cb.vessel_id IS NULL AND {legacy_crew_clause})
                 )
-           )
+            )
+        )
+        AND {call_clause}
         ORDER BY cb.created_at DESC, cb.id DESC
-    """)).all()
+    """), call_params).all()
 
     ongoing = []
     requested = []

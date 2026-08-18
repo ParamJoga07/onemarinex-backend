@@ -7,6 +7,7 @@ from app.db.session import get_db
 from app.db.models.incident import Incident, IncidentNote, IncidentStatus, IncidentType
 from app.db.models.crew_assignment import CrewAssignment
 from app.api.v1.routes_auth import get_current_user
+from app.services.vessel_lifecycle import belongs_to_call, current_call_for
 from pydantic import BaseModel, Field
 
 router = APIRouter()
@@ -629,8 +630,16 @@ def agent_incident_list(
         return {"incidents": []}
 
     query = db.query(Incident).filter(ownership)
+    call = None
     if vessel_id is not None:
-        query = query.filter(Incident.vessel_id == vessel_id)
+        # The vessel page is a view of the call the ship is on, not of the ship
+        # for all time. Without this a returning vessel showed the previous
+        # calls' incidents appended to its new one.
+        call = current_call_for(db, vessel_id)
+        query = query.filter(belongs_to_call(
+            Incident.vessel_call_id, Incident.vessel_id, Incident.created_at,
+            vessel_id=vessel_id, call=call,
+        ))
     if status_filter:
         try:
             query = query.filter(Incident.status == IncidentStatus(status_filter.upper()))
@@ -640,7 +649,7 @@ def agent_incident_list(
     rows = query.order_by(Incident.created_at.desc()).all()
     records = [dict(_serialize_incident(db, i), kind="incident") for i in rows]
     if include_sos:
-        records.extend(_agent_sos_records(db, current_user.id, vessel_id, status_filter))
+        records.extend(_agent_sos_records(db, current_user.id, vessel_id, status_filter, call))
     # created_at mixes naive legacy Incident values with timezone-aware SOS
     # ones; comparing those directly raises TypeError.
     records.sort(key=lambda item: _sort_instant(item.get("created_at")), reverse=True)
@@ -656,7 +665,7 @@ def _sort_instant(value) -> float:
 
 
 def _agent_sos_records(db: Session, agent_user_id: int, vessel_id: Optional[int],
-                       status_filter: Optional[str]) -> List[dict]:
+                       status_filter: Optional[str], call=None) -> List[dict]:
     """This agent's SOS alerts, shaped like the incident rows beside them."""
     from app.db.models.agent_profile import AgentProfile
     from app.db.models.crew_profile import CrewProfile
@@ -668,7 +677,10 @@ def _agent_sos_records(db: Session, agent_user_id: int, vessel_id: Optional[int]
     ).scalar()
     strong_query = db.query(CrewSos).filter(CrewSos.agency_id == agency_id)
     if vessel_id is not None:
-        strong_query = strong_query.filter(CrewSos.vessel_id == vessel_id)
+        strong_query = strong_query.filter(belongs_to_call(
+            CrewSos.vessel_call_id, CrewSos.vessel_id, CrewSos.created_at,
+            vessel_id=vessel_id, call=call,
+        ))
     strong_rows = strong_query.all() if agency_id is not None else []
 
     records: List[dict] = []
