@@ -193,6 +193,19 @@ def read_bytes(stored: str) -> Optional[tuple]:
             import mimetypes
             with open(local, "rb") as handle:
                 return handle.read(), (mimetypes.guess_type(local)[0] or "application/octet-stream")
+
+        # An absolute URL we could not turn into a bucket key: a row written
+        # while a different CDN endpoint was configured, or a logo hosted
+        # somewhere else entirely. Fetching it is safe here because this column
+        # is never client-supplied — it only ever holds what save_fileobj
+        # returned — and a 404 instead would put us back to a blank masthead.
+        if stored.startswith("http://") or stored.startswith("https://"):
+            import urllib.request
+            with urllib.request.urlopen(stored, timeout=10) as response:
+                return (
+                    response.read(),
+                    response.headers.get("Content-Type") or "application/octet-stream",
+                )
     except Exception:
         logger.exception("Failed to read stored file %s", stored)
     return None
