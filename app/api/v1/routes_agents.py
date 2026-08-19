@@ -165,6 +165,7 @@ def get_agent_profile(
         "status": agent_profile.status,
         "profile_image": agent_profile.profile_image,
         "agency_logo_url": agent_profile.agency_logo_url,
+        "agency_logo_display_url": _agency_logo_display_url(agent_profile),
         "support_number": agent_profile.support_number,
         "agent_identifier": agent_profile.agent_identifier,
         "auth_document_url": agent_profile.auth_document_url
@@ -1376,7 +1377,7 @@ def shore_leave_report(
         etd=call.etd,
         port_name=call.port_name,
         agency_name=call.agency_name,
-        agency_logo_url=agent_profile.agency_logo_url if agent_profile else None,
+        agency_logo_url=_agency_logo_display_url(agent_profile),
         report_date=resolved_date,
         period_start=period_start_label,
         period_end=period_end_label,
@@ -1460,3 +1461,51 @@ def create_shore_leave_report_snapshot(
     db.commit()
     db.refresh(snapshot)
     return serialize_report_snapshot(snapshot)
+
+
+def _agency_logo_display_url(agent_profile) -> Optional[str]:
+    """Where a report should load this agency's logo from.
+
+    Not the stored URL. A report is drawn to a canvas and saved as a PDF, and a
+    canvas that has drawn a cross-origin image without CORS headers cannot be
+    exported — the logo silently becomes an empty space on the sheet, which is
+    what agencies were getting. Object storage sends no such headers unless the
+    bucket is configured for it, and that configuration has not happened.
+
+    The API does send them, so pointing the report at our own path makes the
+    logo exportable without depending on the bucket at all. Returns None when
+    there is no logo, so the caller falls through to its wordmark.
+    """
+    if agent_profile is None or not (agent_profile.agency_logo_url or "").strip():
+        return None
+    return f"/api/v1/agents/{agent_profile.id}/logo"
+
+
+@router.get("/{agency_id}/logo")
+def agency_logo(agency_id: int, db: Session = Depends(get_db)):
+    """An agency's logo, served with the API's CORS headers.
+
+    Unauthenticated on purpose: these are the same bytes the storage bucket
+    already serves publicly to anyone holding the URL, so requiring a token
+    here would protect nothing while making the image unusable from an <img>
+    tag — which cannot carry an Authorization header, and is what the report
+    needs in order to draw the logo into its canvas.
+    """
+    from fastapi.responses import Response
+    from app.services import storage
+
+    profile = db.query(AgentProfile).filter(AgentProfile.id == agency_id).first()
+    stored = (profile.agency_logo_url or "").strip() if profile else ""
+    if not stored:
+        raise HTTPException(status_code=404, detail="No logo for this agency")
+
+    payload = storage.read_bytes(stored)
+    if payload is None:
+        raise HTTPException(status_code=404, detail="The logo could not be read")
+    body, content_type = payload
+    return Response(
+        content=body,
+        media_type=content_type,
+        # Logos change rarely and every report download re-fetches this.
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
