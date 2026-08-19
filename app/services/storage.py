@@ -160,3 +160,52 @@ def _key_from_url(url: str) -> Optional[str]:
         if base and url.startswith(base):
             return url[len(base.rstrip("/")) + 1:]
     return None
+
+
+def read_bytes(stored: str) -> Optional[tuple]:
+    """The stored file's bytes and content type, or None if it cannot be read.
+
+    Reports are rendered to a canvas in the browser and saved as a PDF, and a
+    canvas that has drawn a cross-origin image without CORS headers cannot be
+    exported. Object storage does not send those headers unless the bucket is
+    configured to, so agency logos came out of the PDF as an empty space.
+
+    Serving the bytes back through the API sidesteps the bucket's configuration
+    entirely: the API already answers with CORS headers for the app's origin,
+    so the same image becomes something the canvas will export.
+    """
+    try:
+        if stored.startswith("spaces://"):
+            key = stored[len("spaces://"):]
+        elif spaces_enabled() and not stored.startswith("/"):
+            key = _key_from_url(stored)
+        else:
+            key = None
+
+        if key:
+            obj = _get_client().get_object(Bucket=SPACES_BUCKET, Key=key)
+            return obj["Body"].read(), obj.get("ContentType") or "application/octet-stream"
+
+        # Local disk: the path is relative to the working directory, as the
+        # /uploads static mount serves it.
+        local = stored.lstrip("/")
+        if os.path.isfile(local):
+            import mimetypes
+            with open(local, "rb") as handle:
+                return handle.read(), (mimetypes.guess_type(local)[0] or "application/octet-stream")
+
+        # An absolute URL we could not turn into a bucket key: a row written
+        # while a different CDN endpoint was configured, or a logo hosted
+        # somewhere else entirely. Fetching it is safe here because this column
+        # is never client-supplied — it only ever holds what save_fileobj
+        # returned — and a 404 instead would put us back to a blank masthead.
+        if stored.startswith("http://") or stored.startswith("https://"):
+            import urllib.request
+            with urllib.request.urlopen(stored, timeout=10) as response:
+                return (
+                    response.read(),
+                    response.headers.get("Content-Type") or "application/octet-stream",
+                )
+    except Exception:
+        logger.exception("Failed to read stored file %s", stored)
+    return None
