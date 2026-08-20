@@ -28,7 +28,7 @@ from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
 from app.api.v1.routes_agents import get_dashboard_data
-from app.api.v1.routes_superadmin import _agent_for_new_vessel
+from app.api.v1.routes_superadmin import _agent_for_new_vessel, update_vessel_superadmin
 from app.api.v1.routes_vessels import _start_return_call
 from app.db.models.agent_profile import AgentProfile
 from app.db.models.crew_sos import CrewSos
@@ -134,6 +134,64 @@ class SuperadminVesselAssignmentTests(_Base):
                 self.db, self.body(agency_name=self.agency_name),
                 self.superadmin)
         self.assertEqual(caught.exception.status_code, 409)
+
+
+class AgencyChangeMovesTheVesselTests(_Base):
+    """Changing the agency on the edit form must move the vessel, not relabel it.
+
+    The form sends an agency name and never an agent id. Requiring an explicit
+    id meant agency_name said one agency while agent_id still held another, and
+    visibility follows agent_id — so the vessel appeared on no dashboard and in
+    no agency's mapped vessels.
+    """
+
+    def vessel(self, *, agency_name, agent_id):
+        v = Vessel(
+            agent_id=agent_id, name=_uniq("MV"), imo_number=_uniq("IMO"),
+            vessel_type="Bulk Carrier", status="Active",
+            agency_name=agency_name,
+            eta=NOW - timedelta(days=1), etd=NOW + timedelta(days=2))
+        self.db.add(v)
+        self.db.flush()
+        return v
+
+    def edit(self, vessel, **kw):
+        body = self.body(name=vessel.name, imo_number=vessel.imo_number,
+                         eta=vessel.eta, etd=vessel.etd, **kw)
+        return update_vessel_superadmin(
+            vessel_id=vessel.id, body=body, db=self.db,
+            current_user=self.superadmin)
+
+    def test_naming_a_new_agency_moves_the_vessel_to_it(self):
+        vessel = self.vessel(agency_name="Other",
+                             agent_id=self.superadmin_user.id)
+        self.edit(vessel, agency_name=self.agency_name)
+        self.db.refresh(vessel)
+        self.assertEqual(vessel.agency_name, self.agency_name)
+        self.assertEqual(vessel.agent_id, self.agent_user.id)
+
+    def test_resubmitting_the_same_agency_does_not_reassign(self):
+        """Correcting an ETD resends the name; that is not a reassignment."""
+        vessel = self.vessel(agency_name=self.agency_name,
+                             agent_id=self.agent_user.id)
+        self.edit(vessel, agency_name=f"  {self.agency_name.upper()}  ")
+        self.db.refresh(vessel)
+        self.assertEqual(vessel.agent_id, self.agent_user.id)
+
+    def test_moving_a_vessel_to_other_returns_it_to_the_superadmin(self):
+        vessel = self.vessel(agency_name=self.agency_name,
+                             agent_id=self.agent_user.id)
+        self.edit(vessel, agency_name="Other")
+        self.db.refresh(vessel)
+        self.assertEqual(vessel.agency_name, "Other")
+        self.assertEqual(vessel.agent_id, self.superadmin_user.id)
+
+    def test_an_explicit_agent_id_still_wins(self):
+        vessel = self.vessel(agency_name="Other",
+                             agent_id=self.superadmin_user.id)
+        self.edit(vessel, agent_id=self.agent_user.id, agency_name="Other")
+        self.db.refresh(vessel)
+        self.assertEqual(vessel.agent_id, self.agent_user.id)
 
 
 class ReturningVesselTests(_Base):

@@ -1573,6 +1573,11 @@ def list_all_vessels_superadmin(
         output.append(serialized)
     return output
 
+def _agency_key(name) -> str:
+    """Agency names compared the way a person reads them."""
+    return (name or "").strip().lower()
+
+
 def _agent_for_new_vessel(db: Session, body, current_user: User) -> int:
     """Which agent a superadmin-created vessel belongs to.
 
@@ -1603,7 +1608,7 @@ def _agent_for_new_vessel(db: Session, body, current_user: User) -> int:
     # stored names, so an exact comparison should hold — but a difference in
     # spacing or case used to mean the vessel quietly went to the superadmin,
     # and that failure is not worth preserving.
-    wanted = (body.agency_name or "").strip().lower()
+    wanted = _agency_key(body.agency_name)
     profiles = db.query(AgentProfile).filter(
         func.lower(func.trim(AgentProfile.agency_name)) == wanted
     ).all()
@@ -1700,15 +1705,27 @@ def update_vessel_superadmin(
     vessel.vessel_type = body.vessel_type
     vessel.berth_assignment = body.berth_assignment
     vessel.flag = body.flag
-    if body.agency_name is not None:
-        vessel.agency_name = body.agency_name
-
-    # Only an explicitly chosen agent moves the vessel. This used to also infer
-    # agent_id from agency_name, and the edit form resubmits that name whether
-    # or not it changed — so correcting an ETD could silently look like a
-    # reassignment.
+    # Changing the agency moves the vessel; resubmitting the same one does not.
+    #
+    # The form sends the agency name on every save and never sends an agent id,
+    # so requiring an explicit id meant the dropdown only ever relabelled the
+    # vessel: agency_name said one agency and agent_id still held another, and
+    # since visibility follows agent_id the vessel appeared on no dashboard and
+    # in no agency's mapped vessels. That is what "the assignment is not
+    # visible" was.
+    #
+    # Comparing against the stored name is what keeps the earlier fix intact —
+    # an unchanged name resubmitted while correcting an ETD is not a
+    # reassignment and must not be read as one.
     if body.agent_id:
         vessel.agent_id = body.agent_id
+        if body.agency_name is not None:
+            vessel.agency_name = body.agency_name
+    elif body.agency_name is not None:
+        renamed = _agency_key(body.agency_name) != _agency_key(vessel.agency_name)
+        vessel.agency_name = body.agency_name
+        if renamed:
+            vessel.agent_id = _agent_for_new_vessel(db, body, current_user)
 
     vessel.eta = body.eta
     vessel.etd = body.etd
