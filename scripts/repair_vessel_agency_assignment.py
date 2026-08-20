@@ -6,9 +6,15 @@ to resolve to a profile, so the vessel was created, reported as created, and
 belonged to a user who is not an agent — invisible on the agency's dashboard and
 absent from its mapped vessels.
 
-This finds those vessels and, with --apply, hands each to the agency its own
-agency_name records. A vessel whose name matches no agency, or matches more than
-one, is reported and left alone.
+The same divergence arrives from the edit form, which sends an agency name and
+no agent id: the name changed, the holder did not, and the vessel quietly stopped
+matching the agency it claims.
+
+So the question is not who holds a vessel but whether the holder is the agency
+the vessel names. A vessel naming "Other" belongs with the superadmin by design
+and is not a finding. This reports the ones whose agency_name and agent_id
+disagree and, with --apply, hands each to the agency it names. A name matching no
+agency, or more than one, is reported and left alone.
 
 It also lists the agency names that would defeat an exact-match lookup — the
 ones carrying leading or trailing whitespace, and any name registered twice —
@@ -68,15 +74,23 @@ def main():
                   f"{len({p.user_id for p in ps})} different agents: "
                   f"{sorted({p.user_id for p in ps})}")
 
-        agent_ids = {u.id for u in db.query(User).filter(User.role == "agent").all()}
-        stranded = [
-            v for v in db.query(Vessel).all()
-            if v.agent_id is not None and v.agent_id not in agent_ids
-        ]
+        # "Other" names no agency, so resting with the superadmin is correct
+        # and not a finding. Reporting those was 137 lines of noise that hid
+        # the question worth asking.
+        unassigned = {"", "other", "others", "none", "n/a", "other agency"}
+        stranded = []
+        for v in db.query(Vessel).all():
+            if _key(v.agency_name) in unassigned:
+                continue
+            owners = by_name.get(_key(v.agency_name), [])
+            distinct = {p.user_id for p in owners}
+            if len(distinct) == 1 and v.agent_id in distinct:
+                continue  # holder already matches the agency it names
+            stranded.append(v)
 
         print()
         print(RULE)
-        print("Vessels held by a user who is not an agent")
+        print("Vessels whose agency_name and agent_id disagree")
         print()
         if not stranded:
             print("  None.")
@@ -90,9 +104,8 @@ def main():
         for v in stranded:
             owners = by_name.get(_key(v.agency_name), [])
             distinct = {p.user_id for p in owners}
-            print(f"  vessel {v.id:<6} '{v.name}'  IMO {v.imo_number}  "
-                  f"held by user {v.agent_id}")
-            print(f"      its agency_name reads '{v.agency_name}'")
+            print(f"  vessel {v.id:<6} '{v.name}'  IMO {v.imo_number}")
+            print(f"      names '{v.agency_name}' but is held by user {v.agent_id}")
             if len(distinct) == 1:
                 target = owners[0].user_id
                 print(f"      -> agency {owners[0].id}, agent user {target}")
