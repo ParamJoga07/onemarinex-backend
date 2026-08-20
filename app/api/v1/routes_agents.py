@@ -278,7 +278,11 @@ def get_dashboard_data(
         raise HTTPException(status_code=403, detail="Only agents can access dashboard data")
     
     # Resolve lifecycle from backend time before any status-based query.
-    from app.services.vessel_lifecycle import synchronize_vessel_lifecycle
+    from app.services.vessel_lifecycle import (
+        belongs_to_call,
+        current_call_for,
+        synchronize_vessel_lifecycle,
+    )
 
     owned_vessels = db.query(Vessel).filter(Vessel.agent_id == current_user.id).all()
     if synchronize_vessel_lifecycle(db, owned_vessels):
@@ -451,16 +455,30 @@ def get_dashboard_data(
         crew_ashore = crew_ashore_count(db, vessel_crew_ids)
 
         # 3. SOS/Incidents of ship — the card says "SOS/Incidents", so count both.
+        #
+        # Of the call the ship is on, not of the hull for all time. The trips
+        # above were already scoped this way and these were not, so a returning
+        # vessel's card reported the previous call's open records while the
+        # Incidents tab beside it — scoped since the vessel-page fix — read
+        # zero. MV JIM MING 82 arrived on a new call showing 1 SOS/incident it
+        # had never had.
         incidents = 0
         if agency_profile_id is not None:
+            call = current_call_for(db, v.id)
             incidents = db.query(Incident).filter(
                 Incident.agency_id == agency_profile_id,
-                Incident.vessel_id == v.id,
+                belongs_to_call(
+                    Incident.vessel_call_id, Incident.vessel_id, Incident.created_at,
+                    vessel_id=v.id, call=call,
+                ),
                 Incident.status.in_([IncidentStatus.ACTIVE, IncidentStatus.INVESTIGATING]),
             ).count()
             incidents += db.query(CrewSos).filter(
                 CrewSos.agency_id == agency_profile_id,
-                CrewSos.vessel_id == v.id,
+                belongs_to_call(
+                    CrewSos.vessel_call_id, CrewSos.vessel_id, CrewSos.created_at,
+                    vessel_id=v.id, call=call,
+                ),
                 CrewSos.closed_at.is_(None),
                 CrewSos.cancelled_at.is_(None),
             ).count()

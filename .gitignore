@@ -30,6 +30,7 @@ scripts/*
 !scripts/preflight_assignment_scoped_operations.py
 !scripts/audit_safety_record_vessel_names.py
 !scripts/repair_sos_vessel_call.py
+!scripts/repair_vessel_agency_assignment.py
 apply_port_id_migration.py
 migrations/
 seeds/
