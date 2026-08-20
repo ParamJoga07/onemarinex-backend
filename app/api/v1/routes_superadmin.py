@@ -1573,6 +1573,60 @@ def list_all_vessels_superadmin(
         output.append(serialized)
     return output
 
+def _agent_for_new_vessel(db: Session, body, current_user: User) -> int:
+    """Which agent a superadmin-created vessel belongs to.
+
+    This used to fall back to the superadmin's own id whenever the agency name
+    failed to match a profile, and the form does not send an agent id — so a
+    vessel assigned to a real agency was created successfully, reported as
+    created, and belonged to nobody who could see it. It appeared in neither
+    the agent's dashboard nor the agency's mapped vessels.
+
+    An agency that names no partner is a genuine case and still rests with the
+    superadmin. An agency that names one and cannot be found is not: that is
+    refused, because silently keeping the vessel is what hid it.
+    """
+    from app.db.models.agent_profile import AgentProfile
+
+    if body.agent_id:
+        agent = db.query(User).filter(
+            User.id == body.agent_id, User.role == "agent"
+        ).first()
+        if not agent:
+            raise HTTPException(status_code=404, detail="Agent user not found")
+        return agent.id
+
+    if not is_partnered_agency(body.agency_name):
+        return current_user.id
+
+    # Matched on the trimmed, case-folded name. The form's options come from the
+    # stored names, so an exact comparison should hold — but a difference in
+    # spacing or case used to mean the vessel quietly went to the superadmin,
+    # and that failure is not worth preserving.
+    wanted = (body.agency_name or "").strip().lower()
+    profiles = db.query(AgentProfile).filter(
+        func.lower(func.trim(AgentProfile.agency_name)) == wanted
+    ).all()
+    if not profiles:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"No agency is registered under the name '{body.agency_name}'. "
+                "Create the agency first, or choose 'Other' to hold the vessel "
+                "without assigning it."
+            ),
+        )
+    if len({p.user_id for p in profiles}) > 1:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"More than one agency is registered as '{body.agency_name}'. "
+                "Assign the vessel from that agency's own row instead."
+            ),
+        )
+    return profiles[0].user_id
+
+
 @router.post("/vessels", response_model=VesselOut, status_code=status.HTTP_201_CREATED)
 def create_vessel_superadmin(
     body: SuperAdminVesselCreate,
@@ -1580,13 +1634,7 @@ def create_vessel_superadmin(
     current_user: User = Depends(get_current_user)
 ):
     verify_superadmin(current_user)
-    assigned_agent_id = body.agent_id or current_user.id
-    if body.agency_name and is_partnered_agency(body.agency_name):
-        # Find agent with matching agency_name if possible
-        from app.db.models.agent_profile import AgentProfile
-        prof = db.query(AgentProfile).filter(AgentProfile.agency_name == body.agency_name).first()
-        if prof:
-            assigned_agent_id = prof.user_id
+    assigned_agent_id = _agent_for_new_vessel(db, body, current_user)
 
     # A ship that comes back is the same ship, whoever adds it. The agent path
     # has reused the canonical vessel since the returning-vessel work; this one
@@ -1748,6 +1796,21 @@ def create_vessel_under_agent(
     agent = db.query(User).filter(User.id == agent_id, User.role == "agent").first()
     if not agent:
         raise HTTPException(status_code=404, detail="Agent user not found")
+
+    # A ship that comes back is the same ship, whoever adds it. The other two
+    # entry points reuse the canonical vessel and open a new call against it;
+    # this one still built a second Vessel unconditionally, so a return visit
+    # hit the unique IMO index and came back as "Vessel IMO possibly already
+    # exists" — with no vessel created and nothing said about why.
+    from app.api.v1.routes_vessels import _start_return_call, _vessel_by_imo
+
+    returning = _vessel_by_imo(db, body.imo_number)
+    if returning is not None:
+        return _start_return_call(
+            db, returning, body,
+            agent_id=agent.id,
+            agency_name=agent.agent_profile.agency_name if agent.agent_profile else None,
+        )
 
     vessel = Vessel(
         agent_id=agent.id,

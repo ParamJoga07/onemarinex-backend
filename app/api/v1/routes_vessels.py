@@ -909,6 +909,12 @@ def _start_return_call(db: Session, vessel: Vessel, body, *, agent_id, agency_na
     for row in departed_manifest:
         db.delete(row)
     db.flush()
+    # And the count cached beside them. total_crew reads the roster when there
+    # is one and falls back to this number when there is not, so a cleared
+    # manifest left the returning vessel reporting the crew of the call before
+    # it: MV JIM MING 82 was onboarded with the crew field at zero and its
+    # management row still read 23.
+    _refresh_vessel_crew_count(db, vessel)
 
     vessel.name = body.name or vessel.name
     vessel.vessel_type = body.vessel_type or vessel.vessel_type
