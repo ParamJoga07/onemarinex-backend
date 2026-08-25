@@ -191,6 +191,38 @@ def is_partnered_agency(agency_name: Optional[str]) -> bool:
     return clean not in ["other", "others", "none", "n/a", "", "other agency"]
 
 
+def _unmanaged_vessel_call(db: Session, profile):
+    """The vessel and call for crew on a ship no agency runs.
+
+    Shore leave is an agency's to grant, so a vessel recorded as "Other" has no
+    agent, no manifest and no crew assignments — and never will. Everything that
+    waits for an assignment therefore waits forever, which is why cabs stayed
+    locked behind "your agent has not uploaded the crew list" on a vessel that
+    has no agent to do it.
+
+    Returns the vessel the crew member selected and its open call, but only when
+    that vessel really is unmanaged. A partnered vessel missing an assignment is
+    a crew member their agent has not added yet, which is a genuine wait and
+    still refused.
+    """
+    from app.db.models.vessel import Vessel
+    from app.services.historical_context import active_vessel_call
+
+    if profile is None or not profile.selected_vessel_id:
+        return None, None
+    vessel = db.query(Vessel).filter(Vessel.id == profile.selected_vessel_id).first()
+    if vessel is None:
+        return None, None
+
+    agency = vessel.agency_name
+    if not agency and vessel.agent and getattr(vessel.agent, "agent_profile", None):
+        agency = vessel.agent.agent_profile.agency_name
+    if is_partnered_agency(agency):
+        return None, None
+
+    return vessel, active_vessel_call(db, vessel, create=False)
+
+
 def _fallback_straight_line_distance_km(
     pickup_lat: float,
     pickup_lng: float,
@@ -406,7 +438,16 @@ def list_eligible_crew_assignments(
         and row.vessel_call.vessel_id is not None
         and bool(row.vessel_call.vessel_name)
     ]
+    # Whether an assignment is something this crew member is waiting for.
+    #
+    # On a vessel no agency runs there is no agent, no manifest and no
+    # assignment coming, so an empty list is the settled answer rather than a
+    # wait — and a screen that says "your agent has not uploaded the crew list"
+    # is naming someone who does not exist. The caller needs to tell the two
+    # apart, and only the server knows which vessel was selected.
+    _unmanaged_vessel, _unmanaged_call = _unmanaged_vessel_call(db, profile)
     return {
+        "agency_managed": _unmanaged_vessel is None,
         "assignments": [
             EligibleCrewAssignmentOut(
                 crew_assignment_id=row.id,
@@ -2320,13 +2361,21 @@ def book_cab(
         )
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
-    if booking_assignment is None:
-        raise HTTPException(
-            status_code=409,
-            detail="No active vessel assignment is available for this booking",
-        )
-    booking_call = _assignment_call_or_conflict(booking_assignment)
-    booking_vessel = booking_call.vessel
+    if booking_assignment is not None:
+        booking_call = _assignment_call_or_conflict(booking_assignment)
+        booking_vessel = booking_call.vessel
+    else:
+        # A vessel no agency runs has no manifest and never will, so there is
+        # no assignment to wait for and refusing the booking would lock these
+        # crew out of cabs permanently. The profile already says as much —
+        # cab_booking_locked is false and no shore pass card is offered — and
+        # this is the rest of that promise.
+        booking_vessel, booking_call = _unmanaged_vessel_call(db, profile)
+        if booking_call is None:
+            raise HTTPException(
+                status_code=409,
+                detail="No active vessel assignment is available for this booking",
+            )
 
     from app.db.models.cab_booking import VehicleType, BookingStatus, RideType
     from app.db.models.booking_timeline import TimelineEventType
@@ -2540,7 +2589,7 @@ def book_cab(
         # later — see app/services/agent_contact.py.
         vessel_id=booking_call.vessel_id,
         vessel_call_id=booking_call.id,
-        crew_assignment_id=booking_assignment.id,
+        crew_assignment_id=booking_assignment.id if booking_assignment else None,
         agency_id=booking_call.agency_id,
         port_id=booking_call.port_id or (booking_port.id if booking_port else None),
         context_resolution="assignment",
