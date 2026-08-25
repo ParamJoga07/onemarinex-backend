@@ -194,13 +194,17 @@ def resolve_verified_crew_profile(
             "The passport matches an account with a different nationality; "
             "Superadmin identity reconciliation is required"
         )
-    if crew_name and normalized_person_name(profile.full_name) != normalized_person_name(
-        crew_name
-    ):
-        raise CrewIdentityConflict(
-            "The passport matches an account with a different crew name; "
-            "Superadmin identity reconciliation is required"
-        )
+    # The name is deliberately not compared.
+    #
+    # A passport number identifies a person; a name is how one was typed. Crew
+    # register themselves as "MARIMUTHU", agents type "MARIMUTHU S", and the two
+    # stopped being the same person — so a matching passport queued a Superadmin
+    # reconciliation and the crew member got no shore pass over a spelling. The
+    # passport, the nationality and the HPID still have to agree.
+    #
+    # crew_name is still accepted so callers need not change and so it keeps
+    # reaching the conflict record, where a human reconciling one can still see
+    # which name was submitted.
     return profile
 
 
