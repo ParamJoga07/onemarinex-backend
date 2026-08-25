@@ -241,10 +241,17 @@ def _same_manifest_identity(
     nationality: str,
     passport_number: str,
 ) -> bool:
+    """Whether an existing manifest row is this same person.
+
+    The name is not part of the answer. It is how somebody typed a person, not
+    who they are, and treating a differently-spelled name as a different
+    identity meant re-adding a crew member with their name corrected was
+    refused as a conflict. `name` is still taken so the caller reads plainly and
+    so the submitted spelling reaches the conflict record.
+    """
     existing_nationality = normalize_nationality(crew.nationality, strict=False)
     return (
-        normalized_person_name(crew.name) == normalized_person_name(name)
-        and existing_nationality == nationality
+        existing_nationality == nationality
         and normalize_passport_number(crew.passport_number) == passport_number
     )
 

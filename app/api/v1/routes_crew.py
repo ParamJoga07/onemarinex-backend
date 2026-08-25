@@ -754,10 +754,12 @@ def sync_crew_manifest_helper(profile: CrewProfile, db: Session):
     manifests_by_id = {row.id: row for row in hpid_manifests}
     for row in passport_manifests:
         row_nationality = normalize_nationality(row.nationality, strict=False)
-        if (
-            normalized_person_name(row.name) == profile_name
-            and (not row_nationality or row_nationality == profile_nationality)
-        ):
+        # Matched on the passport alone. Requiring the name to match too is
+        # what kept crew off their own vessel: the agent had them on the list,
+        # the passport agreed, and a different spelling of the same person left
+        # the row unmapped, so no assignment was created and no shore pass card
+        # ever appeared.
+        if not row_nationality or row_nationality == profile_nationality:
             manifests_by_id[row.id] = row
     manifests = list(manifests_by_id.values())
 

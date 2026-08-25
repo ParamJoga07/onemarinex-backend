@@ -217,26 +217,40 @@ class AddCrewIdentityTests(unittest.TestCase):
         self.assertEqual(caught.exception.status_code, 409)
         self.assertIn("different nationality", caught.exception.detail["message"])
 
-    def test_passport_with_conflicting_name_is_not_silently_linked(self):
+    def test_a_passport_links_its_account_whatever_the_name_says(self):
+        """Crew register as one spelling and agents type another.
+
+        Requiring the two to agree meant a matching passport still queued a
+        Superadmin reconciliation, and the crew member got no shore pass over a
+        spelling.
+        """
         passport = _uniq("WHO").replace("-", "")
-        self.add_profile(passport=passport, name="Different Person")
+        profile = self.add_profile(passport=passport, name="MARIMUTHU")
+
+        crew = self.add(self.body(passport_number=passport, name="MARIMUTHU S"))
+
+        self.assertEqual(crew.status, "Mapped")
+        self.assertEqual(crew.hp_id, profile.hpid)
+
+    def test_re_adding_with_a_corrected_name_is_the_same_person(self):
+        passport = _uniq("NAME").replace("-", "")
+        first = self.add(self.body(passport_number=passport, name="Ravi Kumar"))
+
+        again = self.add(self.body(passport_number=passport, name="Ravi Kumaar"))
+
+        # One manifest row, not two, and no conflict raised.
+        self.assertEqual(again.id, first.id)
+
+    def test_a_different_nationality_is_still_a_conflict(self):
+        """Only the name stopped being evidence; the rest still is."""
+        passport = _uniq("NAT").replace("-", "")
+        self.add_profile(passport=passport, name="Ravi Kumar", nationality="PH")
 
         with self.assertRaises(HTTPException) as caught:
             self.add(self.body(passport_number=passport, name="Ravi Kumar"))
 
         self.assertEqual(caught.exception.status_code, 409)
-        self.assertIn("different crew name", caught.exception.detail["message"])
-
-    def test_existing_manifest_with_different_name_is_not_overwritten(self):
-        passport = _uniq("NAME").replace("-", "")
-        first = self.add(self.body(passport_number=passport, name="Ravi Kumar"))
-
-        with self.assertRaises(HTTPException) as caught:
-            self.add(self.body(passport_number=passport, name="Another Person"))
-
-        self.assertEqual(caught.exception.status_code, 409)
-        self.db.refresh(first)
-        self.assertEqual(first.name, "Ravi Kumar")
+        self.assertIn("different nationality", caught.exception.detail["message"])
 
     def test_resolution_is_audited_and_only_authorizes_the_same_identity(self):
         from app.api.v1.routes_superadmin import (
