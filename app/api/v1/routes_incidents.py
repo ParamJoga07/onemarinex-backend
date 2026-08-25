@@ -381,12 +381,22 @@ async def create_incident(
                 )
             except ValueError as exc:
                 raise HTTPException(status_code=409, detail=str(exc))
-            if assignment is None:
-                raise HTTPException(
-                    status_code=409,
-                    detail="No active vessel assignment is available for this incident",
-                )
-            call = assignment.vessel_call
+            if assignment is not None:
+                call = assignment.vessel_call
+                resolution = "assignment"
+            else:
+                # A vessel no agency runs never produces an assignment, so
+                # refusing here would leave its crew unable to report anything
+                # at all. The call still identifies where it happened.
+                from app.api.v1.routes_crew import _unmanaged_vessel_call
+
+                _vessel, call = _unmanaged_vessel_call(db, crew)
+                resolution = "unmanaged_vessel"
+                if call is None:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="No active vessel assignment is available for this incident",
+                    )
             if call is None:
                 raise HTTPException(
                     status_code=409,
@@ -396,9 +406,9 @@ async def create_incident(
                 "vessel_call": call,
                 "vessel_id": call.vessel_id,
                 "agency_id": call.agency_id,
-                "crew_assignment_id": assignment.id,
+                "crew_assignment_id": assignment.id if assignment else None,
                 "port_id": call.port_id,
-                "context_resolution": "assignment",
+                "context_resolution": resolution,
             }
         incident = Incident(
             **incident_data,
